@@ -10,41 +10,55 @@ renders the active session's terminal output and forwards user input.
 
 ### Requirement: Sidebar session creation
 
-The system SHALL provide a sidebar with a `+` button. Clicking `+` SHALL
-create a new agent session, assign it an auto-incrementing name of the form
-`pi-N` (where `N` starts at 1 and never reuses a previously issued number),
-append it to the sidebar, and make it the active session in the main pane.
+The system SHALL provide a `[+ agent]` button at the bottom of each expanded
+workspace's agent list. Clicking it SHALL create a new agent session inside
+that workspace, assign it a per-workspace auto-incrementing name of the form
+`pi-N` (where `N` starts at 1 within that workspace and never reuses a number
+already issued inside that workspace), display it in the sidebar as
+`<dirname>/pi-N` (e.g. `foo/pi-1`), spawn the `pi` subprocess with a working
+directory equal to the workspace's absolute path, and make it the active
+session in the main pane. If no workspace exists yet, no `[+ agent]` button
+SHALL be rendered.
 
 #### Scenario: First session
 
-- **WHEN** the user clicks `+` on an empty sidebar
-- **THEN** a new item named `pi-1` appears in the sidebar and the main pane
-  shows that session's output area
+- **WHEN** the user expands a previously empty workspace for `/Users/me/code/foo`
+  and clicks `[+ agent]`
+- **THEN** a new item labelled `foo/pi-1` appears indented under the workspace,
+  the main pane shows that session's output area, and the `pi` subprocess runs
+  with cwd `/Users/me/code/foo`
 
 #### Scenario: Multiple sessions
 
-- **WHEN** the user clicks `+` twice in a row
-- **THEN** the sidebar contains `pi-1` and `pi-2`, and `pi-2` is the active
-  session shown in the main pane
+- **WHEN** the user clicks `[+ agent]` twice in a row inside `foo`
+- **THEN** the sidebar contains `foo/pi-1` and `foo/pi-2`, and `foo/pi-2` is
+  the active session shown in the main pane
+
+#### Scenario: Independent counters per workspace
+
+- **WHEN** the user creates one agent in workspace `foo` and one agent in
+  workspace `bar`
+- **THEN** the sidebar shows both `foo/pi-1` and `bar/pi-1` as separate items
 
 ### Requirement: Sidebar session item display
 
-Each sidebar item SHALL display the session name, a status badge, and a
-close button that is visible on hover. The status badge SHALL reflect one of
-three states: `starting` (subprocess spawned but no output yet), `running`
-(subprocess has produced output and not exited), or `exited` (subprocess has
-closed its stdout).
+Each agent item in the sidebar SHALL be indented under its parent workspace
+and SHALL display the session's prefixed name (e.g. `foo/pi-1`), a status
+badge, and a close button that is visible on hover. The status badge SHALL
+reflect one of three states: `starting` (subprocess spawned but no output
+yet), `running` (subprocess has produced output and not exited), or `exited`
+(subprocess has closed its stdout).
 
 #### Scenario: Newly created session shows starting
 
 - **WHEN** a session is created and its subprocess has not yet produced any
   bytes
-- **THEN** the sidebar item shows the name with a `starting` badge
+- **THEN** the sidebar item shows the prefixed name with a `starting` badge
 
 #### Scenario: Running session shows running
 
 - **WHEN** a session's subprocess has emitted output and is still alive
-- **THEN** the sidebar item shows the name with a `running` badge
+- **THEN** the sidebar item shows the prefixed name with a `running` badge
 
 #### Scenario: Exited session shows exited
 
@@ -54,22 +68,31 @@ closed its stdout).
 
 #### Scenario: Close button on hover
 
-- **WHEN** the user hovers the pointer over a sidebar item
+- **WHEN** the user hovers the pointer over a sidebar agent item
 - **THEN** a close button (`x`) becomes visible on that item
 
 ### Requirement: Session selection focus model
 
-The main pane SHALL always render the currently selected session. Clicking a
-sidebar item SHALL switch the main pane to that session AND make it the
-recipient of keyboard input. The macOS-level application losing focus SHALL
+The main pane SHALL always render the currently selected agent session.
+Clicking an agent item in the sidebar SHALL switch the main pane to that
+session AND make it the recipient of keyboard input. Clicking a workspace row
+SHALL NOT switch the main pane. The macOS-level application losing focus SHALL
 be the only condition under which keyboard input is not forwarded to the
-active session.
+active session. The main pane's status bar SHALL display the active session's
+full workspace absolute path, its prefixed agent name, and its status — for
+example `/Users/me/code/foo — pi-1 [Running]`.
 
 #### Scenario: Click sidebar item switches active session
 
-- **WHEN** the user clicks sidebar item `pi-2` while `pi-1` is active
-- **THEN** the main pane now renders `pi-2`, and subsequent keystrokes are
-  sent to `pi-2`
+- **WHEN** the user clicks sidebar item `bar/pi-1` while `foo/pi-1` is active
+- **THEN** the main pane now renders `bar/pi-1`, subsequent keystrokes are
+  sent to `bar/pi-1`, and the status bar shows `…/bar — pi-1 [Running]`
+
+#### Scenario: Click workspace row does not switch main pane
+
+- **WHEN** the user clicks a workspace row while an agent in a different
+  workspace is active
+- **THEN** the main pane continues to render the previously active agent
 
 #### Scenario: Active session visual emphasis
 
@@ -115,16 +138,39 @@ block (foreground/background inverted at the cursor position).
 ### Requirement: Keyboard input forwarding
 
 While the application window is focused, the system SHALL forward to the
-active session: printable characters (including IME-committed strings),
-Enter (`\r`), Backspace (`\x7f`), Tab (`\t`), and the four arrow keys
-(`\x1b[A` through `\x1b[D`). Ctrl-combination keys SHALL NOT be forwarded
-in this change.
+active session: printable characters (including IME-committed strings) via
+both `Event::Text` and `Event::Ime(ImeEvent::Commit(s))`, Enter (`\r`),
+Backspace (`\x7f`), Tab (`\t`), and the four arrow keys (`\x1b[A` through
+`\x1b[D`). The system SHALL forward the committed string as its raw UTF-8
+bytes. Other IME events (`Preedit`, `DeleteSurrounding`) SHALL NOT be
+forwarded in this change. Ctrl-combination keys SHALL NOT be forwarded in
+this change.
+
+IME-committed strings SHALL only be forwarded while the active pane holds
+keyboard focus (i.e. the user has clicked inside the pane area after
+switching to that agent). While the pane is selected but not focused, the
+system SHALL NOT claim IME ownership, and IME input SHALL NOT be routed to
+the subprocess.
 
 #### Scenario: Printable characters forwarded
 
 - **WHEN** the user types "hello" while a session is active and the window
   is focused
 - **THEN** the bytes `h e l l o` are sent to that session's subprocess stdin
+
+#### Scenario: IME committed text forwarded as UTF-8
+
+- **WHEN** the user composes "你好" with an IME and commits it (e.g. by
+  pressing space or enter on the candidate) while the pane has keyboard
+  focus
+- **THEN** the UTF-8 bytes for "你好" are sent to that session's subprocess
+  stdin, and the session's terminal shows the committed text
+
+#### Scenario: IME preedit not forwarded
+
+- **WHEN** the user is composing an IME candidate (preedit visible) but has
+  not yet committed it
+- **THEN** no bytes are sent to the subprocess stdin for the preedit text
 
 #### Scenario: Enter forwarded as CR
 
@@ -173,3 +219,30 @@ sidebar until the user explicitly closes it.
 
 - **WHEN** the user clicks the close button on an `exited` item
 - **THEN** the item is removed from the sidebar (no new subprocess to kill)
+
+### Requirement: Pane keyboard focus claim
+
+The main pane SHALL own a focusable interactive surface. Clicking anywhere
+inside the pane area (including its border and rendered contents) SHALL
+claim keyboard focus for that pane. Clicking a sidebar item SHALL switch
+the active selection but SHALL NOT claim pane keyboard focus. While no pane
+has focus, the system SHALL NOT enable IME input routing to any session.
+
+#### Scenario: Click pane claims focus
+
+- **WHEN** the user clicks anywhere inside the main pane area while an agent
+  session is active
+- **THEN** that pane owns keyboard focus, and IME-committed text will be
+  routed to the active session
+
+#### Scenario: Click sidebar switches selection without focus
+
+- **WHEN** the user clicks a sidebar agent row to switch the active session
+- **THEN** the main pane renders that agent, but pane keyboard focus is not
+  claimed until the user clicks inside the pane area
+
+#### Scenario: Active vs inactive pane stroke
+
+- **WHEN** an agent session is selected for display in the main pane
+- **THEN** the pane border is drawn in the active color (blue); when no
+  agent is selected, the pane is not rendered as an interactive surface

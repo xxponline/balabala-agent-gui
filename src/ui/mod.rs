@@ -1,5 +1,6 @@
 //! UI 层: sidebar + pane 渲染。
 
+pub mod common;
 pub mod pane;
 pub mod sidebar;
 

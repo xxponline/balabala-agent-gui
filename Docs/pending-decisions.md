@@ -64,3 +64,88 @@ resize 需要字体 metrics + SIGWINCH 通知, 是独立的工作块。
 - 在 `Event::Key` 分支里检查 `ui.input(|i| i.modifiers.ctrl)`
 - 把 Ctrl+字母 映射成对应的 ASCII 控制字符 (Ctrl+A=0x01 ... Ctrl+Z=0x1a)
 - 注意区分 Cmd+C (复制) 和 Ctrl+C (中断), 取决于平台
+
+## 统一 sidebar 事件处理器
+
+**当前选择**: sidebar::render 返回一个 `SidebarAction` struct, app.rs 在 ui()
+里用一长串 `if let ... = action.xxx` 匹配并调用相应方法。
+
+**为什么这样选**: MVP 阶段直通, 不引入事件总线 / 命令模式。
+
+**未来需要重新评估的信号**:
+- action 种类继续膨胀 (现在已经 6 种), if 链可读性下降
+- 想给某些 action 加全局快捷键 / 撤销 / 重做
+- 想做命令面板 (Ctrl+Shift+P 那种)
+
+**要做的事**:
+- 把每个 action 抽象成一个 `Command` trait 对象
+- 在 app 层维护一个 `CommandQueue` 或 `EventBus`
+- sidebar 只负责发出事件, 不直接触发状态变更
+
+## rfd 同步调用阻塞主线程
+
+**当前选择**: 用 `rfd::FileDialog::pick_folder()` 同步调用, 直接在 egui 的
+ui() 里阻塞等用户选完。
+
+**为什么这样选**: MVP 阶段最简, 用户主动点的按钮, 阻塞期间用户本来就在
+等对话框。
+
+**未来需要重新评估的信号**:
+- macOS 上某些版本会卡窗口 /  beach ball
+- 想在对话框打开期间让后台 pty 继续渲染
+- pick_folder() 被绑到非用户手势的代码路径上 (比如自动恢复)
+
+**要做的事**:
+- 切到 `rfd::AsyncFileDialog`
+- 把 Future 句柄存在 app 状态里, 每帧 poll
+
+## 持久化路径选择 (项目本地 vs 用户目录)
+
+**当前选择**: `.workspaces.json` 写在项目根目录下。
+
+**为什么这样选**: 这是 demo / 开发期工具, 用户从哪启动 cargo run,
+workspaces.json 就在哪, 心智最简单。
+
+**未来需要重新评估的信号**:
+- 把这个 app 发布给其他用户用 (他们不会 clone 源码)
+- 用户期望在不同项目里启动同一个 app 都能看到自己的 workspace 列表
+
+**要做的事**:
+- 引入 `directories` crate 拿平台特定的配置目录
+  (macOS: `~/Library/Application Support/pi-agent-shell/`)
+- 写一个一次性迁移: 如果项目根有旧的 `.workspaces.json`, 复制到新位置
+- 之后读新位置, 删项目根的旧文件
+
+## IME preedit 在终端里的预览
+
+**当前选择**: 只转发 `ImeEvent::Commit(s)` (上屏后的最终字符串),
+不转发 `Preedit` (候选词预览) 和 `DeleteSurrounding`。
+
+**为什么这样选**: MVP 阶段先让中文能进 pty, 预览是体验优化。
+
+**未来需要重新评估的信号**:
+- 用户抱怨打字时终端里看不到候选词预览, 体验跟原生终端差太多
+- 想做光标位置感知 (DeleteSurrounding 要知道光标在哪)
+
+**要做的事**:
+- 在 vt100 网格底部 (或光标下方) 画一个临时预览行
+- 监听 `Preedit { text, active_range_chars }` 事件, 实时更新预览
+- Commit 时把预览行清掉, 把最终文本写到主网格
+- DeleteSurrounding 要反查当前光标位置, 调 parser 删字符
+
+## 一步切 pane focus (点 sidebar 直接拿焦点)
+
+**当前选择**: 两步操作 — 点 sidebar 切 selection, 再点 pane 区域才拿
+键盘焦点 (IME 才激活)。
+
+**为什么这样选**: MVP 阶段信任 egui 的 focus 系统, 不自己跟踪
+"当前哪个 pane 有 focus"。
+
+**未来需要重新评估的信号**:
+- 用户抱怨 "切了 agent 还要再点一下才能打字", 体验差
+- 想做 keyboard-only 导航 (Tab 切 agent)
+
+**要做的事**:
+- sidebar 点 agent 行时, 调 `ctx.memory_mut(|m| m.focused = Some(frame_id))`
+- 或者用 `response.request_focus()` 的等价 API
+- 跟 InteractiveFrame 的全局 ID 协调好

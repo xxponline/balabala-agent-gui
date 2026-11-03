@@ -5,6 +5,7 @@
 //! 未来可以加 mock / remote 等。
 
 use std::num::NonZeroU16;
+use std::path::Path;
 use std::sync::mpsc::Receiver;
 
 use vt100::Screen;
@@ -36,6 +37,9 @@ pub enum SessionStatus {
 pub trait AgentEntity {
     /// sidebar 上显示的名字, 例如 "pi-1"
     fn name(&self) -> &str;
+
+    /// agent 启动时的工作目录 (workspace 路径)
+    fn ws_path(&self) -> &Path;
 
     /// 当前 vt100 屏幕 (UI 直接读 cell(r, c))
     fn screen(&self) -> &Screen;

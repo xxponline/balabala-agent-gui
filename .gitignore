@@ -16,3 +16,6 @@ Thumbs.db
 
 # Logs / runtime
 *.log
+
+# Local state
+.workspaces.json

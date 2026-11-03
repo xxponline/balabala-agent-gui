@@ -5,6 +5,7 @@
 mod agent_entities;
 mod app;
 mod ui;
+mod workspace;
 
 use app::TerminalApp;
 
@@ -19,6 +20,20 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "pi-agent-shell",
         options,
-        Box::new(|_cc| Ok(Box::new(TerminalApp::new()))),
+        Box::new(|_cc| {
+            let app = match TerminalApp::new() {
+                Ok(app) => app,
+                Err(e) => {
+                    rfd::MessageDialog::new()
+                        .set_title("Failed to load workspaces")
+                        .set_description(&e)
+                        .set_level(rfd::MessageLevel::Error)
+                        .show();
+                    eprintln!("failed to load workspaces: {e}");
+                    std::process::exit(1);
+                }
+            };
+            Ok(Box::new(app))
+        }),
     )
 }

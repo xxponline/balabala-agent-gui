@@ -17,6 +17,7 @@
 
 use std::io::{Read, Write};
 use std::num::NonZeroU16;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::thread;
 
@@ -32,6 +33,8 @@ const ROWS: u16 = 30;
 pub struct PiAgentPty {
     /// sidebar 上显示的名字, 例如 "pi-1"
     name: String,
+    /// agent 启动时的工作目录 (workspace 路径)
+    ws_path: PathBuf,
     /// 子进程句柄, 用于 kill
     child: Box<dyn Child + Send + Sync>,
     /// master 写端: 把用户输入送给子进程 stdin
@@ -45,10 +48,10 @@ pub struct PiAgentPty {
 }
 
 impl PiAgentPty {
-    /// 创建一个新的 pty 会话并 spawn `cmd`。
+    /// 创建一个新的 pty 会话并 spawn `cmd`, 在 `cwd` 目录下运行。
     ///
-    /// `name` 是 sidebar 显示的名字 (由 app 层负责分配 pi-N)。
-    pub fn new(name: String, cmd: String) -> Result<Self, String> {
+    /// `name` 是 sidebar 显示的名字 (由 app 层负责分配)。
+    pub fn new(name: String, cmd: String, cwd: PathBuf) -> Result<Self, String> {
         // ---- 1. 开 pty ----
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -64,6 +67,8 @@ impl PiAgentPty {
         let mut cmd_builder = CommandBuilder::new(&cmd);
         // 强制让子进程以为自己在真终端里, 否则很多程序不输出颜色
         cmd_builder.env("TERM", "xterm-256color");
+        // 让 pi 在 workspace 指定的目录下运行
+        cmd_builder.cwd(cwd.clone());
         let child = pair
             .slave
             .spawn_command(cmd_builder)
@@ -114,6 +119,7 @@ impl PiAgentPty {
 
         Ok(Self {
             name,
+            ws_path: cwd,
             child,
             writer,
             parser,
@@ -126,6 +132,10 @@ impl PiAgentPty {
 impl AgentEntity for PiAgentPty {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn ws_path(&self) -> &Path {
+        &self.ws_path
     }
 
     fn screen(&self) -> &vt100::Screen {

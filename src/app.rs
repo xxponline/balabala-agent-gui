@@ -1,104 +1,184 @@
-//! 主 App 状态: 持有 agent 列表, 调度 egui 的 logic() / ui()。
+//! 主 App 状态: 持有 workspaces 列表, 调度 egui 的 logic() / ui()。
+
+use std::path::PathBuf;
 
 use eframe::egui;
 
-use crate::agent_entities::{AgentEntity, PiAgentPty};
+use crate::agent_entities::PiAgentPty;
 use crate::ui::{pane, sidebar};
+use crate::workspace::{Workspace, store};
 
 pub struct TerminalApp {
-    /// 当前所有 agent session
-    pub agents: Vec<Box<dyn AgentEntity>>,
-    /// 当前在 main 区显示的 agent 下标 (None = 空 main 区)
-    pub active_id: Option<usize>,
-    /// 下一个自动编号: pi-{next_name_idx}
-    pub next_name_idx: u32,
+    /// 所有 workspace (每个持有一个路径 + 该路径下的 agents)
+    pub workspaces: Vec<Workspace>,
+    /// 当前在 main 区显示的 (workspace_idx, agent_idx)
+    pub active: Option<(usize, usize)>,
+    /// 最近一次持久化失败的错误信息 (在 sidebar 顶部显示)
+    pub save_error: Option<String>,
 }
 
 impl TerminalApp {
-    pub fn new() -> Self {
-        Self {
-            agents: Vec::new(),
-            active_id: None,
-            next_name_idx: 1,
+    /// 启动时从 `.workspaces.json` 读取, 失败时返回 Err 让 main 退出。
+    pub fn new() -> Result<Self, String> {
+        let paths = store::load()?;
+        let workspaces = paths
+            .into_iter()
+            .map(Workspace::new)
+            .collect::<Vec<_>>();
+        Ok(Self {
+            workspaces,
+            active: None,
+            save_error: None,
+        })
+    }
+
+    /// 把当前 workspaces 的路径列表刷到 `.workspaces.json`,
+    /// 失败时把错误存到 self.save_error (而不是 panic)。
+    fn persist(&mut self) {
+        let paths: Vec<PathBuf> = self.workspaces.iter().map(|w| w.path.clone()).collect();
+        match store::save(&paths) {
+            Ok(_) => {
+                self.save_error = None;
+            }
+            Err(e) => {
+                self.save_error = Some(e);
+            }
         }
     }
 
-    /// 点 "+": 新建一个 pi agent 并立刻 active
-    fn create_new_agent(&mut self) {
-        let name = format!("pi-{}", self.next_name_idx);
-        self.next_name_idx += 1;
+    /// 用户点了 "[+ new workspace]": 弹 rfd 文件夹选择器。
+    fn create_workspace(&mut self) {
+        let picked = rfd::FileDialog::new().pick_folder();
+        let Some(path) = picked else {
+            return; // 用户取消
+        };
 
-        // 默认 spawn "pi" (Q10 = A: 裸 pi, 无参数)
-        match PiAgentPty::new(name, "pi".to_string()) {
+        // canonicalize 方便去重
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+
+        // 去重
+        if self.workspaces.iter().any(|w| w.path == path) {
+            eprintln!("workspace already exists: {}", path.display());
+            return;
+        }
+
+        self.workspaces.push(Workspace::new(path));
+        self.persist();
+    }
+
+    /// 用户点了某个 workspace 下的 "[+ agent]"。
+    fn create_agent(&mut self, ws_idx: usize) {
+        if ws_idx >= self.workspaces.len() {
+            return;
+        }
+        let ws = &mut self.workspaces[ws_idx];
+        let name = ws.new_agent_name();
+        let cwd = ws.path.clone();
+
+        match PiAgentPty::new(name, "pi".to_string(), cwd) {
             Ok(agent) => {
-                self.agents.push(Box::new(agent));
-                self.active_id = Some(self.agents.len() - 1);
+                self.workspaces[ws_idx].agents.push(Box::new(agent));
+                let agent_idx = self.workspaces[ws_idx].agents.len() - 1;
+                self.active = Some((ws_idx, agent_idx));
             }
             Err(e) => {
-                // spawn 失败 (比如 pi 不在 PATH): 打个 println, 不 panic
                 eprintln!("failed to spawn agent: {e}");
             }
         }
     }
 
-    /// 关闭某个 agent, 必要时调整 active_id
-    fn close_agent(&mut self, idx: usize) {
-        if idx >= self.agents.len() {
+    /// 用户点了 workspace 的 "×": 只在 workspace 为空时删除。
+    fn close_workspace(&mut self, ws_idx: usize) {
+        if ws_idx >= self.workspaces.len() {
             return;
         }
-        self.agents[idx].shutdown();
-        self.agents.remove(idx);
-
-        // 调整 active_id: 如果删掉的就是 active, 切到下一个 (或 None)
-        match self.active_id {
-            None => {}
-            Some(active) if idx == active => {
-                // 关掉的是 active: 切到不超过新长度的最后一个
-                self.active_id = if self.agents.is_empty() {
-                    None
-                } else if idx >= self.agents.len() {
-                    Some(self.agents.len() - 1)
-                } else {
-                    Some(idx)
-                };
-            }
-            Some(active) if idx < active => {
-                // 删掉的在 active 前面, 下标要往左挪一位
-                self.active_id = Some(active - 1);
-            }
-            Some(_) => {
-                // 删掉的在 active 后面, active 不变
-            }
+        if !self.workspaces[ws_idx].agents.is_empty() {
+            return; // 还有 agent, 禁止删除
         }
+        self.workspaces.remove(ws_idx);
+
+        // 调整 active
+        self.active = match self.active {
+            None => None,
+            Some((active_ws, _active_agent)) if active_ws == ws_idx => None,
+            Some((active_ws, active_agent)) if active_ws > ws_idx => {
+                Some((active_ws - 1, active_agent))
+            }
+            Some(x) => Some(x),
+        };
+
+        self.persist();
     }
 
-    /// 7.x: 把键盘事件翻译成字节送给 active agent
+    /// 用户点了某个 agent 的 "×"。
+    fn close_agent(&mut self, ws_idx: usize, agent_idx: usize) {
+        if ws_idx >= self.workspaces.len() {
+            return;
+        }
+        let ws = &mut self.workspaces[ws_idx];
+        if agent_idx >= ws.agents.len() {
+            return;
+        }
+        ws.agents[agent_idx].shutdown();
+        ws.agents.remove(agent_idx);
+
+        // 调整 active
+        self.active = match self.active {
+            None => None,
+            Some((a_ws, a_agent)) if a_ws == ws_idx && a_agent == agent_idx => {
+                // 关掉的是 active: 切到同 workspace 内不超过新长度的最后一个
+                if ws.agents.is_empty() {
+                    None
+                } else {
+                    Some((ws_idx, ws.agents.len() - 1))
+                }
+            }
+            Some((a_ws, a_agent)) if a_ws == ws_idx && a_agent > agent_idx => {
+                Some((a_ws, a_agent - 1))
+            }
+            Some(x) => Some(x),
+        };
+    }
+
+    /// 把键盘事件翻译成字节送给 active agent。
     fn forward_keyboard(&mut self, ctx: &egui::Context) {
-        let Some(active_idx) = self.active_id else {
+        let Some((ws_idx, agent_idx)) = self.active else {
             return;
         };
-        if active_idx >= self.agents.len() {
+        if ws_idx >= self.workspaces.len() {
+            return;
+        }
+        if agent_idx >= self.workspaces[ws_idx].agents.len() {
             return;
         }
 
         let events = ctx.input(|i| i.raw.events.clone());
         for ev in events {
             match ev {
-                // 7.1: 可打印字符 (包括 IME 提交的字符串)
                 egui::Event::Text(s) => {
-                    self.agents[active_idx].send_input(s.as_bytes());
+                    self.workspaces[ws_idx].agents[agent_idx].send_input(s.as_bytes());
                 }
-                // 7.2: 控制键翻译成 VT100 转义序列
+                // Event::Ime 由 InteractiveFrame 处理, 这里不匹配
                 egui::Event::Key {
                     key, pressed: true, ..
                 } => match key {
-                    egui::Key::Enter => self.agents[active_idx].send_input(b"\r"),
-                    egui::Key::Backspace => self.agents[active_idx].send_input(b"\x7f"),
-                    egui::Key::Tab => self.agents[active_idx].send_input(b"\t"),
-                    egui::Key::ArrowUp => self.agents[active_idx].send_input(b"\x1b[A"),
-                    egui::Key::ArrowDown => self.agents[active_idx].send_input(b"\x1b[B"),
-                    egui::Key::ArrowRight => self.agents[active_idx].send_input(b"\x1b[C"),
-                    egui::Key::ArrowLeft => self.agents[active_idx].send_input(b"\x1b[D"),
+                    egui::Key::Enter => self.workspaces[ws_idx].agents[agent_idx].send_input(b"\r"),
+                    egui::Key::Backspace => {
+                        self.workspaces[ws_idx].agents[agent_idx].send_input(b"\x7f")
+                    }
+                    egui::Key::Tab => self.workspaces[ws_idx].agents[agent_idx].send_input(b"\t"),
+                    egui::Key::ArrowUp => {
+                        self.workspaces[ws_idx].agents[agent_idx].send_input(b"\x1b[A")
+                    }
+                    egui::Key::ArrowDown => {
+                        self.workspaces[ws_idx].agents[agent_idx].send_input(b"\x1b[B")
+                    }
+                    egui::Key::ArrowRight => {
+                        self.workspaces[ws_idx].agents[agent_idx].send_input(b"\x1b[C")
+                    }
+                    egui::Key::ArrowLeft => {
+                        self.workspaces[ws_idx].agents[agent_idx].send_input(b"\x1b[D")
+                    }
                     _ => {}
                 },
                 _ => {}
@@ -108,55 +188,187 @@ impl TerminalApp {
 }
 
 impl eframe::App for TerminalApp {
-    /// 每帧调用, 但不能画 UI。适合把 channel 里的新字节喂给 parser。
     fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 8.2: 遍历所有 agent 调 poll()
-        for agent in self.agents.iter_mut() {
-            agent.poll();
+        for ws in self.workspaces.iter_mut() {
+            for agent in ws.agents.iter_mut() {
+                agent.poll();
+            }
         }
     }
 
-    /// 每帧重绘: 画 sidebar + main pane。
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // ---- 7.x: 先把键盘事件送给 active agent ----
         self.forward_keyboard(ui.ctx());
 
-        // ---- 左右分栏: sidebar | main pane ----
         ui.horizontal(|ui| {
-            // 左边栏 (固定窄宽)
+            // ---- 左边栏 ----
             ui.with_layout(
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     ui.set_min_width(160.0);
-                    ui.set_max_width(220.0);
-                    let action = sidebar::render(ui, &self.agents, self.active_id);
+                    ui.set_max_width(260.0);
+                    let save_error = self.save_error.as_deref();
+                    let action = sidebar::render(ui, &self.workspaces, self.active, save_error);
 
-                    // 处理 sidebar 动作
-                    if action.clicked_new {
-                        self.create_new_agent();
+                    if action.new_workspace {
+                        self.create_workspace();
                     }
-                    if let Some(idx) = action.selected {
-                        self.active_id = Some(idx);
+                    if let Some(ws_idx) = action.toggle_collapse {
+                        if let Some(ws) = self.workspaces.get_mut(ws_idx) {
+                            ws.collapsed = !ws.collapsed;
+                        }
                     }
-                    if let Some(idx) = action.closed {
-                        self.close_agent(idx);
+                    if let Some(ws_idx) = action.close_workspace {
+                        self.close_workspace(ws_idx);
+                    }
+                    if let Some(ws_idx) = action.new_agent {
+                        self.create_agent(ws_idx);
+                    }
+                    if let Some(pair) = action.select_agent {
+                        self.active = Some(pair);
+                    }
+                    if let Some((ws_idx, agent_idx)) = action.close_agent {
+                        self.close_agent(ws_idx, agent_idx);
                     }
                 },
             );
 
             ui.separator();
 
-            // 右边主区
-            ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
-                // 把 active agent 借出来给 pane 渲染
-                let active = self
-                    .active_id
-                    .and_then(|idx| self.agents.get_mut(idx));
-                pane::render(ui, active);
+            // ---- 右边主区 ----
+            // 强制占满窗口高度, 不被 sidebar 压扁
+            let screen_h = ui.ctx().content_rect().height();
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_min_height(screen_h);
+                let active_pair = self.active;
+
+                if active_pair.is_none() {
+                    pane::render_empty(ui);
+                    return;
+                }
+
+                let (ws_idx, agent_idx) = active_pair.unwrap();
+
+                // 先拿只读 view 数据 (status bar + vt100 渲染需要)
+                // 注意: 这里只借 &self.workspaces, 不创建可变闭包
+                let view = self.workspaces
+                    .get(ws_idx)
+                    .and_then(|w| w.agents.get(agent_idx))
+                    .map(|a| {
+                        (
+                            a.ws_path().to_path_buf(),
+                            a.name().to_string(),
+                            a.status(),
+                            a.screen() as *const vt100::Screen,
+                        )
+                    });
+
+                let Some((path_str, name, status, screen_ptr)) = view else {
+                    pane::render_empty(ui);
+                    return;
+                };
+
+                // 现在创建可变 on_commit 闭包
+                let workspaces = &mut self.workspaces;
+                let mut on_commit = |s: &str| {
+                    if let Some(agent) = workspaces
+                        .get_mut(ws_idx)
+                        .and_then(|w| w.agents.get_mut(agent_idx))
+                    {
+                        agent.send_input(s.as_bytes());
+                    }
+                };
+
+                // 把 screen 指针转回引用 (safty: agent 还在 workspaces 里,
+                // 我们只是临时绕开 borrow checker)
+                let screen = unsafe { &*screen_ptr };
+
+                // 恢复正常的 pane 渲染
+                pane::render_active(ui, &mut on_commit, |ui| {
+                    let (rows, cols) = screen.size();
+                    let (rows, cols) = (rows.get(), cols.get());
+                    let (cur_row, cur_col) = screen.cursor_position();
+                    let path_str = path_str.to_string_lossy().to_string();
+
+                    // 顶部状态条
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(75, 161, 215),
+                            format!("● {path_str} — {name}"),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("[{status:?}]"))
+                                .color(egui::Color32::from_rgb(150, 150, 150)),
+                        );
+                    });
+                    ui.separator();
+
+                    if status == crate::agent_entities::SessionStatus::Starting {
+                        ui.label(
+                            egui::RichText::new("waiting for pi to start...")
+                                .color(egui::Color32::from_rgb(229, 193, 16))
+                                .monospace(),
+                        );
+                    }
+
+                    // vt100 网格
+                    ui.vertical(|ui| {
+                        ui.style_mut().override_font_id =
+                            Some(egui::FontId::monospace(13.0));
+
+                        for r in 0..rows {
+                            let mut segments: Vec<(String, egui::Color32, egui::Color32)> =
+                                Vec::new();
+                            let mut cur_text = String::new();
+                            let mut cur_fg = egui::Color32::WHITE;
+                            let mut cur_bg = egui::Color32::from_rgb(30, 30, 30);
+
+                            for c in 0..cols {
+                                let cell = match screen.cell(r, c) {
+                                    Some(cell) => cell,
+                                    None => continue,
+                                };
+                                let mut fg = crate::ui::fg_to_egui(cell.fgcolor());
+                                let mut bg = crate::ui::bg_to_egui(cell.bgcolor());
+
+                                if r == cur_row && c == cur_col {
+                                    std::mem::swap(&mut fg, &mut bg);
+                                }
+
+                                if (fg, bg) != (cur_fg, cur_bg) && !cur_text.is_empty() {
+                                    segments.push((
+                                        std::mem::take(&mut cur_text),
+                                        cur_fg,
+                                        cur_bg,
+                                    ));
+                                    cur_fg = fg;
+                                    cur_bg = bg;
+                                }
+                                cur_text.push_str(cell.contents());
+                            }
+                            if !cur_text.is_empty() {
+                                segments.push((cur_text, cur_fg, cur_bg));
+                            }
+
+                            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                            ui.horizontal(|ui| {
+                                for (text, fg, bg) in segments {
+                                    if bg == egui::Color32::from_rgb(30, 30, 30) {
+                                        ui.colored_label(fg, text);
+                                    } else {
+                                        egui::Frame::new()
+                                            .fill(bg)
+                                            .show(ui, |ui| {
+                                                ui.colored_label(fg, text);
+                                            });
+                                    }
+                                }
+                            });
+                        }
+                    });
+                });
             });
         });
 
-        // 8.4: 异步刷新, 保证 pty 输出能持续更新
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(50));
     }
