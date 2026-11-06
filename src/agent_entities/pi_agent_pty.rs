@@ -30,6 +30,13 @@ use crate::agent_entities::{AgentEntity, AgentEvent, SessionStatus};
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
 
+/// 单次 poll 的 drain 预算: 防止输出狂喷时, 无界 channel 的贪心
+/// drain (producer 快于 parser) 饿死 50ms 节流循环。
+/// 这是 pending-decisions.md 已知风险的临时护栏; 有界 channel/
+/// 背压策略仍是未来工作。
+const POLL_MAX_EVENTS: usize = 4096;
+const POLL_MAX_BYTES: usize = 512 * 1024;
+
 pub struct PiAgentPty {
     /// sidebar 上显示的名字, 例如 "pi-1"
     name: String,
@@ -142,12 +149,24 @@ impl AgentEntity for PiAgentPty {
         self.parser.screen()
     }
 
-    fn poll(&mut self) {
-        // drain 所有事件, 更新 parser + status
-        while let Ok(event) = self.event_rx.try_recv() {
+    fn poll(&mut self) -> bool {
+        // drain 事件, 更新 parser + status; 受预算限制, 返回是否
+        // 消费了事件 (供 shell 决定 notify)。预算耗尽则余量留给
+        // 下一个 tick, 循环永不挂死。
+        let mut consumed = false;
+        let mut events = 0usize;
+        let mut bytes = 0usize;
+        while events < POLL_MAX_EVENTS && bytes < POLL_MAX_BYTES {
+            let event = match self.event_rx.try_recv() {
+                Ok(event) => event,
+                Err(_) => break, // Empty 或 Disconnected
+            };
+            events += 1;
+            consumed = true;
             match event {
-                AgentEvent::Output(bytes) => {
-                    self.parser.process(&bytes);
+                AgentEvent::Output(chunk) => {
+                    bytes += chunk.len();
+                    self.parser.process(&chunk);
                     if self.status == SessionStatus::Starting {
                         self.status = SessionStatus::Running;
                     }
@@ -157,6 +176,7 @@ impl AgentEntity for PiAgentPty {
                 }
             }
         }
+        consumed
     }
 
     fn send_input(&mut self, bytes: &[u8]) {

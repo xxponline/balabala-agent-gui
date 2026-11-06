@@ -1,37 +1,69 @@
-//! UI 层: sidebar + pane 渲染。
+//! UI 层: sidebar + pane 渲染 (gpui 版) + vt100 颜色映射。
+//!
+//!浅色主题默认值见 design D9; 颜色映射是迁移前实现的 gpui 等价物
+//! (旧实现在 git history)。
 
-pub mod common;
 pub mod pane;
 pub mod sidebar;
 
-use egui::Color32;
+use gpui_kit::{Rgba, rgb};
 use vt100::Color;
 
-/// 把 vt100 的前景色翻译成 egui 的 Color32。
-///
-/// 只覆盖常用的 16 色调色板 + Rgb; 256 色以上的 Idx 暂时 fallback 到白色。
-pub fn fg_to_egui(color: Color) -> Color32 {
-    match color {
-        Color::Default => Color32::from_rgb(229, 229, 229),
-        Color::Idx(0) => Color32::from_rgb(0, 0, 0),
-        Color::Idx(1) => Color32::from_rgb(205, 49, 49), // red
-        Color::Idx(2) => Color32::from_rgb(13, 188, 121), // green
-        Color::Idx(3) => Color32::from_rgb(229, 229, 16), // yellow
-        Color::Idx(4) => Color32::from_rgb(36, 114, 200), // blue
-        Color::Idx(5) => Color32::from_rgb(188, 75, 173), // magenta
-        Color::Idx(6) => Color32::from_rgb(17, 168, 205), // cyan
-        Color::Idx(7) => Color32::from_rgb(229, 229, 229), // white (bright)
-        Color::Idx(i) if i < 16 => Color32::from_rgb(128, 128, 128),
-        Color::Idx(_) => Color32::WHITE,
-        Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
+/// ANSI 0-15 调色板 (浅色主题适配, design D9): 比暗色版整体
+/// 加深以保白底可读; "white" (7/15) 取灰阶 — 纯白在白底上不可见。
+const PALETTE: [u32; 16] = [
+    0x000000, // 0  black
+    0xcd3131, // 1  red        (与原版一致)
+    0x1a7f2e, // 2  green      (比原版的 0dbc79 深, 白底可读)
+    0x8a7f00, // 3  yellow     (橄榄色; 原版 e5e510 白底不可读)
+    0x2472c8, // 4  blue       (与原版一致)
+    0xa94db0, // 5  magenta
+    0x0f7fa8, // 6  cyan
+    0x9e9e9e, // 7  white → 中灰 (可读性适配)
+    0x5c5c5c, // 8  bright black
+    0xe05252, // 9  bright red
+    0x2fa043, // 10 bright green
+    0x9a8f00, // 11 bright yellow
+    0x4a8fe0, // 12 bright blue
+    0xc066cc, // 13 bright magenta
+    0x2f9fc0, // 14 bright cyan
+    0xbfbfbf, // 15 bright white → 浅灰
+];
+
+/// xterm 256 色索引 → RGB:
+/// 0-15 查表, 16-231 为 6x6x6 立方, 232-255 为灰阶。
+/// (原实现对 16+ 回退白/默认色, 这里是完整转换 — 更符合
+///  agent-shell spec 的 "preserve colors" 要求)
+fn idx_to_rgb(i: u8) -> u32 {
+    match i {
+        0..=15 => PALETTE[i as usize],
+        16..=231 => {
+            let n = u32::from(i - 16);
+            let (r, g, b) = (n / 36, (n / 6) % 6, n % 6);
+            let c = |v: u32| if v == 0 { 0 } else { 55 + 40 * v };
+            (c(r) << 16) | (c(g) << 8) | c(b)
+        }
+        _ => {
+            let v = 8 + 10 * u32::from(i - 232);
+            (v << 16) | (v << 8) | v
+        }
     }
 }
 
-/// 把 vt100 的背景色翻译成 egui 的 Color32 (终端默认深灰底)。
-pub fn bg_to_egui(color: Color) -> Color32 {
+/// vt100 前景色 → gpui (浅色主题默认深色前景)。
+pub fn fg_to_gpui(color: Color) -> Rgba {
     match color {
-        Color::Default => Color32::from_rgb(30, 30, 30),
-        Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
-        _ => Color32::from_rgb(30, 30, 30),
+        Color::Default => rgb(0x2b2b2b),
+        Color::Idx(i) => rgb(idx_to_rgb(i)),
+        Color::Rgb(r, g, b) => rgb((u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)),
+    }
+}
+
+/// vt100 背景色 → gpui (浅色主题默认白底)。
+pub fn bg_to_gpui(color: Color) -> Rgba {
+    match color {
+        Color::Default => rgb(0xffffff),
+        Color::Idx(i) => rgb(idx_to_rgb(i)),
+        Color::Rgb(r, g, b) => rgb((u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)),
     }
 }

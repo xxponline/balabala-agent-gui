@@ -6,7 +6,9 @@ pub mod store;
 
 use std::path::PathBuf;
 
-use crate::agent_entities::AgentEntity;
+use gpui_kit::Entity;
+
+use crate::agent_entities::AgentSession;
 
 /// 一个工作区: 对应磁盘上的一个目录, 下面挂着若干 agent 会话。
 pub struct Workspace {
@@ -14,8 +16,8 @@ pub struct Workspace {
     pub path: PathBuf,
     /// 折叠状态 (易失, 不持久化)
     pub collapsed: bool,
-    /// 该 workspace 下的所有 agent 会话
-    pub agents: Vec<Box<dyn AgentEntity>>,
+    /// 该 workspace 下的所有 agent 会话 (design D2: entity 持有)
+    pub agents: Vec<Entity<AgentSession>>,
     /// 下一个 agent 编号: 每个 workspace 独立从 1 开始
     pub next_agent_idx: u32,
 }

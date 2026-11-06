@@ -138,19 +138,20 @@ block (foreground/background inverted at the cursor position).
 ### Requirement: Keyboard input forwarding
 
 While the application window is focused, the system SHALL forward to the
-active session: printable characters (including IME-committed strings) via
-both `Event::Text` and `Event::Ime(ImeEvent::Commit(s))`, Enter (`\r`),
-Backspace (`\x7f`), Tab (`\t`), and the four arrow keys (`\x1b[A` through
-`\x1b[D`). The system SHALL forward the committed string as its raw UTF-8
-bytes. Other IME events (`Preedit`, `DeleteSurrounding`) SHALL NOT be
-forwarded in this change. Ctrl-combination keys SHALL NOT be forwarded in
-this change.
+active session: printable characters (including IME-committed strings),
+Enter (`\r`), Backspace (`\x7f`), Tab (`\t`), and the four arrow keys
+(`\x1b[A` through `\x1b[D`). The system SHALL forward an IME-committed
+string as its raw UTF-8 bytes. Other IME events (preedit composition,
+surrounding-text deletion) SHALL NOT be forwarded. Ctrl-combination keys
+SHALL NOT be forwarded.
 
-IME-committed strings SHALL only be forwarded while the active pane holds
-keyboard focus (i.e. the user has clicked inside the pane area after
-switching to that agent). While the pane is selected but not focused, the
-system SHALL NOT claim IME ownership, and IME input SHALL NOT be routed to
-the subprocess.
+Selecting an agent item in the sidebar SHALL make that session's pane the
+recipient of keyboard input AND IME input in the same step: the system
+SHALL claim IME ownership for the pane immediately upon selection, with
+no additional click required inside the pane area. While the session is
+selected, IME-committed strings SHALL be routed to its subprocess. The
+macOS-level application losing focus SHALL remain the only condition under
+which keystrokes and IME commits are not forwarded.
 
 #### Scenario: Printable characters forwarded
 
@@ -161,8 +162,7 @@ the subprocess.
 #### Scenario: IME committed text forwarded as UTF-8
 
 - **WHEN** the user composes "你好" with an IME and commits it (e.g. by
-  pressing space or enter on the candidate) while the pane has keyboard
-  focus
+  pressing space or enter on the candidate) while the session is selected
 - **THEN** the UTF-8 bytes for "你好" are sent to that session's subprocess
   stdin, and the session's terminal shows the committed text
 
@@ -181,6 +181,13 @@ the subprocess.
 
 - **WHEN** the macOS application window is not the focused window
 - **THEN** keystrokes are not sent to any session
+
+#### Scenario: Sidebar selection grants keyboard and IME focus in one step
+
+- **WHEN** the user clicks a different agent item in the sidebar and then
+  composes text with an IME without clicking inside the pane area
+- **THEN** the committed text is sent to the newly selected session's
+  subprocess, and no bytes are sent to the previously selected session
 
 ### Requirement: Manual session close
 
@@ -224,9 +231,11 @@ sidebar until the user explicitly closes it.
 
 The main pane SHALL own a focusable interactive surface. Clicking anywhere
 inside the pane area (including its border and rendered contents) SHALL
-claim keyboard focus for that pane. Clicking a sidebar item SHALL switch
-the active selection but SHALL NOT claim pane keyboard focus. While no pane
-has focus, the system SHALL NOT enable IME input routing to any session.
+claim keyboard focus for that pane. Clicking a sidebar agent item SHALL
+switch the active selection AND claim pane keyboard focus for that session
+in the same step (one-step focus, consistent with Keyboard input
+forwarding). While no pane has focus, the system SHALL NOT enable IME
+input routing to any session.
 
 #### Scenario: Click pane claims focus
 
@@ -238,8 +247,10 @@ has focus, the system SHALL NOT enable IME input routing to any session.
 #### Scenario: Click sidebar switches selection without focus
 
 - **WHEN** the user clicks a sidebar agent row to switch the active session
-- **THEN** the main pane renders that agent, but pane keyboard focus is not
-  claimed until the user clicks inside the pane area
+- **THEN** the main pane renders that agent and its pane claims keyboard
+  focus in the same step; no additional click inside the pane area is
+  required (the two-step behavior this scenario's name refers to is
+  superseded by the one-step model)
 
 #### Scenario: Active vs inactive pane stroke
 

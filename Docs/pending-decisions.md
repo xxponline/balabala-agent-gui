@@ -67,10 +67,11 @@ resize 需要字体 metrics + SIGWINCH 通知, 是独立的工作块。
 
 ## 统一 sidebar 事件处理器
 
-**当前选择**: sidebar::render 返回一个 `SidebarAction` struct, app.rs 在 ui()
-里用一长串 `if let ... = action.xxx` 匹配并调用相应方法。
-
-**为什么这样选**: MVP 阶段直通, 不引入事件总线 / 命令模式。
+**当前选择 (2026-11-06 更新, change `port-ui-to-gpui-kit`)**: 回调式分发 —
+gpui 版 sidebar 渲染时经 `cx.listener` 给每个控件挂闭包, 点击经 entity
+update 直接进入 `TerminalApp` 的方法 (design D7); `SidebarAction` struct
+已退役, egui 时代的 `if let` 链随之消失。不引入事件总线 / 命令模式的
+取舍不变 (理由同下)。
 
 **未来需要重新评估的信号**:
 - action 种类继续膨胀 (现在已经 6 种), if 链可读性下降
@@ -82,22 +83,17 @@ resize 需要字体 metrics + SIGWINCH 通知, 是独立的工作块。
 - 在 app 层维护一个 `CommandQueue` 或 `EventBus`
 - sidebar 只负责发出事件, 不直接触发状态变更
 
-## rfd 同步调用阻塞主线程
+## rfd 文件夹选择 (原: 同步调用阻塞主线程)
 
-**当前选择**: 用 `rfd::FileDialog::pick_folder()` 同步调用, 直接在 egui 的
-ui() 里阻塞等用户选完。
+**状态: 已解决** (2026-11-06, change `port-ui-to-gpui-kit`)。
 
-**为什么这样选**: MVP 阶段最简, 用户主动点的按钮, 阻塞期间用户本来就在
-等对话框。
-
-**未来需要重新评估的信号**:
-- macOS 上某些版本会卡窗口 /  beach ball
-- 想在对话框打开期间让后台 pty 继续渲染
-- pick_folder() 被绑到非用户手势的代码路径上 (比如自动恢复)
-
-**要做的事**:
-- 切到 `rfd::AsyncFileDialog`
-- 把 Future 句柄存在 app 状态里, 每帧 poll
+- 同步版在 gpui 下会崩溃: 模态循环阻塞期间监听器仍持有 App 可变借用,
+  50ms drain 循环的 `weak.update` 重入借用 → RefCell panic (实测)。
+- 已切到 `rfd::AsyncFileDialog` + `cx.spawn`, Future 句柄存于 shell 的
+  `_dialog_task` (design D8); 对话框打开期间主线程照常跑 drain 循环。
+- 通则: gpui 事件监听器内禁止任何阻塞调用 (design D3)。
+- 原记录的 "要做的事" (切 AsyncFileDialog + 存 Future 句柄) 已完成;
+  gpui 原生 `prompt_for_paths` 仍是可选的后续替换 (D8)。
 
 ## 持久化路径选择 (项目本地 vs 用户目录)
 
@@ -135,17 +131,13 @@ workspaces.json 就在哪, 心智最简单。
 
 ## 一步切 pane focus (点 sidebar 直接拿焦点)
 
-**当前选择**: 两步操作 — 点 sidebar 切 selection, 再点 pane 区域才拿
-键盘焦点 (IME 才激活)。
+**状态: 已解决** (2026-11-06, change `port-ui-to-gpui-kit`)。
 
-**为什么这样选**: MVP 阶段信任 egui 的 focus 系统, 不自己跟踪
-"当前哪个 pane 有 focus"。
-
-**未来需要重新评估的信号**:
-- 用户抱怨 "切了 agent 还要再点一下才能打字", 体验差
-- 想做 keyboard-only 导航 (Tab 切 agent)
-
-**要做的事**:
-- sidebar 点 agent 行时, 调 `ctx.memory_mut(|m| m.focused = Some(frame_id))`
-- 或者用 `response.request_focus()` 的等价 API
-- 跟 InteractiveFrame 的全局 ID 协调好
+- 一步式模型落地: 点 sidebar agent 行 → 同时聚焦 `pane_focus:
+  FocusHandle`, 键盘/IME 即刻生效, 无需再点面板。
+- 聚焦态可视化: 终端面板框蓝 (聚焦) / 灰 (失焦)。
+- specs delta 已同步 ("Sidebar selection grants keyboard and IME focus
+  in one step")。
+- 原两步方案 (egui `InteractiveFrame` + `memory.focused`) 已随 egui 删除。
+- 仍待未来: keyboard-only 导航 — sidebar 尚未进 Tab 序, Tab 目前只在
+  终端面板内被转发 (Terminal context 绑定)。

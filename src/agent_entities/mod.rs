@@ -13,6 +13,10 @@ use vt100::Screen;
 pub mod pi_agent_pty;
 pub use pi_agent_pty::PiAgentPty;
 
+/// gpui entity 包装: shell 以 `Entity<AgentSession>` 持有会话,
+/// 通过 `read(cx)` / `update(cx)` 安全访问 (design D2)。
+pub struct AgentSession(pub Box<dyn AgentEntity>);
+
 /// reader 线程 -> UI 线程 的事件类型
 #[derive(Debug)]
 pub enum AgentEvent {
@@ -45,8 +49,9 @@ pub trait AgentEntity {
     fn screen(&self) -> &Screen;
 
     /// 把 reader channel 里的新事件吃掉, 顺便更新 status / parser。
-    /// 由 egui 的 logic() 每帧调用。
-    fn poll(&mut self);
+    /// 返回 true 表示本次 drain 消费了事件 (UI 据此决定是否 notify)。
+    /// 由 shell 的节流循环每 50ms 调用。
+    fn poll(&mut self) -> bool;
 
     /// 把用户键盘输入的字节送回子进程 stdin
     fn send_input(&mut self, bytes: &[u8]);
