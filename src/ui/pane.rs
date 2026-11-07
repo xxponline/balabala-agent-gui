@@ -93,11 +93,19 @@ pub fn terminal_grid(screen: &Screen) -> Div {
         let mut cur_text = String::new();
 
         for c in 0..cols {
-            let Some(cell) = screen.cell(r, c) else {
-                continue;
+            let cell = screen.cell(r, c);
+            let (mut fg, mut bg) = match cell {
+                Some(cell) => (fg_to_gpui(cell.fgcolor()), bg_to_gpui(cell.bgcolor())),
+                None => (default_fg, default_bg),
             };
-            let mut fg = fg_to_gpui(cell.fgcolor());
-            let mut bg = bg_to_gpui(cell.bgcolor());
+            // 未写入的 cell (ratatui 增量绘制下常见) 按真实终端的空格对待:
+            // 用不换行空格 U+00A0 参与成段——普通空格串可能被行盒裁剪,
+            // 空段会让行 div 无子元素而坍缩成 0 高, 上下内容粘连
+            // (验收缺陷: 输入框贴顶显示)。
+            let text: &str = match cell {
+                Some(cell) if !cell.contents().is_empty() => cell.contents(),
+                _ => "\u{00a0}",
+            };
 
             // 光标: 前景/背景互换 (静态反色块)
             if cursor == (r, c) {
@@ -109,7 +117,7 @@ pub fn terminal_grid(screen: &Screen) -> Div {
             }
             cur_fg = fg;
             cur_bg = bg;
-            cur_text.push_str(cell.contents());
+            cur_text.push_str(text);
         }
         if !cur_text.is_empty() {
             segments.push((cur_text, cur_fg, cur_bg));
