@@ -5,8 +5,10 @@ edition = "2024"
 
 [dependencies]
 gpui-kit = "0.9.0"
-portable-pty = "0.9.0"
 vt100 = "0.18.1"
 rfd = "0.15.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+crossterm = "0.29.0"
+# 本地开发：直接引用 ref/ 下的副本，修改立即生效，不走网络
+pi-shell-rs = { path = "ref/pi-shell-rs" }

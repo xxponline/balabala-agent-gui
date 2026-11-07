@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use gpui_kit::*;
 
-use crate::agent_entities::{AgentSession, PiAgentPty, SessionStatus};
+use crate::agent_entities::{AgentSession, PiAgentShell, SessionStatus};
 use crate::ui;
 use crate::workspace::{Workspace, store};
 
@@ -20,33 +20,41 @@ actions!(terminal, [TerminalTab]);
 /// 把按键映射为终端字节 (与 spike 同一张表):
 /// 可打印字符优先 key_char, 特殊键按名字。Ctrl/Cmd/Function 组合
 /// 不在此列 (调用方负责过滤 — spec: Ctrl 组合不转发)。
-fn keystroke_to_bytes(key: &str, key_char: Option<&str>) -> Option<Vec<u8>> {
-    let special: Option<&[u8]> = match key {
-        "enter" | "return" => Some(b"\r"),
-        "backspace" => Some(b"\x7f"),
-        "tab" => Some(b"\t"),
-        "up" => Some(b"\x1b[A"),
-        "down" => Some(b"\x1b[B"),
-        "right" => Some(b"\x1b[C"),
-        "left" => Some(b"\x1b[D"),
+/// GPUI keystroke → crossterm 键事件（通常 0/1 个；`key_char` 多字符时逐字）。
+/// 映射语义与原 `keystroke_to_bytes` 一致：特殊键 + 可打印字符。
+fn keystroke_to_keyevents(key: &str, key_char: Option<&str>) -> Vec<crossterm::event::KeyEvent> {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let special: Option<KeyCode> = match key {
+        "enter" | "return" => Some(KeyCode::Enter),
+        "backspace" => Some(KeyCode::Backspace),
+        "tab" => Some(KeyCode::Tab),
+        "up" => Some(KeyCode::Up),
+        "down" => Some(KeyCode::Down),
+        "right" => Some(KeyCode::Right),
+        "left" => Some(KeyCode::Left),
         _ => None,
     };
-    if let Some(b) = special {
-        return Some(b.to_vec());
+    if let Some(code) = special {
+        return vec![KeyEvent::new(code, KeyModifiers::NONE)];
     }
     // 可打印字符: 优先平台给出的合成字符
     if let Some(c) = key_char {
         if !c.is_empty() {
-            return Some(c.as_bytes().to_vec());
+            return c
+                .chars()
+                .map(|ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .collect();
         }
     }
     if key == "space" {
-        return Some(b" ".to_vec());
+        return vec![KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)];
     }
     if key.chars().count() == 1 {
-        return Some(key.as_bytes().to_vec());
+        if let Some(ch) = key.chars().next() {
+            return vec![KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)];
+        }
     }
-    None
+    vec![]
 }
 
 pub struct TerminalApp {
@@ -114,7 +122,8 @@ impl TerminalApp {
         self.persist();
     }
 
-    /// 用户点了某个 workspace 下的 "[+ agent]": spawn pi 子进程,
+    /// 用户点了某个 workspace 下的 "[+ agent]": 创建嵌入式 agent 会话
+    /// (进程内 pi-shell-rs + pi --mode rpc),
     /// 命名 <dirname>/pi-N (每 workspace 独立计数), 并设为 active。
     pub fn create_agent(&mut self, ws_idx: usize, cx: &mut Context<Self>) {
         if ws_idx >= self.workspaces.len() {
@@ -125,9 +134,9 @@ impl TerminalApp {
             (ws.new_agent_name(), ws.path.clone())
         };
 
-        match PiAgentPty::new(name, "pi".to_string(), cwd) {
-            Ok(pty) => {
-                let entity = cx.new(|_| AgentSession(Box::new(pty)));
+        match PiAgentShell::new(name, cwd) {
+            Ok(shell) => {
+                let entity = cx.new(|_| AgentSession(Box::new(shell)));
                 let ws = &mut self.workspaces[ws_idx];
                 ws.agents.push(entity);
                 let agent_idx = ws.agents.len() - 1;
@@ -172,8 +181,8 @@ impl TerminalApp {
         };
     }
 
-    /// 把字节送给 active session 的 pty stdin。
-    fn send_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+    /// 把一个键送给 active session。
+    fn send_key(&mut self, key: crossterm::event::KeyEvent, cx: &mut Context<Self>) {
         let Some((ws_idx, agent_idx)) = self.active else {
             return;
         };
@@ -184,11 +193,26 @@ impl TerminalApp {
         else {
             return;
         };
-        session.update(cx, |s, _| s.0.send_input(bytes));
+        session.update(cx, |s, _| s.0.send_key(key));
+    }
+
+    /// 把一段已提交文本（IME commit / 粘贴）送给 active session。
+    fn send_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let Some((ws_idx, agent_idx)) = self.active else {
+            return;
+        };
+        let Some(session) = self
+            .workspaces
+            .get(ws_idx)
+            .and_then(|w| w.agents.get(agent_idx))
+        else {
+            return;
+        };
+        session.update(cx, |s, _| s.0.send_text(text));
     }
 
     /// 键盘转发 (design D5, spike 已验证的机制):
-    /// 可打印字符/控制键 → 字节; 每次转发都 stop_propagation,
+    /// 可打印字符/控制键 → crossterm 键事件; 每次转发都 stop_propagation,
     /// 阻止 macOS 后端把同一个键再交给 input context (insertText
     /// 双发)。Ctrl/Cmd/Function 组合不转发也不阻止传播。
     fn handle_key_down(
@@ -204,8 +228,11 @@ impl TerminalApp {
         if ks.modifiers.control || ks.modifiers.platform || ks.modifiers.function {
             return; // 平台快捷键 / IME 菜单照常工作 (spec: Ctrl 不转发)
         }
-        if let Some(bytes) = keystroke_to_bytes(&ks.key, ks.key_char.as_deref()) {
-            self.send_input(&bytes, cx);
+        let keys = keystroke_to_keyevents(&ks.key, ks.key_char.as_deref());
+        if !keys.is_empty() {
+            for key in keys {
+                self.send_key(key, cx);
+            }
             cx.stop_propagation(); // 防双发 (见上)
         }
     }
@@ -301,8 +328,7 @@ impl EntityInputHandler for TerminalApp {
         cx: &mut Context<Self>,
     ) {
         if !text.is_empty() {
-            let bytes = text.as_bytes().to_vec();
-            self.send_input(&bytes, cx);
+            self.send_text(text, cx);
         }
     }
 
@@ -479,7 +505,13 @@ impl Render for TerminalApp {
                     .on_action(cx.listener(|this, _: &TerminalTab, _window, cx| {
                         // Tab 被 Terminal context 的绑定截获 (原始 key
                         // event 不再派发), 在动作里转发 — 单路径 (D5)
-                        this.send_input(b"\t", cx);
+                        this.send_key(
+                            crossterm::event::KeyEvent::new(
+                                crossterm::event::KeyCode::Tab,
+                                crossterm::event::KeyModifiers::NONE,
+                            ),
+                            cx,
+                        );
                         cx.stop_propagation();
                     }))
                     .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
