@@ -122,7 +122,11 @@ The main pane SHALL render the active session's terminal screen cell-by-cell
 using monospace text. It SHALL preserve foreground and background colors
 produced by the session's embedded interface, and SHALL draw the terminal
 cursor as a static block (foreground/background inverted at the cursor
-position).
+position). Every rendered row SHALL have a pixel width exactly equal to the
+grid's column count times the monospace cell width: a wide character (e.g.
+CJK) SHALL contribute two cells of width, its continuation cell SHALL NOT be
+painted as an extra column, and an empty cell SHALL contribute one cell of
+width.
 
 #### Scenario: ANSI colors preserved
 
@@ -133,6 +137,20 @@ position).
 
 - **WHEN** the active session's vt100 parser reports a cursor position
 - **THEN** the cell at that position is rendered with inverted colors
+
+#### Scenario: Mixed ASCII/CJK row stays aligned
+
+- **WHEN** a row contains both ASCII characters and CJK characters (e.g.
+  `> 帮我解释这段代码`)
+- **THEN** the row's rendered width equals its logical column count times the
+  cell width, and the row's right edge lines up with rows containing only
+  ASCII characters of the same column count
+
+#### Scenario: Wide character continuation not painted
+
+- **WHEN** the vt100 screen reports a cell as a wide-character continuation
+- **THEN** that cell contributes no additional rendered width beyond the two
+  cells already consumed by its leading wide character
 ### Requirement: Keyboard input forwarding
 
 While the application window is focused, the system SHALL deliver to the
@@ -253,3 +271,50 @@ input routing to any session.
 - **WHEN** an agent session is selected for display in the main pane
 - **THEN** the pane border is drawn in the active color (blue); when no
   agent is selected, the pane is not rendered as an interactive surface
+### Requirement: Adaptive terminal grid sizing
+
+The terminal grid's column and row counts SHALL be derived from the measured
+pixel area available to the grid and the pane's monospace metrics (cell
+advance width and line height), using floor division clamped to a safe
+minimum (never zero or an invalid size).
+
+#### Scenario: Window resize changes grid resolution
+
+- **WHEN** the user enlarges the application window while a session is shown
+  in the main pane
+- **THEN** the grid renders more columns and/or rows in the freed space
+
+#### Scenario: Tiny pane clamps to minimum size
+
+- **WHEN** the pane is shrunk so that the pixel area would compute fewer than
+  the minimum columns or rows
+- **THEN** the grid uses the minimum dimensions instead of zero or an
+  invalid size
+
+### Requirement: Grid resize propagation
+
+When the computed grid dimensions differ from the current dimensions, the
+system SHALL propagate the new size to both the embedded interface (so its
+TUI re-lays out and redraws) and the session's vt100 screen (so the parsed
+screen reflows), in the same step. When dimensions are unchanged, no resize
+SHALL be propagated. Sessions in the `exited` state SHALL NOT be resized, so
+their preserved last rendered screen is not reflowed.
+
+#### Scenario: Resize reaches the embedded TUI
+
+- **WHEN** a session's grid dimensions change while it is running
+- **THEN** the embedded TUI redraws its layout for the new size and the
+  following parsed screen reflects the new dimensions
+
+#### Scenario: Unchanged layout propagates nothing
+
+- **WHEN** repaints occur while the grid's computed (columns, rows) equal its
+  current dimensions
+- **THEN** no resize is propagated to the embedded interface or the vt100
+  screen
+
+#### Scenario: Exited session screen preserved
+
+- **WHEN** the window is resized while the active session (or a background
+  session) is in the `exited` state
+- **THEN** that session's vt100 screen and last rendered frame are unchanged
