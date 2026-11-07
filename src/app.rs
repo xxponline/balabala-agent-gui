@@ -17,6 +17,10 @@ use crate::workspace::{Workspace, store};
 // Terminal context 绑定胜出 (design D5, spike 已验证)。
 actions!(terminal, [TerminalTab]);
 
+/// 网格最小尺寸 (spec: Tiny pane clamps to minimum size; design D2)
+const MIN_GRID_COLS: u16 = 20;
+const MIN_GRID_ROWS: u16 = 5;
+
 /// 把按键映射为终端字节 (与 spike 同一张表):
 /// 可打印字符优先 key_char, 特殊键按名字。Ctrl/Cmd/Function 组合
 /// 不在此列 (调用方负责过滤 — spec: Ctrl 组合不转发)。
@@ -70,6 +74,8 @@ pub struct TerminalApp {
     _update_task: Option<Task<()>>,
     /// 进行中的异步文件夹选择任务 (design D8; 换新对话框时旧任务被取消)
     _dialog_task: Option<Task<()>>,
+    /// 累计实际传播的网格 resize 次数 (诊断/测试观测: 输入型重绘不增)
+    pub grid_resizes: usize,
 }
 
 impl TerminalApp {
@@ -87,6 +93,7 @@ impl TerminalApp {
             save_error: None,
             _update_task: None,
             _dialog_task: None,
+            grid_resizes: 0,
             pane_focus: cx.focus_handle(),
         })
     }
@@ -234,6 +241,50 @@ impl TerminalApp {
                 self.send_key(key, cx);
             }
             cx.stop_propagation(); // 防双发 (见上)
+        }
+    }
+
+    /// 把 (cols, rows) 分发给所有会话 (Exited 会话自行跳过, spec:
+    /// Grid resize propagation); 仅当至少一个会话实际改变尺寸时才打
+    /// 日志并累加 `grid_resizes` — 未变尺寸的重绘零传播零日志 (去重
+    /// 在 `AgentEntity::resize` 内按会话进行)。
+    ///
+    /// 输入: cols/rows — 目标网格尺寸 (已夹取下限); w/h — 面板像素面积;
+    ///       cell_w/line_h — 度量值 (日志用); cx — 实体上下文
+    /// 输出: 副作用为传播 resize + notify + 诊断日志
+    fn propagate_grid_size(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        w: f32,
+        h: f32,
+        cell_w: Pixels,
+        line_h: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        let mut resized = 0usize;
+        for ws in &self.workspaces {
+            for session in &ws.agents {
+                if session.update(cx, |s, cx| {
+                    if s.0.resize(cols, rows) {
+                        cx.notify();
+                        true
+                    } else {
+                        false
+                    }
+                }) {
+                    resized += 1;
+                }
+            }
+        }
+        if resized > 0 {
+            self.grid_resizes += resized;
+            eprintln!(
+                "[grid] pane {w:.0}x{h:.0}px -> {cols}x{rows} cells \
+                 (cell_w {:.2}, line_h {:.2}); resized {resized} session(s)",
+                f32::from(cell_w),
+                f32::from(line_h)
+            );
         }
     }
 
@@ -424,7 +475,7 @@ impl EntityInputHandler for TerminalApp {
 }
 
 impl Render for TerminalApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // gpui 元素树要求拥有数据: 行数据先快照成值
         let mut ws_rows = Vec::with_capacity(self.workspaces.len());
         for (ws_idx, w) in self.workspaces.iter().enumerate() {
@@ -463,7 +514,7 @@ impl Render for TerminalApp {
                         path: s.0.ws_path().to_string_lossy().to_string(),
                         name: s.0.name().to_string(),
                         status: s.0.status(),
-                        grid: ui::pane::terminal_grid(s.0.screen()),
+                        grid: ui::pane::terminal_grid(s.0.screen(), window),
                     }
                 }),
             None => None,
@@ -493,6 +544,10 @@ impl Render for TerminalApp {
             .child(
                 div()
                     .id("terminal-pane")
+                    // 与网格容器同理: root 是横排 flex, 此项主轴为水平,
+                    // overflow visible 时自动最小尺寸=内容最小宽 (网格 780px)
+                    // 会把整个 pane 撑宽并挤出窗口 — 裁剪切断该反馈链
+                    .overflow_hidden()
                     .flex_1()
                     .h_full()
                     .flex()
@@ -539,6 +594,26 @@ impl Render for TerminalApp {
                                 .children(starting.then(ui::pane::starting_placeholder))
                                 .child(
                                     div()
+                                        // 网格区域锚点: 自适应测量的 bounds
+                                        // 即此 div (canvas size_full 同界),
+                                        // 测试经此断言换算 (test_support 在
+                                        // 非测试构建下为 no-op)
+                                        .id("terminal-grid")
+                                        .test_support()
+                                        // 断开反馈环: 否则 flex 自动最小尺寸让
+                                        // 此 div 被网格内容撑大 (回退 100x30 =
+                                        // 780x630px), canvas 量到的是内容而非
+                                        // 可用面积, floor 捰好落回回退值后去重
+                                        // 永久锁死溢出。overflow != visible 时
+                                        // 自动最小尺寸为 0 -> bounds = 可用面积,
+                                        // 溢出行按真实终端裁剪 (spec: area
+                                        // available to the grid)
+                                        .overflow_hidden()
+                                        // 显式清零双轴自动最小尺寸: taffy 对
+                                        // cross 轴的 auto-min 不看 overflow,
+                                        // 内容仍会把宽度撑到 780px (反馈环残留)
+                                        .min_w(px(0.))
+                                        .min_h(px(0.))
                                         .flex_1()
                                         .w_full()
                                         .child(data.grid)
@@ -552,10 +627,39 @@ impl Render for TerminalApp {
                                                         &focus,
                                                         ElementInputHandler::new(
                                                             pane_bounds,
-                                                            view_entity,
+                                                            view_entity.clone(),
                                                         ),
                                                         cx,
                                                     );
+                                                    // 自适应 (spec: Adaptive terminal
+                                                    // grid sizing): 量网格区域 -> 换算
+                                                    // 列/行 (floor + 下限夹取) ->
+                                                    // defer 分发 (paint 阶段不能直接
+                                                    // 改实体)
+                                                    let (cell_w, line_h) =
+                                                        ui::pane::grid_metrics(window);
+                                                    let (w, h) = (
+                                                        f32::from(pane_bounds.size.width),
+                                                        f32::from(pane_bounds.size.height),
+                                                    );
+                                                    let clamp = |v: f32, min: u16| {
+                                                        (v.floor() as i64)
+                                                            .clamp(min as i64, u16::MAX as i64)
+                                                            as u16
+                                                    };
+                                                    let cols =
+                                                        clamp(w / f32::from(cell_w), MIN_GRID_COLS);
+                                                    let rows =
+                                                        clamp(h / f32::from(line_h), MIN_GRID_ROWS);
+                                                    let entity = view_entity.clone();
+                                                    cx.defer(move |cx| {
+                                                        entity.update(cx, |app, cx| {
+                                                            app.propagate_grid_size(
+                                                                cols, rows, w, h, cell_w, line_h,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    });
                                                 },
                                             )
                                             .absolute()
@@ -565,5 +669,181 @@ impl Render for TerminalApp {
                         }
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 自适应网格分发的无头验证 (spec: Adaptive terminal grid sizing /
+    //! Grid resize propagation): canvas paint 量出的 bounds 经 defer 分发,
+    //! 换算与去重在真实渲染路径上成立。显式导入、不用 glob (避免
+    //! `gpui_kit::*` 把 `#[test]` 宏遮蔽掉)。
+
+    use super::{MIN_GRID_COLS, MIN_GRID_ROWS, TerminalApp};
+    use crate::agent_entities::{AgentSession, PiAgentShell};
+    use crate::ui::pane::grid_metrics;
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{
+        AppContext, Bounds, Point, TestAppContext, WindowBounds, WindowOptions, px, size,
+    };
+    use std::fs;
+    use std::io::Write as _;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// 假 pi (与 tests/embed_layout.rs 同款), 供 stub 会话嵌入。
+    fn write_stub(dir: &std::path::Path) -> std::path::PathBuf {
+        let pwd_file = dir.join("pwd.txt");
+        let script = format!(
+            "#!/bin/sh\npwd > '{}'\nwhile IFS= read -r line; do\n  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n  printf '{{\"type\":\"response\",\"id\":\"%s\",\"success\":true,\"data\":{{}}}}\\n' \"$id\"\ndone\n",
+            pwd_file.display()
+        );
+        let path = dir.join("fake-pi.sh");
+        let mut f = fs::File::create(&path).unwrap();
+        f.write_all(script.as_bytes()).unwrap();
+        drop(f);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    #[gpui_kit::test]
+    fn adaptive_grid_dispatch(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, app_entity) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1000.), px(600.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |_window, cx| {
+                    cx.new(|cx| TerminalApp::new(cx).expect(".workspaces.json 加载"))
+                },
+            )
+            .expect("open test window")
+        });
+
+        // 注入 stub 会话并激活 (绕过 create_agent: 它走真实 pi)
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("grid-dispatch-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let stub = write_stub(&dir);
+        app_entity.update(cx, |app, cx| {
+            assert!(
+                !app.workspaces.is_empty(),
+                "测试需要 .workspaces.json 中至少一个 workspace"
+            );
+            let shell = PiAgentShell::new_with_pi_bin(
+                "pi-t".into(),
+                std::env::temp_dir(),
+                Some(stub.to_str().unwrap().to_string()),
+            )
+            .expect("stub embed spawn");
+            let e = cx.new(|_| AgentSession(Box::new(shell)));
+            app.workspaces[0].agents.push(e);
+            app.active = Some((0, app.workspaces[0].agents.len() - 1));
+        });
+
+        // frame 1: paint 量 bounds -> defer 分发
+        let _ = cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+        });
+        cx.run_until_parked();
+
+        // 读取分发结果 + 网格区域 bounds + 度量
+        let (resizes1, screen) = app_entity.read_with(cx, |app, cx| {
+            let s = app.workspaces[0].agents[0].read(cx);
+            (app.grid_resizes, s.0.screen().size())
+        });
+        let (win_bounds, bounds, (cell_w, line_h)) = cx
+            .update_window(handle.into(), |_, window, _cx| {
+                let b = window.find("terminal-grid").bounds();
+                (window.bounds(), b, grid_metrics(window))
+            })
+            .expect("update window");
+        eprintln!(
+            "[dbg] window {:?}x{:?} grid {}x{} cell_w {:.2} line_h {:.2}",
+            f32::from(win_bounds.size.width),
+            f32::from(win_bounds.size.height),
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+            f32::from(cell_w),
+            f32::from(line_h),
+        );
+
+        // 换算必须与 paint 侧同一公式一致 (1.1 bounds 流通 + 3.1 分发)
+        let clamp = |v: f32, min: u16| {
+            (v.floor() as i64).clamp(min as i64, u16::MAX as i64) as u16
+        };
+        let exp_cols = clamp(f32::from(bounds.size.width) / f32::from(cell_w), MIN_GRID_COLS);
+        let exp_rows = clamp(f32::from(bounds.size.height) / f32::from(line_h), MIN_GRID_ROWS);
+        assert!(
+            resizes1 >= 1,
+            "首帧测量后应至少传播一次 resize, 得 {resizes1}"
+        );
+        assert_eq!(screen.1.get(), exp_cols, "会话列数 = floor(宽/cell_w)");
+        assert_eq!(screen.0.get(), exp_rows, "会话行数 = floor(高/line_h)");
+        // bounds 应排除 sidebar (240px) 与 chrome: 1000px 窗口下明显小于全宽
+        assert!(
+            f32::from(bounds.size.width) < 800.,
+            "网格 bounds 应排除 sidebar 等 chrome: {}",
+            f32::from(bounds.size.width)
+        );
+
+        // 3.2: 未变布局的重绘零传播 (计数不变 = 无 resize 调用)
+        let _ = cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+        });
+        cx.run_until_parked();
+        let resizes2 = app_entity.read_with(cx, |app, _| app.grid_resizes);
+        assert_eq!(
+            resizes2, resizes1,
+            "输入型重绘不得再传播 resize (去重)"
+        );
+
+        // 1.1: 窗口 resize -> canvas 量到的 bounds 跟踪面板 -> 再传播一次
+        cx.simulate_window_resize(handle.into(), size(px(1200.), px(700.)));
+        let _ = cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+        });
+        cx.run_until_parked();
+        let (resizes3, screen3) = app_entity.read_with(cx, |app, cx| {
+            let s = app.workspaces[0].agents[0].read(cx);
+            (app.grid_resizes, s.0.screen().size())
+        });
+        let bounds3 = cx
+            .update_window(handle.into(), |_, window, _cx| {
+                window.find("terminal-grid").bounds()
+            })
+            .expect("update window");
+        eprintln!("[dbg] after resize: resizes {resizes1}->{resizes2}->{resizes3} bounds {}x{} -> {}x{}", f32::from(bounds.size.width), f32::from(bounds.size.height), f32::from(bounds3.size.width), f32::from(bounds3.size.height));
+        assert!(resizes3 > resizes2, "窗口 resize 后必须再传播一次");
+        assert!(
+            f32::from(bounds3.size.width) > f32::from(bounds.size.width),
+            "bounds 应随窗口变宽: {} -> {}",
+            f32::from(bounds.size.width),
+            f32::from(bounds3.size.width)
+        );
+        let exp_cols3 = clamp(f32::from(bounds3.size.width) / f32::from(cell_w), MIN_GRID_COLS);
+        let exp_rows3 = clamp(f32::from(bounds3.size.height) / f32::from(line_h), MIN_GRID_ROWS);
+        assert_eq!(screen3.1.get(), exp_cols3, "resize 后列数跟随新 bounds");
+        assert_eq!(screen3.0.get(), exp_rows3, "resize 后行数跟随新 bounds");
+
+        // 收尾: 关会话、清 stub
+        app_entity.update(cx, |app, cx| {
+            if let Some(e) = app.workspaces.get_mut(0).and_then(|w| w.agents.pop()) {
+                e.update(cx, |s, _| s.0.shutdown());
+            }
+        });
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -54,4 +54,12 @@ pub trait AgentEntity {
 
     /// 当前状态 (Starting / Running / Exited)
     fn status(&self) -> SessionStatus;
+
+    /// 调整终端网格尺寸 (spec: Adaptive terminal grid sizing / Grid resize
+    /// propagation): 同步传播到会话的嵌入 TUI 与 vt100 屏幕两半。
+    ///
+    /// 输入: cols/rows — 目标网格列/行数 (调用方负责下限夹取)
+    /// 输出: true 表示实际传播了 resize (尺寸与当前不同且会话未 Exited);
+    ///       false 表示去重跳过或会话已 Exited (保留最后画面, 不 reflow)
+    fn resize(&mut self, cols: u16, rows: u16) -> bool;
 }
