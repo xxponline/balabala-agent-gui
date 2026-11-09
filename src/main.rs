@@ -7,6 +7,9 @@
 
 mod agent_entities;
 mod app;
+mod pane;
+mod shell;
+mod sidebar;
 mod ui;
 mod workspace;
 
@@ -40,9 +43,9 @@ fn main() {
             ..Default::default()
         };
 
-        gpui_kit::open_window(options, cx, |_window, cx| {
+        gpui_kit::open_window(options, cx, |window, cx| {
             cx.new(|cx| {
-                let mut app = match TerminalApp::new(cx) {
+                let mut app = match TerminalApp::new(window, cx) {
                     Ok(app) => app,
                     Err(e) => {
                         rfd::MessageDialog::new()

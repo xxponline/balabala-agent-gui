@@ -141,3 +141,61 @@ workspaces.json 就在哪, 心智最简单。
 - 原两步方案 (egui `InteractiveFrame` + `memory.focused`) 已随 egui 删除。
 - 仍待未来: keyboard-only 导航 — sidebar 尚未进 Tab 序, Tab 目前只在
   终端面板内被转发 (Terminal context 绑定)。
+
+## Streaming 活动指示 (badge 视觉反馈)
+
+**当前选择**: 不做 — 维持 spec 三态 (starting / running / exited)。
+
+**背景 (2026-11-09, change `split-ui-modules-dockarea` 6.1 验收)**:
+用户报告 "badge 在 streaming 期间没有实时变动"。诊断结论: **badge 无缺陷** —
+- 创建后即绿: pi 首帧输出极快 (<100ms), 黄点 starting 一闪而过, 肉眼即"直接变绿";
+- streaming 期间不变: running → running **本来就没有状态变化**, spec 无此态;
+- quit 变红 (exited): 实时 ✓ (无头回归测试 `status_badge_refreshes_via_drain_loop`
+  验证全链: drain → notify 转发 → 面板重渲)。
+
+**未来需要重新评估的信号**:
+- 用户明确想要 streaming 时的视觉反馈 (如"让绿点知道它在干活")
+- 多 agent 并行时需要区分"哪个在流式输出"
+
+**要做的事** (若立项):
+- spec delta: agent-shell 的 status badge requirement 扩展一个活动态
+  (或独立 capability), 定义视觉语义 (脉冲/闪烁/透明度呼吸)
+- 实现点: 与 drain 循环联动 (有帧消费 -> 临时活动态 -> 超时回落 running)
+- 注意: 活动态是**纯视觉**, 不改变三态语义与 quit 行为
+
+**备选方案**:
+- A: 绿点脉冲动画 (透明度呼吸, 有帧消费时启动, idle 停)
+- B: 状态点旁小 spinner 字符 (网格内不可行, 只能 sidebar 侧)
+- C: badge 数字/计数 (如本次会话 token 流量) — 依赖 pi 状态快照
+
+## pi-shell-rs 不处理 Tab 键 (原生 TUI 功能在 embed 路径缺失)
+
+**状态**: 待查 (2026-11-09, change `split-ui-modules-dockarea` 6.1 的 F3 诊断发现)。
+
+**现象**: Tab 键经完整链路送达后**零反应** — 光标不动、整屏内容不变;
+同一 `inject_key` 通道的 Left/Right/Backspace 均有反应。诊断复现:
+`cargo test diagnostic_per_commit -- --ignored --nocapture` (key Tab 段)。
+
+**应用侧已全部证实无责**:
+- 真机: `[F3] TerminalTab action fired -> send_key(Tab)` ×3 (绑定截获路径通);
+- CI: `sidebar_select_grants_one_step_focus` 断言3 (`tab_forwards` 计数) 守卫
+  spec "Tab SHALL be delivered" 转发边界;
+- 通道: 同 `embed.inject_key` 的其他键全部正常送达并生效。
+
+**关键线索 (用户)**: **原生 TUI 的 Tab 是有对应功能的** → 问题大概率在
+pi-shell-rs 的 key 事件封装/注入层, 而非 pi 本身。
+
+**未来需要重新评估的信号**:
+- 修好后: embed 路径 Tab 行为应与原生 TUI 一致 (可跑 diagnostic 对比)
+
+**要做的事** (排查方向, 按嫌疑排序):
+- `event.rs` 的 `key_intent` 分类 (event.rs:200-206): `UiEvent::Key(Tab)` 是否
+  被分类成被丢弃/降级的 intent (已有 `KeyIntent::SendFollowUp` 等分类器)
+- embed 事件循环消费 `UiEvent::Key` 的路径 (embed.rs:140 入队后): 注入 TUI
+  时是否过滤了 Tab / 非文本键
+- 对照原生模式 (crossterm 直通) 与 embed 模式的按键处理差异
+
+**备选方案**:
+- A: pi-shell-rs 修复 Tab 注入 (首选, 保持与原生一致)
+- B: 若 embed 场景确不适用 Tab → 文档化已知限制, spec 交付边界不变
+  (应用侧已送达, 属 pi-shell 行为)

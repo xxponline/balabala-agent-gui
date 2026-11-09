@@ -3,13 +3,16 @@
 //! 行为规格见 openspec/specs/{agent-shell,workspace-management}。
 //! sidebar 3.x 接入, 终端面板 4.x 接入。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui_kit::*;
+use gpui_kit::component::dock::{DockArea, DockPlacement};
 
-use crate::agent_entities::{AgentSession, PiAgentShell, SessionStatus};
-use crate::ui;
+use crate::agent_entities::{AgentSession, PiAgentShell};
+use crate::pane::TerminalPanel;
+use crate::shell;
+use crate::sidebar::{SidebarEvent, SidebarPanel};
 use crate::workspace::{Workspace, store};
 
 // Tab 在 Terminal context 下的转发动作: gpui-base 的 Root 全局绑定
@@ -17,76 +20,48 @@ use crate::workspace::{Workspace, store};
 // Terminal context 绑定胜出 (design D5, spike 已验证)。
 actions!(terminal, [TerminalTab]);
 
-/// 网格最小尺寸 (spec: Tiny pane clamps to minimum size; design D2)
-const MIN_GRID_COLS: u16 = 20;
-const MIN_GRID_ROWS: u16 = 5;
-
-/// 把按键映射为终端字节 (与 spike 同一张表):
-/// 可打印字符优先 key_char, 特殊键按名字。Ctrl/Cmd/Function 组合
-/// 不在此列 (调用方负责过滤 — spec: Ctrl 组合不转发)。
-/// GPUI keystroke → crossterm 键事件（通常 0/1 个；`key_char` 多字符时逐字）。
-/// 映射语义与原 `keystroke_to_bytes` 一致：特殊键 + 可打印字符。
-fn keystroke_to_keyevents(key: &str, key_char: Option<&str>) -> Vec<crossterm::event::KeyEvent> {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    let special: Option<KeyCode> = match key {
-        "enter" | "return" => Some(KeyCode::Enter),
-        "backspace" => Some(KeyCode::Backspace),
-        "tab" => Some(KeyCode::Tab),
-        "up" => Some(KeyCode::Up),
-        "down" => Some(KeyCode::Down),
-        "right" => Some(KeyCode::Right),
-        "left" => Some(KeyCode::Left),
-        _ => None,
-    };
-    if let Some(code) = special {
-        return vec![KeyEvent::new(code, KeyModifiers::NONE)];
-    }
-    // 可打印字符: 优先平台给出的合成字符
-    if let Some(c) = key_char {
-        if !c.is_empty() {
-            return c
-                .chars()
-                .map(|ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
-                .collect();
-        }
-    }
-    if key == "space" {
-        return vec![KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)];
-    }
-    if key.chars().count() == 1 {
-        if let Some(ch) = key.chars().next() {
-            return vec![KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)];
-        }
-    }
-    vec![]
-}
-
 pub struct TerminalApp {
     /// 所有 workspace (每个持有一个路径 + 该路径下的 agents)
     pub workspaces: Vec<Workspace>,
-    /// 当前在 main 区显示的 (workspace_idx, agent_idx)
-    pub active: Option<(usize, usize)>,
+    /// 当前 active session 的稳定身份 (D4: gpui EntityId, 索引删除不错位)
+    pub active: Option<EntityId>,
     /// 最近一次持久化失败的错误信息 (在 sidebar 顶部显示)
     pub save_error: Option<String>,
-    /// 主面板的键盘/IME 焦点 (design D4, 一步切焦点: 选中即聚焦)
-    pub pane_focus: FocusHandle,
+    /// DockArea 布局引擎 (design D1): 左|中|右三槽由它编排,
+    /// 是 R3 外壳容器 (`render` 的根 div) 的子节点
+    pub dock_area: Entity<DockArea>,
+    /// sidebar 面板实体 (D2; notify 转发目标 — spike §10.5)
+    pub sidebar: Entity<SidebarPanel>,
+    /// 终端面板实体 (4.1; 焦点在其内, 一步切焦点/步骤 5 进 DockArea 中心)
+    pub terminal: Entity<TerminalPanel>,
     /// 节流 drain 任务; drop 会取消循环 (design D3)
     _update_task: Option<Task<()>>,
     /// 进行中的异步文件夹选择任务 (design D8; 换新对话框时旧任务被取消)
     _dialog_task: Option<Task<()>>,
     /// 累计实际传播的网格 resize 次数 (诊断/测试观测: 输入型重绘不增)
     pub grid_resizes: usize,
+    /// 累计经 send_key 转发给会话的 Tab 键数 (诊断/测试观测: spec
+    /// Keyboard input forwarding - Tab 的端到端守卫; pi 收到 Tab 无可见
+    /// 反应, 只能在转发边界计数验证 — 见 spike F3 结论)
+    pub tab_forwards: usize,
 }
 
 impl TerminalApp {
     /// 启动时从 `.workspaces.json` 读取, 失败时返回 Err 让 main 退出。
-    pub fn new(cx: &mut Context<Self>) -> Result<Self, String> {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Result<Self, String> {
         // Terminal context 下的 tab 终端转发绑定 (Root 的焦点遍历
         // 绑定在更浅的 context, 被这条压过 — design D5)
         cx.bind_keys([KeyBinding::new("tab", TerminalTab, Some("Terminal"))]);
 
         let paths = store::load()?;
         let workspaces = paths.into_iter().map(Workspace::new).collect();
+        // 装配 DockArea 三槽 (shell::build; panel_handle 包装见其文档)
+        let weak_app = cx.weak_entity();
+        let shell::ShellParts {
+            dock_area,
+            sidebar,
+            terminal,
+        } = shell::build(weak_app, window, cx);
         Ok(Self {
             workspaces,
             active: None,
@@ -94,37 +69,33 @@ impl TerminalApp {
             _update_task: None,
             _dialog_task: None,
             grid_resizes: 0,
-            pane_focus: cx.focus_handle(),
+            tab_forwards: 0,
+            dock_area,
+            sidebar,
+            terminal,
         })
     }
 
     /// 点 workspace 行: 只切折叠状态。
-    /// (spec: 不切 active, 不抢键盘焦点)
-    pub fn toggle_collapse(&mut self, ws_idx: usize) {
-        if let Some(ws) = self.workspaces.get_mut(ws_idx) {
+    /// (spec: 不切 active, 不抢键盘焦点; 载荷 = PathBuf 稳定身份, D3)
+    pub fn toggle_collapse(&mut self, path: &Path) {
+        if let Some(ws) = self.workspaces.iter_mut().find(|w| w.path == path) {
             ws.collapsed = !ws.collapsed;
         }
     }
 
     /// 点 workspace 的 "×": 只在 workspace 为空时删除 + 立即持久化。
-    pub fn close_workspace(&mut self, ws_idx: usize) {
-        if ws_idx >= self.workspaces.len() {
+    pub fn close_workspace(&mut self, path: &Path) {
+        let Some(ws_idx) = self.workspaces.iter().position(|w| w.path == path) else {
             return;
-        }
+        };
         if !self.workspaces[ws_idx].agents.is_empty() {
             return; // 还有 agent, 禁止删除
         }
         self.workspaces.remove(ws_idx);
 
-        // 调整 active
-        self.active = match self.active {
-            None => None,
-            Some((active_ws, _active_agent)) if active_ws == ws_idx => None,
-            Some((active_ws, active_agent)) if active_ws > ws_idx => {
-                Some((active_ws - 1, active_agent))
-            }
-            Some(x) => Some(x),
-        };
+        // 无需调整 active (对比原版索引位移逻辑): EntityId 不随移位改变;
+        // 且只有空 workspace 才能删 — active 不可能指向其中的会话。
 
         self.persist();
     }
@@ -132,10 +103,10 @@ impl TerminalApp {
     /// 用户点了某个 workspace 下的 "[+ agent]": 创建嵌入式 agent 会话
     /// (进程内 pi-shell-rs + pi --mode rpc),
     /// 命名 <dirname>/pi-N (每 workspace 独立计数), 并设为 active。
-    pub fn create_agent(&mut self, ws_idx: usize, cx: &mut Context<Self>) {
-        if ws_idx >= self.workspaces.len() {
+    pub fn create_agent(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(ws_idx) = self.workspaces.iter().position(|w| w.path == path) else {
             return;
-        }
+        };
         let (name, cwd) = {
             let ws = &mut self.workspaces[ws_idx];
             (ws.new_agent_name(), ws.path.clone())
@@ -144,10 +115,8 @@ impl TerminalApp {
         match PiAgentShell::new(name, cwd) {
             Ok(shell) => {
                 let entity = cx.new(|_| AgentSession(Box::new(shell)));
-                let ws = &mut self.workspaces[ws_idx];
-                ws.agents.push(entity);
-                let agent_idx = ws.agents.len() - 1;
-                self.active = Some((ws_idx, agent_idx));
+                self.active = Some(entity.entity_id());
+                self.workspaces[ws_idx].agents.push(entity);
             }
             Err(e) => {
                 eprintln!("failed to spawn agent: {e}");
@@ -156,48 +125,47 @@ impl TerminalApp {
     }
 
     /// 用户点了某个 agent 的 "×": hard kill 子进程 + 移除 + 调整 active。
-    pub fn close_agent(&mut self, ws_idx: usize, agent_idx: usize, cx: &mut Context<Self>) {
-        if ws_idx >= self.workspaces.len() {
+    /// (载荷 = EntityId 稳定身份, D3: 不因兄弟删除错位)
+    pub fn close_agent(&mut self, id: EntityId, cx: &mut Context<Self>) {
+        let Some(ws_idx) = self
+            .workspaces
+            .iter()
+            .position(|w| w.agents.iter().any(|e| e.entity_id() == id))
+        else {
             return;
-        }
+        };
         let ws = &mut self.workspaces[ws_idx];
-        if agent_idx >= ws.agents.len() {
+        let Some(agent_idx) = ws.agents.iter().position(|e| e.entity_id() == id) else {
             return;
-        }
+        };
 
         // hard kill (spec: 立即终止子进程)
         let session = ws.agents.remove(agent_idx);
+        let removed_id = session.entity_id();
         session.update(cx, |s, _| s.0.shutdown());
 
-        // 调整 active (与原版同款规则)
-        let ws = &mut self.workspaces[ws_idx];
-        self.active = match self.active {
-            None => None,
-            Some((a_ws, a_agent)) if a_ws == ws_idx && a_agent == agent_idx => {
-                // 关掉的是 active: 切到同 workspace 内不超过新长度的最后一个
-                if ws.agents.is_empty() {
-                    None
-                } else {
-                    Some((ws_idx, ws.agents.len() - 1))
-                }
-            }
-            Some((a_ws, a_agent)) if a_ws == ws_idx && a_agent > agent_idx => {
-                Some((a_ws, a_agent - 1))
-            }
-            Some(x) => Some(x),
-        };
+        // 关掉的是 active -> 切到同 workspace 内最后一个 / 无则 None
+        // (对比原版: EntityId 不因兄弟移除而错位, 其余情况 active 无需调整)
+        if self.active == Some(removed_id) {
+            self.active = self.workspaces[ws_idx].agents.last().map(|e| e.entity_id());
+        }
+    }
+
+    /// 按稳定 id 找 active session 实体 (D4: 遍历即可, 规模小)。
+    pub(crate) fn active_session(&self) -> Option<&Entity<AgentSession>> {
+        let active = self.active?;
+        self.workspaces
+            .iter()
+            .flat_map(|w| w.agents.iter())
+            .find(|e| e.entity_id() == active)
     }
 
     /// 把一个键送给 active session。
-    fn send_key(&mut self, key: crossterm::event::KeyEvent, cx: &mut Context<Self>) {
-        let Some((ws_idx, agent_idx)) = self.active else {
-            return;
-        };
-        let Some(session) = self
-            .workspaces
-            .get(ws_idx)
-            .and_then(|w| w.agents.get(agent_idx))
-        else {
+    pub(crate) fn send_key(&mut self, key: crossterm::event::KeyEvent, cx: &mut Context<Self>) {
+        if key.code == crossterm::event::KeyCode::Tab {
+            self.tab_forwards += 1; // 诊断/测试观测 (spec: Tab 转发边界)
+        }
+        let Some(session) = self.active_session() else {
             return;
         };
         session.update(cx, |s, _| s.0.send_key(key));
@@ -205,43 +173,10 @@ impl TerminalApp {
 
     /// 把一段已提交文本（IME commit / 粘贴）送给 active session。
     fn send_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        let Some((ws_idx, agent_idx)) = self.active else {
-            return;
-        };
-        let Some(session) = self
-            .workspaces
-            .get(ws_idx)
-            .and_then(|w| w.agents.get(agent_idx))
-        else {
+        let Some(session) = self.active_session() else {
             return;
         };
         session.update(cx, |s, _| s.0.send_text(text));
-    }
-
-    /// 键盘转发 (design D5, spike 已验证的机制):
-    /// 可打印字符/控制键 → crossterm 键事件; 每次转发都 stop_propagation,
-    /// 阻止 macOS 后端把同一个键再交给 input context (insertText
-    /// 双发)。Ctrl/Cmd/Function 组合不转发也不阻止传播。
-    fn handle_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.pane_focus.is_focused(window) {
-            return;
-        }
-        let ks = &event.keystroke;
-        if ks.modifiers.control || ks.modifiers.platform || ks.modifiers.function {
-            return; // 平台快捷键 / IME 菜单照常工作 (spec: Ctrl 不转发)
-        }
-        let keys = keystroke_to_keyevents(&ks.key, ks.key_char.as_deref());
-        if !keys.is_empty() {
-            for key in keys {
-                self.send_key(key, cx);
-            }
-            cx.stop_propagation(); // 防双发 (见上)
-        }
     }
 
     /// 把 (cols, rows) 分发给所有会话 (Exited 会话自行跳过, spec:
@@ -252,7 +187,7 @@ impl TerminalApp {
     /// 输入: cols/rows — 目标网格尺寸 (已夹取下限); w/h — 面板像素面积;
     ///       cell_w/line_h — 度量值 (日志用); cx — 实体上下文
     /// 输出: 副作用为传播 resize + notify + 诊断日志
-    fn propagate_grid_size(
+    pub(crate) fn propagate_grid_size(
         &mut self,
         cols: u16,
         rows: u16,
@@ -324,11 +259,78 @@ impl TerminalApp {
                 app.workspaces.push(Workspace::new(path));
                 app.persist();
                 cx.notify();
+                app.notify_panels(cx); // 面板自读不重建 (spike §10.5), 显式转发
             })
             .ok();
         });
         // 存住任务 (drop 会取消 future); 再次点击时旧任务被替换
         self._dialog_task = Some(task);
+    }
+
+    /// 关闭右 dock（dock-layout spec: 关闭 + 焦点交回）：`toggle_dock`
+    /// 只切 open（面板状态保留；重启恢复默认 — grill 定案，本轮无会话内
+    /// 重开路径）。spike E2：点 `×` 会把焦点交给即将隐藏的面板，因此
+    /// 关闭后显式把键盘/IME 焦点交回终端面板。
+    pub fn close_right_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dock_area.update(cx, |area, cx| {
+            area.toggle_dock(DockPlacement::Right, window, cx);
+        });
+        let focus = self.terminal.read(cx).focus_handle(cx);
+        focus.focus(window, cx);
+    }
+
+    /// sidebar 事件漏斗单一入口 (design D3): SidebarPanel 的所有交互
+    /// 经此进入 model；SelectAgent 的一步切焦点也收拢在此 (3.2, spec:
+    /// one-step focus — 选中即把键盘/IME 焦点交给 pane)。
+    pub fn on_sidebar_event(
+        &mut self,
+        ev: SidebarEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 一步切焦点 (spec one-step focus) + "点击不离开终端" (spec: 窗口聚焦
+        // 即转发; workspace 行点击不得抢键盘焦点): dock 的左 TabGroup 会把
+        // sidebar 内的点击焦点抢给 sidebar 面板 (真机实测 focus -> elsewhere),
+        // 不交回则无 Terminal context, 打字/Tab 全断。放 match 前 = 所有 arm
+        // (含 NewWorkspace 对话框路径) 共用; 焦点目标与 active 无关, 先聚焦
+        // 后改 model 无害。
+        let focus = self.terminal.read(cx).focus_handle(cx);
+        focus.focus(window, cx);
+        match ev {
+            SidebarEvent::NewWorkspace => {
+                // 异步对话框: 变更在完成回调里, 面板转发也在那里 (见 create_workspace)
+                self.create_workspace(cx);
+                return;
+            }
+            SidebarEvent::ToggleCollapse(path) => self.toggle_collapse(&path),
+            SidebarEvent::CloseWorkspace(path) => self.close_workspace(&path),
+            SidebarEvent::NewAgent(path) => self.create_agent(&path, cx),
+            SidebarEvent::SelectAgent(id) => {
+                self.active = Some(id);
+            }
+            SidebarEvent::CloseAgent(id) => self.close_agent(id, cx),
+        }
+        cx.notify();
+        self.notify_panels(cx);
+    }
+
+    /// 数据变化 → notify 展示该数据的面板 (spike §10.5 实测: 面板自读不
+    /// 重建, 必须显式转发)。转发列表: sidebar (badge/列表) + terminal
+    /// (输出滚动 — 3.3 计划的 step-4 扩展, 此处补全)。
+    ///
+    /// **必须 `cx.defer`**: 事件 listener 挂在面板 entity 上, listener
+    /// 执行期间面板持有 update lease — 同步 `panel.update` 会重入 panic
+    /// (实测 crash: "cannot update SidebarPanel while it is already being
+    /// updated", entity_map lease)。`App::defer` 的 effect 只在**最外层**
+    /// update 的 finish 时 flush (pending_updates 守卫), 此时面板 lease
+    /// 已 end_lease → 安全。
+    fn notify_panels(&self, cx: &mut Context<Self>) {
+        let sidebar = self.sidebar.clone();
+        let terminal = self.terminal.clone();
+        cx.defer(move |cx| {
+            sidebar.update(cx, |_, cx| cx.notify());
+            terminal.update(cx, |_, cx| cx.notify());
+        });
     }
 
     /// 启动 50ms 节流的 poll 循环 (design D3): 每 tick drain 所有
@@ -354,15 +356,22 @@ impl TerminalApp {
     }
 
     /// 遍历所有 session entity, poll 并按需 notify。
+    /// session 自身 notify 走根读取链路 (现行为); 同时转发到面板
+    /// (spike §10.5: 面板自读不重建) — 输出滚动 + sidebar badge 同帧刷新。
     fn poll_sessions(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
         for ws in &self.workspaces {
             for session in &ws.agents {
                 session.update(cx, |s, cx| {
                     if s.0.poll() {
                         cx.notify();
+                        changed = true;
                     }
                 });
             }
+        }
+        if changed {
+            self.notify_panels(cx);
         }
     }
 }
@@ -475,200 +484,15 @@ impl EntityInputHandler for TerminalApp {
 }
 
 impl Render for TerminalApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // gpui 元素树要求拥有数据: 行数据先快照成值
-        let mut ws_rows = Vec::with_capacity(self.workspaces.len());
-        for (ws_idx, w) in self.workspaces.iter().enumerate() {
-            let mut agents = Vec::new();
-            if !w.collapsed {
-                for (agent_idx, session) in w.agents.iter().enumerate() {
-                    let s = session.read(cx);
-                    agents.push(ui::sidebar::AgentRow {
-                        ws_idx,
-                        agent_idx,
-                        name: s.0.name().to_string(),
-                        status: s.0.status(),
-                        is_active: self.active == Some((ws_idx, agent_idx)),
-                    });
-                }
-            }
-            ws_rows.push(ui::sidebar::WorkspaceRow {
-                full_path: w.full_path_str(),
-                display_name: w.display_name().to_string(),
-                collapsed: w.collapsed,
-                agent_count: w.agents.len(),
-                agents,
-            });
-        }
-
-        // active 面板的状态条数据 (4.1)
-        let pane_data = match self.active {
-            Some((ws_idx, agent_idx)) => self
-                .workspaces
-                .get(ws_idx)
-                .and_then(|w| w.agents.get(agent_idx))
-                .map(|session| {
-                    let s = session.read(cx);
-                    ui::pane::PaneData {
-                        // 用 session 自己的 ws_path (AgentEntity 契约)
-                        path: s.0.ws_path().to_string_lossy().to_string(),
-                        name: s.0.name().to_string(),
-                        status: s.0.status(),
-                        grid: ui::pane::terminal_grid(s.0.screen(), window),
-                    }
-                }),
-            None => None,
-        };
-
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        // 外壳 (design R3): DockArea 承担左|中|右三槽 (D1), 是本容器的
+        // 子节点; 未来 titlebar / 状态栏 / 覆盖层挂同一容器。
+        // (行数据/终端块的渲染在各面板 entity 内 — 3.1/4.1)
         div()
             .size_full()
             .flex()
-            .flex_row()
-            // ---- 左边栏 (agent 行 3.3) ----
-            .child(
-                div()
-                    .w(px(240.))
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .child(ui::sidebar::render(
-                        self.save_error.clone(),
-                        ws_rows,
-                        cx,
-                    )),
-            )
-            .child(div().w(px(1.)).h_full().bg(rgb(0x2a2a2a)))
-            // ---- 右边主区: 终端面板 (4.1 chrome) ----
-            // 一步切焦点: pane 持有 FocusHandle, 选中/点击即聚焦,
-            // 4.3 的键盘/IME 转发挂在它上面 (key_context 已就位)。
-            .child(
-                div()
-                    .id("terminal-pane")
-                    // 与网格容器同理: root 是横排 flex, 此项主轴为水平,
-                    // overflow visible 时自动最小尺寸=内容最小宽 (网格 780px)
-                    // 会把整个 pane 撑宽并挤出窗口 — 裁剪切断该反馈链
-                    .overflow_hidden()
-                    .flex_1()
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .key_context("Terminal")
-                    .track_focus(&self.pane_focus)
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                        this.handle_key_down(event, window, cx);
-                    }))
-                    .on_action(cx.listener(|this, _: &TerminalTab, _window, cx| {
-                        // Tab 被 Terminal context 的绑定截获 (原始 key
-                        // event 不再派发), 在动作里转发 — 单路径 (D5)
-                        this.send_key(
-                            crossterm::event::KeyEvent::new(
-                                crossterm::event::KeyCode::Tab,
-                                crossterm::event::KeyModifiers::NONE,
-                            ),
-                            cx,
-                        );
-                        cx.stop_propagation();
-                    }))
-                    .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                        this.pane_focus.focus(window, cx);
-                        cx.notify();
-                    }))
-                    .child(match pane_data {
-                        None => ui::pane::render_empty(),
-                        Some(data) => {
-                            let starting = data.status == SessionStatus::Starting;
-                            // 面板框: 选中即蓝边 (spec "Active vs inactive
-                            // pane stroke"; 未选中走 render_empty, 无框)
-                            let focus = self.pane_focus.clone();
-                            let view_entity = cx.entity();
-                            div()
-                                .size_full()
-                                .p_2()
-                                .bg(rgb(0xffffff))
-                                .border_1()
-                                .border_color(rgb(0x4ba3d7)) // 原版同款蓝 (75,161,215)
-                                .flex()
-                                .flex_col()
-                                .child(ui::pane::status_bar(&data))
-                                .child(ui::pane::separator())
-                                .children(starting.then(ui::pane::starting_placeholder))
-                                .child(
-                                    div()
-                                        // 网格区域锚点: 自适应测量的 bounds
-                                        // 即此 div (canvas size_full 同界),
-                                        // 测试经此断言换算 (test_support 在
-                                        // 非测试构建下为 no-op)
-                                        .id("terminal-grid")
-                                        .test_support()
-                                        // 断开反馈环: 否则 flex 自动最小尺寸让
-                                        // 此 div 被网格内容撑大 (回退 100x30 =
-                                        // 780x630px), canvas 量到的是内容而非
-                                        // 可用面积, floor 捰好落回回退值后去重
-                                        // 永久锁死溢出。overflow != visible 时
-                                        // 自动最小尺寸为 0 -> bounds = 可用面积,
-                                        // 溢出行按真实终端裁剪 (spec: area
-                                        // available to the grid)
-                                        .overflow_hidden()
-                                        // 显式清零双轴自动最小尺寸: taffy 对
-                                        // cross 轴的 auto-min 不看 overflow,
-                                        // 内容仍会把宽度撑到 780px (反馈环残留)
-                                        .min_w(px(0.))
-                                        .min_h(px(0.))
-                                        .flex_1()
-                                        .w_full()
-                                        .child(data.grid)
-                                        .child(
-                                            // IME 挂载点: paint 阶段注册
-                                            // InputHandler (spike 同款)
-                                            canvas(
-                                                move |bounds, _window, _cx| bounds,
-                                                move |_bounds, pane_bounds, window, cx| {
-                                                    window.handle_input(
-                                                        &focus,
-                                                        ElementInputHandler::new(
-                                                            pane_bounds,
-                                                            view_entity.clone(),
-                                                        ),
-                                                        cx,
-                                                    );
-                                                    // 自适应 (spec: Adaptive terminal
-                                                    // grid sizing): 量网格区域 -> 换算
-                                                    // 列/行 (floor + 下限夹取) ->
-                                                    // defer 分发 (paint 阶段不能直接
-                                                    // 改实体)
-                                                    let (cell_w, line_h) =
-                                                        ui::pane::grid_metrics(window);
-                                                    let (w, h) = (
-                                                        f32::from(pane_bounds.size.width),
-                                                        f32::from(pane_bounds.size.height),
-                                                    );
-                                                    let clamp = |v: f32, min: u16| {
-                                                        (v.floor() as i64)
-                                                            .clamp(min as i64, u16::MAX as i64)
-                                                            as u16
-                                                    };
-                                                    let cols =
-                                                        clamp(w / f32::from(cell_w), MIN_GRID_COLS);
-                                                    let rows =
-                                                        clamp(h / f32::from(line_h), MIN_GRID_ROWS);
-                                                    let entity = view_entity.clone();
-                                                    cx.defer(move |cx| {
-                                                        entity.update(cx, |app, cx| {
-                                                            app.propagate_grid_size(
-                                                                cols, rows, w, h, cell_w, line_h,
-                                                                cx,
-                                                            );
-                                                        });
-                                                    });
-                                                },
-                                            )
-                                            .absolute()
-                                            .size_full(),
-                                        ),
-                                )
-                        }
-                    }),
-            )
+            .flex_col()
+            .child(self.dock_area.clone())
     }
 }
 
@@ -679,9 +503,11 @@ mod tests {
     //! 换算与去重在真实渲染路径上成立。显式导入、不用 glob (避免
     //! `gpui_kit::*` 把 `#[test]` 宏遮蔽掉)。
 
-    use super::{MIN_GRID_COLS, MIN_GRID_ROWS, TerminalApp};
+    use super::TerminalApp;
     use crate::agent_entities::{AgentSession, PiAgentShell};
-    use crate::ui::pane::grid_metrics;
+    use crate::workspace::Workspace;
+    use gpui_kit::Focusable;
+    use crate::pane::{MIN_GRID_COLS, MIN_GRID_ROWS, grid_metrics};
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
         AppContext, Bounds, Point, TestAppContext, WindowBounds, WindowOptions, px, size,
@@ -689,6 +515,37 @@ mod tests {
     use std::fs;
     use std::io::Write as _;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// hermetic: 注入测试专用 workspace (仅内存, 不写盘) — 让测试不依赖
+    /// 本地 `.workspaces.json` 的内容 (2026-11-09 冒烟清空该文件后 4 个
+    /// 测试齐挂的教训; 原 adaptive 测试本就依赖本地状态)。返回 full_path
+    /// 字符串供行 id 拼装/定位; 注入的 workspace 恒为列表末位。
+    fn inject_test_workspace(app: &mut TerminalApp, tag: &str) -> String {
+        let path = std::env::temp_dir().join(format!("bw-test-{tag}-{}", std::process::id()));
+        let full = path.to_string_lossy().to_string();
+        app.workspaces.push(Workspace::new(path));
+        full
+    }
+
+    /// 假 pi (sleepy 版): 每个响应前 sleep 1s — 让 badge 测试首帧确定为
+    /// [Starting] (与 write_stub 同款 RPC 行为, 仅加 sleep)。
+    fn write_stub_sleepy(dir: &std::path::Path) -> std::path::PathBuf {
+        let pwd_file = dir.join("pwd.txt");
+        let script = format!(
+            "#!/bin/sh\npwd > '{}'\nwhile IFS= read -r line; do\n  sleep 1\n  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n  printf '{{\"type\":\"response\",\"id\":\"%s\",\"success\":true,\"data\":{{}}}}\\n' \"$id\"\ndone\n",
+            pwd_file.display()
+        );
+        let path = dir.join("fake-pi-sleepy.sh");
+        let mut f = fs::File::create(&path).unwrap();
+        f.write_all(script.as_bytes()).unwrap();
+        drop(f);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
 
     /// 假 pi (与 tests/embed_layout.rs 同款), 供 stub 会话嵌入。
     fn write_stub(dir: &std::path::Path) -> std::path::PathBuf {
@@ -722,8 +579,8 @@ mod tests {
                     ..Default::default()
                 },
                 cx,
-                |_window, cx| {
-                    cx.new(|cx| TerminalApp::new(cx).expect(".workspaces.json 加载"))
+                |window, cx| {
+                    cx.new(|cx| TerminalApp::new(window, cx).expect(".workspaces.json 加载"))
                 },
             )
             .expect("open test window")
@@ -738,10 +595,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let stub = write_stub(&dir);
         app_entity.update(cx, |app, cx| {
-            assert!(
-                !app.workspaces.is_empty(),
-                "测试需要 .workspaces.json 中至少一个 workspace"
-            );
+            inject_test_workspace(app, "adaptive"); // hermetic: 不依赖本地文件
             let shell = PiAgentShell::new_with_pi_bin(
                 "pi-t".into(),
                 std::env::temp_dir(),
@@ -749,8 +603,9 @@ mod tests {
             )
             .expect("stub embed spawn");
             let e = cx.new(|_| AgentSession(Box::new(shell)));
-            app.workspaces[0].agents.push(e);
-            app.active = Some((0, app.workspaces[0].agents.len() - 1));
+            let id = e.entity_id(); // 先取 id 再 move (D4)
+            app.workspaces.last_mut().expect("测试 workspace").agents.push(e);
+            app.active = Some(id);
         });
 
         // frame 1: paint 量 bounds -> defer 分发
@@ -761,7 +616,7 @@ mod tests {
 
         // 读取分发结果 + 网格区域 bounds + 度量
         let (resizes1, screen) = app_entity.read_with(cx, |app, cx| {
-            let s = app.workspaces[0].agents[0].read(cx);
+            let s = app.workspaces.last().expect("测试 workspace").agents[0].read(cx);
             (app.grid_resizes, s.0.screen().size())
         });
         let (win_bounds, bounds, (cell_w, line_h)) = cx
@@ -817,7 +672,7 @@ mod tests {
         });
         cx.run_until_parked();
         let (resizes3, screen3) = app_entity.read_with(cx, |app, cx| {
-            let s = app.workspaces[0].agents[0].read(cx);
+            let s = app.workspaces.last().expect("测试 workspace").agents[0].read(cx);
             (app.grid_resizes, s.0.screen().size())
         });
         let bounds3 = cx
@@ -837,6 +692,273 @@ mod tests {
         let exp_rows3 = clamp(f32::from(bounds3.size.height) / f32::from(line_h), MIN_GRID_ROWS);
         assert_eq!(screen3.1.get(), exp_cols3, "resize 后列数跟随新 bounds");
         assert_eq!(screen3.0.get(), exp_rows3, "resize 后行数跟随新 bounds");
+
+        // 收尾: 关会话、清 stub
+        app_entity.update(cx, |app, cx| {
+            if let Some(e) = app.workspaces.get_mut(0).and_then(|w| w.agents.pop()) {
+                e.update(cx, |s, _| s.0.shutdown());
+            }
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+    /// 回归 (crash fix): sidebar 行点击的 listener 在**面板 lease 内**执行,
+    /// funnel 的 notify_panels 必须 `cx.defer` — 同步 panel.update 会重入
+    /// panic/abort ("cannot update SidebarPanel while it is already being
+    /// updated")。同时覆盖: 2.2 稳定身份载荷 +漏斗后面板确实重渲
+    /// (defer 生效: 折叠后 [+ agent] 按钮从观测中消失)。
+    #[gpui_kit::test]
+    fn sidebar_row_click_toggles_collapse(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, app_entity) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1000.), px(600.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| TerminalApp::new(window, cx).expect(".workspaces.json 加载"))
+                },
+            )
+            .expect("open test window")
+        });
+
+        // hermetic: 注入测试专用 workspace, 不依赖本地 .workspaces.json
+        let _ws_path = cx.update(|cx| {
+            app_entity.update(cx, |app, cx| inject_test_workspace(app, "row-click"))
+        });
+        let (path, before) = cx.update(|cx| {
+            let app = app_entity.read(cx);
+            let ws = app.workspaces.last().expect("注入的测试 workspace");
+            (ws.full_path_str(), ws.collapsed)
+        });
+
+        let new_agent_id = format!("new-agent-label-{path}");
+        let row_id = format!("ws-name-{path}");
+
+        // 首帧: 行/按钮进入观测注册表 (初始未折叠 -> 按钮可见)
+        let id = new_agent_id.clone();
+        let _ = cx.update_window(handle.into(), move |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find(id).is_some(),
+                "初始应展开, [+ agent] 可见"
+            );
+        });
+
+        // 点击行 → listener (面板 lease 内) → funnel → defer notify
+        // (修复前: 此处重入 panic → abort)
+        let _ = cx.update_window(handle.into(), |_, window, cx| {
+            window.click(row_id.clone(), cx);
+        });
+        cx.run_until_parked();
+        let after = cx.update(|cx| app_entity.read(cx).workspaces.last().expect("测试 workspace").collapsed);
+        assert_ne!(before, after, "点击 workspace 行应切换折叠 (且不得重入 panic)");
+        // defer 生效: 面板已重渲, 折叠后 [+ agent] 消失 (旧观测不能残留)
+        let id = new_agent_id.clone();
+        let _ = cx.update_window(handle.into(), move |_, window, _cx| {
+            assert!(
+                window.try_find(id).is_none(),
+                "折叠后面板必须重渲, [+ agent] 应消失"
+            );
+        });
+
+        // 再点恢复
+        let _ = cx.update_window(handle.into(), |_, window, cx| {
+            window.click(row_id, cx);
+        });
+        cx.run_until_parked();
+        let back = cx.update(|cx| app_entity.read(cx).workspaces.last().expect("测试 workspace").collapsed);
+        assert_eq!(before, back, "再次点击应恢复原状态");
+        let id = new_agent_id.clone();
+        let _ = cx.update_window(handle.into(), move |_, window, _cx| {
+            assert!(
+                window.try_find(id).is_some(),
+                "展开后面板必须重渲, [+ agent] 应回来"
+            );
+        });
+    }
+    /// 回归 (6.1 手动发现 F1/F3): 点击 agent 行后**一步切焦点**必须把
+    /// 键盘/IME 焦点交给终端面板 (spec: Sidebar selection grants keyboard
+    /// and IME focus in one step), 且 Tab 派发后焦点保持 (若焦点不在
+    /// Terminal context, Root 的 tab 绑定会做焦点遍历 -> 焦点跑掉 = F3 症状)。
+    /// 坑点: 点击 dock 内面板时 dock 机制可能在 frame-end 把焦点交给该
+    /// 面板 (spike E2 实测) — 本测试用 run_until_parked 冲掉延迟任务后再断言。
+    #[gpui_kit::test]
+    fn sidebar_select_grants_one_step_focus(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, app_entity) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1000.), px(600.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| TerminalApp::new(window, cx).expect(".workspaces.json 加载"))
+                },
+            )
+            .expect("open test window")
+        });
+
+        // 注入 stub 会话 (与 adaptive_grid_dispatch 同款, 绕过真实 pi)
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("one-step-focus-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let stub = write_stub(&dir);
+        let shell = PiAgentShell::new_with_pi_bin(
+            "pi-t".into(),
+            std::env::temp_dir(),
+            Some(stub.to_str().unwrap().to_string()),
+        )
+        .expect("stub embed spawn");
+        let e = cx.new(|_| AgentSession(Box::new(shell)));
+        let agent_id = e.entity_id();
+        cx.update(|cx| {
+            let app = app_entity.update(cx, |app, cx| {
+                inject_test_workspace(app, "one-step-focus"); // hermetic
+                app.workspaces.last_mut().expect("测试 workspace").agents.push(e);
+                app.active = Some(agent_id);
+                // 直接注入绕过 funnel, 面板需显式 notify 才会重渲 (§10.5)
+                app.sidebar.update(cx, |_, cx| cx.notify());
+            });
+            let _ = app;
+        });
+        cx.run_until_parked();
+
+        let term_focus = cx.update(|cx| app_entity.read(cx).terminal.read(cx).focus_handle(cx));
+
+        // 渲染 + 点击 agent 行 (内层观测锚点冒泡到行 on_select)
+        let _ = cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click(format!("agent-name-{agent_id}"), cx);
+        });
+        cx.run_until_parked(); // 冲掉 frame-end 任务 (dock 焦点 handoff)
+
+        // 断言 1: 一步切焦点 — 焦点必须在终端面板
+        let focused = cx.update_window(handle.into(), |_, window, cx| window.focused(cx))
+            .expect("update window");
+        assert_eq!(
+            focused,
+            Some(term_focus.clone()),
+            "点击 agent 行后焦点必须在终端面板 (spec: one-step focus)"
+        );
+
+        // 断言 2: Tab 派发后焦点保持 (焦点在 Terminal context -> TerminalTab
+        // action 转发并 stop_propagation; 若焦点错位, Root tab 绑定会做
+        // 焦点遍历 -> 焦点跑掉)
+        let forwards_before = cx.update(|cx| app_entity.read(cx).tab_forwards);
+        let _ = cx.update_window(handle.into(), |_, window, cx| {
+            window.press("tab", cx);
+        });
+        cx.run_until_parked();
+        let focused_after = cx.update_window(handle.into(), |_, window, cx| window.focused(cx))
+            .expect("update window");
+        assert_eq!(
+            focused_after,
+            Some(term_focus),
+            "Tab 派发后焦点应保持在终端面板 (TerminalTab 截获而非 Root 遍历)"
+        );
+        // 断言 3: Tab 必须到达 send_key 转发边界 (spec: Keyboard input
+        // forwarding - Tab; pi 收到 Tab 无可见反应, 只能在边界计数)
+        let forwards_after = cx.update(|cx| app_entity.read(cx).tab_forwards);
+        assert!(
+            forwards_after > forwards_before,
+            "Tab 应经 send_key 转发给会话 (spec: Tab SHALL be delivered),              实际 {forwards_before} -> {forwards_after}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+    /// 回归 (6.1 手动发现 F4): agent 输出到达 -> drain 循环 (50ms 测试时钟)
+    /// -> notify 转发 -> 面板重渲, 状态 starting -> running 实时刷新
+    /// (spec: status badge reflect running)。sleepy stub 把首个响应推迟到
+    /// ~1s (真实时间), 保证首帧确定为 [Starting]; drain 计时器走测试时钟,
+    /// 用 advance_clock 推进。
+    #[gpui_kit::test]
+    fn status_badge_refreshes_via_drain_loop(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, app_entity) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1000.), px(600.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| TerminalApp::new(window, cx).expect(".workspaces.json 加载"))
+                },
+            )
+            .expect("open test window")
+        });
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("badge-refresh-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let stub = write_stub_sleepy(&dir);
+        let shell = PiAgentShell::new_with_pi_bin(
+            "pi-t".into(),
+            std::env::temp_dir(),
+            Some(stub.to_str().unwrap().to_string()),
+        )
+        .expect("stub embed spawn");
+        let e = cx.new(|_| AgentSession(Box::new(shell)));
+        let agent_id = e.entity_id();
+        app_entity.update(cx, |app, cx| {
+            inject_test_workspace(app, "badge"); // hermetic
+            app.workspaces.last_mut().expect("测试 workspace").agents.push(e);
+            app.active = Some(agent_id);
+            // 直接注入绕过 funnel: 两个面板都需显式 notify (§10.5)
+            app.sidebar.update(cx, |_, cx| cx.notify());
+            app.terminal.update(cx, |_, cx| cx.notify());
+        });
+        cx.run_until_parked();
+
+        // 首帧: sleepy stub 的响应 ≥1s (真实时间) 才到, 此刻必为 [Starting]
+        let starting = cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let all: Vec<String> = gpui_kit::base::test_support::texts(window)
+                .iter()
+                .map(|t| t.text().to_string())
+                .collect();
+            eprintln!("[F4-diag] texts({}) = {all:?}", all.len());
+            all.iter().any(|t| t.contains("[Starting]"))
+        })
+        .expect("update window");
+        assert!(starting, "首帧状态条应显示 [Starting]");
+
+        // 启动 drain 循环 (50ms 测试时钟) -> 真实时间等 stub 响应进缓冲
+        // -> 推进测试时钟触发 drain -> poll 消费 -> Running + notify 转发
+        app_entity.update(cx, |app, cx| app.start_update_loop(cx));
+        std::thread::sleep(std::time::Duration::from_millis(1300));
+        cx.executor().advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+
+        let running = cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            gpui_kit::base::test_support::texts(window)
+                .iter()
+                .any(|t| t.text().contains("[Running]"))
+        })
+        .expect("update window");
+        assert!(
+            running,
+            "drain -> notify 转发后面板状态必须刷新为 [Running] (F4 回归)"
+        );
 
         // 收尾: 关会话、清 stub
         app_entity.update(cx, |app, cx| {

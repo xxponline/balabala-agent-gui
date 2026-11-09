@@ -1,10 +1,12 @@
-//! UI 层: sidebar + pane 渲染 (gpui 版) + vt100 颜色映射。
+//! UI 层: vt100 颜色映射 (theme) + 共享小件 (widgets)。
+//! pane 已收为 crate::pane 面板, sidebar 收为 crate::sidebar 面板
+//! (change: split-ui-modules-dockarea)。
 //!
 //!浅色主题默认值见 design D9; 颜色映射是迁移前实现的 gpui 等价物
 //! (旧实现在 git history)。
 
-pub mod pane;
-pub mod sidebar;
+
+pub mod widgets;
 
 use gpui_kit::{Rgba, rgb};
 use vt100::Color;
