@@ -71,7 +71,7 @@ the changed center area in the same step.
 ### Requirement: Right dock close
 
 A close control on the right dock SHALL close the dock: it renders at zero
-width (no placeholder visible), the center pane expands into the freed space,
+width (no panel content visible), the center pane expands into the freed space,
 and the terminal grid recomputes. The system SHALL NOT provide any control to
 reopen the right dock within the same session; a closed right dock is restored
 only by restarting the application.
@@ -89,4 +89,4 @@ only by restarting the application.
 #### Scenario: Restart restores the right dock
 
 - **WHEN** the user closes the right dock and then restarts the application
-- **THEN** the right dock is visible again at its default width showing the placeholder panel
+- **THEN** the right dock is visible again at its default width showing the file tree panel
