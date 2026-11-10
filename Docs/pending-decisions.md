@@ -199,3 +199,73 @@ pi-shell-rs 的 key 事件封装/注入层, 而非 pi 本身。
 - A: pi-shell-rs 修复 Tab 注入 (首选, 保持与原生一致)
 - B: 若 embed 场景确不适用 Tab → 文档化已知限制, spec 交付边界不变
   (应用侧已送达, 属 pi-shell 行为)
+
+## 文件树过滤的配置界面 (含 agent-shell 键盘条款修订)
+
+**状态**: 待立项 (2026-11-09, change `right-dock-file-tree`)。
+
+**当前选择**: 过滤规则纯配置驱动 — `.workspaces.json` 新开 `file_tree`
+区段 (按 workspace 路径键控, gitignore 式模式行数组), v1 右 dock **无任何
+可聚焦文本输入**, ⟳ 刷新时重读生效。
+
+**为什么这样选**: `agent-shell` 两条键盘契约是绝对条款 ("仅 macOS 应用失焦
+才不转发键盘/IME"), dock 内一旦有输入控件, 打字即违反 spec。配置文件绕开了
+这个问题, 且配置语义随数据源走 (i 定案)。
+
+**未来需要重新评估的信号**:
+- 用户想要即输即筛的体验 (改配置文件 + 点刷新太绕)
+
+**要做的事** (配置界面立项时):
+- spec: `agent-shell` 的 Session selection focus model 与 Keyboard input
+  forwarding 两条 MUST 开一个明确例外 — "明确获得焦点的 dock 交互控件
+  (当前即右 dock 过滤框) 可接收键盘/IME, 直到其失焦"; 补对应场景
+- 面板侧: 过滤输入框持焦期间, 树行点击仍即时交回终端 (纪律不变)
+
+## 文件树的自动刷新 (焦点重扫 / FS 监听)
+
+**状态**: 待立项 (2026-11-09, change `right-dock-file-tree` 5.x)。
+
+**当前选择**: 三个低频触发 — 首次加载 (根路径出现) / 切换活动 workspace
+(根路径变化) / 手动 ⟳ 按钮; 同 workspace 切 agent 不重扫。
+
+**未来需要重新评估的信号**:
+- 用户频繁外部建文件后抱怨"要点刷新才能看到"
+- 编辑器内改文件, 右树长期陈旧
+
+**要做的事** (按成本排序):
+- b: 窗口重获焦点时自动重扫 (零依赖, `did_become_key` 订阅 + 防抖)
+- c: notify crate 实时监听 — 需防抖、目录移动事件归并、大树 diff
+- 注意: 重扫 = 全量重建权威树, 展开态由面板集合贴回 (design D4) 不丢
+
+## 文件树的惰性扫描 (大仓)
+
+**状态**: 待立项 (2026-11-09, change `right-dock-file-tree` design D6)。
+
+**当前选择**: 全量递归 + 排除表 (`.git node_modules target build dist
+.DS_Store`) + 后台线程。
+
+**未来需要重新评估的信号**:
+- 排除表挡不住的超大仓 (数据目录 / 未排除的生成物) 刷新明显卡顿
+- 用户要求浏览被排除目录 (如按需展开 node_modules)
+
+**要做的事**:
+- 首展才扫该目录 (惰性) — 需解决两件事: `is_folder()` 对未扫目录为 false
+  (空 children = 假文件, 面板 dir_ids 集合已兜图标, 但语义要补)、展开事件
+  驱动的异步插入 + 树重建 (展开态靠面板集合保留)
+- 或: 扫描深度上限 + 超限目录显示"展开以加载"
+
+## 右键 "在 Finder 显示" 的跨平台
+
+**状态**: 待立项 (2026-11-09, change `right-dock-file-tree` 4.2)。
+
+**当前选择**: macOS only — `open -R <path>` 子进程 (spec 场景即 Finder);
+`cfg(not(target_os = "macos"))` 分支为空操作。
+
+**未来需要重新评估的信号**:
+- app 要发到 Windows / Linux 用户手里
+
+**要做的事**:
+- Windows: `explorer /select,"<path>"`
+- Linux: 桌面环境差异大 (nautilus -select 等), 需定义降级 (如打开父目录)
+- 落地点: `reveal_in_finder` 的 cfg 分支 (src/tree/mod.rs)
+
