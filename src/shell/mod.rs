@@ -1,4 +1,4 @@
-//! 外壳装配：DockArea 三槽（左 sidebar | 中心终端 | 右占位）。
+//! 外壳装配：DockArea 三槽（左 sidebar | 中心终端 | 右文件树）。
 //!
 //! design D1（采用 gpui-component DockArea）/ D5（左 dock 不可关）/
 //! D8（chrome 全 title_bar=false）；spike §10.5 关键实证：
@@ -11,8 +11,6 @@
 //! R3 外壳：`TerminalApp::render` 的外层容器承载本模块产出的 DockArea，
 //! 未来 titlebar/状态栏/覆盖层挂同一容器。
 
-pub mod placeholder;
-
 use gpui_kit::component::dock::{
     panel_handle, DockArea, DockLayout, DockPlacement, DockSkin,
 };
@@ -21,7 +19,7 @@ use gpui_kit::*;
 use crate::app::TerminalApp;
 use crate::pane::TerminalPanel;
 use crate::sidebar::SidebarPanel;
-use placeholder::RightPlaceholderPanel;
+use crate::tree::TreePanel;
 
 /// `shell::build` 的产出；TerminalApp 保存实体句柄
 /// （sidebar 用于 notify 转发，terminal 用于一步切焦点/关闭右 dock 后回焦点）。
@@ -29,6 +27,8 @@ pub struct ShellParts {
     pub dock_area: Entity<DockArea>,
     pub sidebar: Entity<SidebarPanel>,
     pub terminal: Entity<TerminalPanel>,
+    /// 文件树面板 (notify 转发名单 + 一步焦点目标; app 持实体)
+    pub tree: Entity<TreePanel>,
 }
 
 /// 在 `TerminalApp::new(window, cx)` 内调用。
@@ -44,7 +44,7 @@ pub fn build(
 
     let sidebar = cx.new(|cx| SidebarPanel::new(weak_app.clone(), cx));
     let terminal = cx.new(|cx| TerminalPanel::new(weak_app.clone(), cx));
-    let right = cx.new(|cx| RightPlaceholderPanel::new(weak_app, cx));
+    let right = cx.new(|cx| TreePanel::new(weak_app.clone(), cx));
 
     dock_area.update(cx, |area, cx| {
         // 必须 panel_handle 包装（spike §10.5）；先 add 建 dock,
@@ -57,7 +57,7 @@ pub fn build(
             cx,
         );
         area.add_panel_view(
-            panel_handle(right),
+            panel_handle(right.clone()),
             DockPlacement::Right,
             Some(px(240.)),
             window,
@@ -77,5 +77,6 @@ pub fn build(
         dock_area,
         sidebar,
         terminal,
+        tree: right,
     }
 }

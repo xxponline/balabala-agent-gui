@@ -1,0 +1,430 @@
+//! 文件树数据源——`WorkspacePropertySource` 的第一个实现（插件家族首发）。
+//!
+//! part1 职责（design D6/D7）：
+//! - 定位活动 workspace 根（`resolve_active_root`，面板"根变化才重扫"
+//!   的比对也复用它）；
+//! - 读 `.workspaces.json` 的 `file_tree` 规则区段（按根路径键控）；
+//! - 全量递归扫描（默认排除表 + 后台线程），落权威树；
+//! - `view()` 对权威树按 gitignore 式规则求值（**仅文件行**，目录恒显）。
+//!
+//! 状态放在 `Arc<Mutex<SourceInner>>` 共享槽：扫描任务在 `&mut self`
+//! 之外落树；trait 方法只在主线程做短临界区读写（不跨 await 持锁）。
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use gpui_kit::{App, AsyncApp, Task, WeakEntity};
+
+use crate::app::TerminalApp;
+use crate::workspace::store;
+
+use super::filter::Ruleset;
+use super::{
+    MenuDesc, SourceEffect, SourceNode, SourceNodeKind, SourceView, WorkspacePropertySource,
+};
+
+/// spec 锚定的默认排除表（file-tree spec: Default scan exclusions）。
+pub const EXCLUDES: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "build",
+    "dist",
+    ".DS_Store",
+];
+
+/// 右键功能 id（spec: Right-click context menu）。
+pub const FUNC_COPY_PATH: &str = "copy-path";
+pub const FUNC_REVEAL: &str = "reveal";
+
+/// 权威树 + 规则的共享槽状态。
+#[derive(Default)]
+struct SourceInner {
+    /// 合成根（id = workspace 根路径；children = 顶层条目）；None = 未就绪。
+    canonical: Option<SourceNode>,
+    /// 已定位/扫描中的根；None = 无活跃 workspace。
+    root: Option<PathBuf>,
+    /// 降级信息（根不可读；落地时写入）。
+    degraded: Option<String>,
+    /// 当前生效的过滤规则（refresh 时重读）。
+    rules: Vec<String>,
+}
+
+impl SourceInner {
+    fn clear(&mut self) {
+        self.canonical = None;
+        self.root = None;
+        self.degraded = None;
+    }
+
+    fn land(&mut self, outcome: Result<SourceNode, String>, root: PathBuf) {
+        match outcome {
+            Ok(node) => {
+                self.canonical = Some(node);
+                self.root = Some(root);
+                self.degraded = None;
+            }
+            Err(message) => {
+                self.canonical = None;
+                self.root = Some(root);
+                self.degraded = Some(message);
+            }
+        }
+    }
+}
+
+pub struct FileTreeSource {
+    app: WeakEntity<TerminalApp>,
+    /// 规则文件路径（默认 `store::filepath()`；测试缝指向临时文件）。
+    rules_path: PathBuf,
+    inner: Arc<Mutex<SourceInner>>,
+    /// 刷新任务存根——drop 会取消 future（app.rs 同款约定）；
+    /// 新 refresh 覆盖旧任务 = 新扫描取代在途旧扫描（supersede）。
+    _refresh_task: Option<Task<()>>,
+}
+
+impl FileTreeSource {
+    pub fn new(app: WeakEntity<TerminalApp>, rules_path: PathBuf) -> Self {
+        Self {
+            app,
+            rules_path,
+            inner: Arc::new(Mutex::new(SourceInner::default())),
+            _refresh_task: None,
+        }
+    }
+}
+
+/// 定位活动 agent 所属 workspace 的根路径（file-tree spec: Tree scope）。
+///
+/// 面板用同一函数做"根变化才重扫"的比对，避免解析逻辑重复。
+pub fn resolve_active_root(app: &WeakEntity<TerminalApp>, cx: &App) -> Option<PathBuf> {
+    let app = app.upgrade()?;
+    let app = app.read(cx);
+    let active = app.active?;
+    app.workspaces
+        .iter()
+        .find(|ws| ws.agents.iter().any(|a| a.entity_id() == active))
+        .map(|ws| ws.path.clone())
+}
+
+/// 全量递归扫描（**后台线程执行**；design D6）。
+///
+/// - 根不可读 → `Err`（面板落降级态，spec: Empty and degraded states）；
+/// - 子目录不可读 → 跳过其内容（best-effort，目录仍显示）；
+/// - 用 `file_type()`（不跟随符号链接）：链接按文件显示，天然规避
+///   符号链接环导致的递归死循环；
+/// - 排序：目录在前、文件在后，各自按标签（大小写不敏感）字典序。
+pub fn scan_root(root: &Path) -> Result<SourceNode, String> {
+    if !root.is_dir() {
+        return Err(format!("{} 不是可读目录", root.display()));
+    }
+    let children = scan_dir(root)?;
+    Ok(SourceNode {
+        id: root.to_string_lossy().to_string(),
+        label: root.display().to_string(),
+        kind: SourceNodeKind::Dir,
+        children,
+    })
+}
+
+fn scan_dir(dir: &Path) -> Result<Vec<SourceNode>, String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
+    let mut nodes = Vec::new();
+    for entry in entries.flatten() {
+        let label = entry.file_name().to_string_lossy().to_string();
+        if EXCLUDES.contains(&label.as_str()) {
+            continue;
+        }
+        let path = entry.path();
+        // file_type = lstat: 符号链接不视为目录 (不递归, 防环)
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let id = path.to_string_lossy().to_string();
+        if is_dir {
+            let children = scan_dir(&path).unwrap_or_default(); // 子目录不可读 → 空目录仍显示
+            nodes.push(SourceNode {
+                id,
+                label,
+                kind: SourceNodeKind::Dir,
+                children,
+            });
+        } else {
+            nodes.push(SourceNode {
+                id,
+                label,
+                kind: SourceNodeKind::File,
+                children: Vec::new(),
+            });
+        }
+    }
+    nodes.sort_by(|a, b| {
+        let rank = |n: &SourceNode| match n.kind {
+            SourceNodeKind::Dir => 0,
+            SourceNodeKind::File => 1,
+        };
+        rank(a)
+            .cmp(&rank(b))
+            .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    Ok(nodes)
+}
+
+/// 规则求值后的视图树：**目录恒显**（结构保留），文件按 `Ruleset` 过滤。
+///
+/// `root_id` = 合成根的 id（workspace 根路径），用于剥离出相对路径。
+pub fn filter_tree(node: &SourceNode, root_id: &str, rules: &Ruleset) -> SourceNode {
+    let rel_of = |id: &str| -> String {
+        id.strip_prefix(root_id)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .map(str::to_string)
+            .unwrap_or_else(|| id.to_string())
+    };
+    let children = node
+        .children
+        .iter()
+        .filter(|child| child.kind == SourceNodeKind::Dir || rules.is_visible(&rel_of(&child.id)))
+        .map(|child| filter_tree(child, root_id, rules))
+        .collect();
+    SourceNode {
+        id: node.id.clone(),
+        label: node.label.clone(),
+        kind: node.kind,
+        children,
+    }
+}
+
+impl WorkspacePropertySource for FileTreeSource {
+    fn name(&self) -> &str {
+        "文件树"
+    }
+
+    fn refresh(&mut self, cx: &mut App) {
+        // part1a: 定位根 (活跃 agent 所属 workspace)
+        let root = resolve_active_root(&self.app, cx);
+        // part1b: 重读配置规则 (按根键控; 缺失 = 空 = 全显)
+        let all_rules = store::load_file_tree_rules(&self.rules_path);
+        let rules = root
+            .as_ref()
+            .and_then(|r| all_rules.get(r.to_string_lossy().as_ref()))
+            .cloned()
+            .unwrap_or_default();
+
+        let inner = self.inner.clone();
+        let app = self.app.clone();
+        {
+            let mut guard = inner.lock().expect("source inner lock");
+            guard.rules = rules;
+            match &root {
+                None => guard.clear(), // 无活跃 workspace → 空态 (调用方自行 notify)
+                Some(r) => {
+                    if guard.root.as_ref() != Some(r) {
+                        // 换根: 先清空 (spec: 切换 workspace 替换树; 不闪旧树)
+                        guard.canonical = None;
+                        guard.degraded = None;
+                        guard.root = Some(r.clone());
+                    }
+                    // 同根 (⟳ 刷新): 保留旧树直到新扫描落地
+                }
+            }
+        }
+        let Some(root) = root else { return };
+
+        // part1c: 后台扫描 → 主线程落树 → 经 app 枢纽转发通知
+        // (spec: 面板自读不重建, 必须显式转发; notify_panels 内部 defer)
+        let task = cx.spawn(async move |cx: &mut AsyncApp| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { scan_root(&root) })
+                .await;
+            {
+                let mut guard = inner.lock().expect("source inner lock");
+                let root = guard.root.clone().expect("root set before scan");
+                guard.land(outcome, root);
+            }
+            app.update(cx, |app, cx| app.notify_panels(cx)).ok();
+        });
+        self._refresh_task = Some(task);
+    }
+
+    fn view(&self) -> SourceView {
+        let guard = self.inner.lock().expect("source inner lock");
+        if let Some(message) = &guard.degraded {
+            return SourceView::Degraded {
+                root: guard.root.clone().expect("degraded implies root"),
+                message: message.clone(),
+            };
+        }
+        match (&guard.root, &guard.canonical) {
+            (Some(root), Some(node)) => {
+                let ruleset = Ruleset::compile(&guard.rules);
+                SourceView::Tree {
+                    root: root.clone(),
+                    node: filter_tree(node, &node.id, &ruleset),
+                    rules: guard.rules.clone(),
+                }
+            }
+            _ => SourceView::Empty,
+        }
+    }
+
+    fn menu(&self, _item_id: &str) -> Vec<MenuDesc> {
+        // 功能描述由数据源提供 (proposal): v1 两项, 端到端链路可验证
+        vec![
+            MenuDesc {
+                id: FUNC_COPY_PATH.to_string(),
+                label: "复制路径".to_string(),
+            },
+            MenuDesc {
+                id: FUNC_REVEAL.to_string(),
+                label: "在 Finder 显示".to_string(),
+            },
+        ]
+    }
+
+    fn execute(&mut self, item_id: &str, func_id: &str) -> Vec<SourceEffect> {
+        // 执行结果 = 效果意图 (design D2): 落地 (剪贴板/reveal) 由面板完成
+        match func_id {
+            FUNC_COPY_PATH => vec![SourceEffect::CopyText(item_id.to_string())],
+            FUNC_REVEAL => vec![SourceEffect::RevealPath(PathBuf::from(item_id))],
+            _ => Vec::new(),
+        }
+    }
+
+    fn open(&mut self, _item_id: &str) {
+        // v1 no-op (spec: no visible effect beyond selection highlight)。
+        // TODO: 默认打开系统另行立项后在此接入。
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 每测试独立 temp 根 (进程 id + 名字, 并行安全)。
+    fn temp_root(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("filetree-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn touch(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, "x").unwrap();
+    }
+
+    fn labels(nodes: &[SourceNode]) -> Vec<&str> {
+        nodes.iter().map(|n| n.label.as_str()).collect()
+    }
+
+    fn find<'a>(nodes: &'a [SourceNode], label: &str) -> Option<&'a SourceNode> {
+        nodes.iter().find(|n| n.label == label)
+    }
+
+    #[test]
+    fn filetree_scan_excludes_and_kinds() {
+        let root = temp_root("scan");
+        // 正常内容
+        touch(&root.join("src/app.rs"));
+        touch(&root.join("src/pane/mod.rs"));
+        touch(&root.join("README.md"));
+        touch(&root.join(".gitignore")); // dotfile 必须显示
+        // 排除表全量播种 (任意深度)
+        for excluded in EXCLUDES {
+            touch(&root.join(format!("src/{excluded}/junk.js"))); // 任意深度排除
+            touch(&root.join(excluded)); // 文件形态也排除 (.DS_Store 等)
+        }
+        // 深层 node_modules
+        touch(&root.join("src/deep/node_modules/dep/index.js"));
+
+        let tree = scan_root(&root).expect("root 可读");
+        assert_eq!(tree.kind, SourceNodeKind::Dir);
+
+        // 顶层: 目录在前 + 排除项缺席 + dotfile 在场
+        let top = labels(&tree.children);
+        assert_eq!(top, vec!["src", ".gitignore", "README.md"], "顶层排序: 目录前, 大小写不敏感字典序; 排除项全部缺席");
+
+        // 递归无任何排除项
+        fn assert_no_excluded(node: &SourceNode) {
+            assert!(
+                !EXCLUDES.contains(&node.label.as_str()),
+                "排除项泄漏: {}",
+                node.id
+            );
+            for child in &node.children {
+                assert_no_excluded(child);
+            }
+        }
+        assert_no_excluded(&tree);
+
+        // kind 正确
+        let src = find(&tree.children, "src").expect("src 在场");
+        assert_eq!(src.kind, SourceNodeKind::Dir);
+        let app_rs = find(&src.children, "app.rs").expect("app.rs 在场");
+        assert_eq!(app_rs.kind, SourceNodeKind::File);
+        let pane = find(&src.children, "pane").expect("pane 在场");
+        assert_eq!(pane.kind, SourceNodeKind::Dir);
+        assert_eq!(labels(&pane.children), vec!["mod.rs"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn filetree_scan_missing_root_errors() {
+        let missing = std::env::temp_dir().join(format!(
+            "filetree-gone-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(scan_root(&missing).is_err(), "根不存在 → Err (降级态输入)");
+        // 文件而非目录同样 Err
+        let file = std::env::temp_dir().join(format!("filetree-file-{}", std::process::id()));
+        std::fs::write(&file, "x").unwrap();
+        assert!(scan_root(&file).is_err());
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn filetree_view_filters_files_only() {
+        let root = temp_root("view");
+        touch(&root.join("src/main.rs"));
+        touch(&root.join("src/main.log"));
+        touch(&root.join("docs/readme.md"));
+        touch(&root.join("notes.txt"));
+        let tree = scan_root(&root).expect("root 可读");
+        let root_id = tree.id.clone();
+
+        // ["*.log"] → log 隐藏, 其余与目录全在
+        let rules = Ruleset::compile(&["*.log".to_string()]);
+        let view = filter_tree(&tree, &root_id, &rules);
+        assert_eq!(labels(&view.children), vec!["docs", "src", "notes.txt"]);
+        let src = find(&view.children, "src").unwrap();
+        assert_eq!(labels(&src.children), vec!["main.rs"], "main.log 被过滤");
+        assert!(find(&view.children, "notes.txt").is_some());
+
+        // ["*"] → 文件全隐、目录恒显 (结构保留)
+        let all = Ruleset::compile(&["*".to_string()]);
+        let view = filter_tree(&tree, &root_id, &all);
+        assert_eq!(labels(&view.children), vec!["docs", "src"], "顶层只剩目录");
+        let src = find(&view.children, "src").unwrap();
+        assert!(src.children.is_empty(), "文件全隐但目录仍在");
+        assert_eq!(src.kind, SourceNodeKind::Dir);
+
+        // ["*", "!*.rs"] → 白名单化, 目录结构完整
+        let only_rs = Ruleset::compile(&["*".to_string(), "!*.rs".to_string()]);
+        let view = filter_tree(&tree, &root_id, &only_rs);
+        let src = find(&view.children, "src").unwrap();
+        assert_eq!(labels(&src.children), vec!["main.rs"]);
+        assert!(find(&view.children, "docs").is_some(), "空内容目录仍显示");
+
+        // 空规则 → 全显
+        let empty = Ruleset::compile(&[]);
+        let view = filter_tree(&tree, &root_id, &empty);
+        assert_eq!(view.children.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

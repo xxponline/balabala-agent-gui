@@ -13,6 +13,7 @@ use crate::agent_entities::{AgentSession, PiAgentShell};
 use crate::pane::TerminalPanel;
 use crate::shell;
 use crate::sidebar::{SidebarEvent, SidebarPanel};
+use crate::tree::TreePanel;
 use crate::workspace::{Workspace, store};
 
 // Tab 在 Terminal context 下的转发动作: gpui-base 的 Root 全局绑定
@@ -34,6 +35,8 @@ pub struct TerminalApp {
     pub sidebar: Entity<SidebarPanel>,
     /// 终端面板实体 (4.1; 焦点在其内, 一步切焦点/步骤 5 进 DockArea 中心)
     pub terminal: Entity<TerminalPanel>,
+    /// 文件树面板实体 (right-dock-file-tree; notify 转发名单成员)
+    pub tree: Entity<TreePanel>,
     /// 节流 drain 任务; drop 会取消循环 (design D3)
     _update_task: Option<Task<()>>,
     /// 进行中的异步文件夹选择任务 (design D8; 换新对话框时旧任务被取消)
@@ -61,6 +64,7 @@ impl TerminalApp {
             dock_area,
             sidebar,
             terminal,
+            tree,
         } = shell::build(weak_app, window, cx);
         Ok(Self {
             workspaces,
@@ -73,6 +77,7 @@ impl TerminalApp {
             dock_area,
             sidebar,
             terminal,
+            tree,
         })
     }
 
@@ -316,7 +321,8 @@ impl TerminalApp {
 
     /// 数据变化 → notify 展示该数据的面板 (spike §10.5 实测: 面板自读不
     /// 重建, 必须显式转发)。转发列表: sidebar (badge/列表) + terminal
-    /// (输出滚动 — 3.3 计划的 step-4 扩展, 此处补全)。
+    /// (输出滚动) + tree (文件树: 拉视图/根比对/同步 TreeState —
+    /// right-dock-file-tree 3.2)。
     ///
     /// **必须 `cx.defer`**: 事件 listener 挂在面板 entity 上, listener
     /// 执行期间面板持有 update lease — 同步 `panel.update` 会重入 panic
@@ -324,12 +330,15 @@ impl TerminalApp {
     /// updated", entity_map lease)。`App::defer` 的 effect 只在**最外层**
     /// update 的 finish 时 flush (pending_updates 守卫), 此时面板 lease
     /// 已 end_lease → 安全。
-    fn notify_panels(&self, cx: &mut Context<Self>) {
+    pub(crate) fn notify_panels(&self, cx: &mut Context<Self>) {
         let sidebar = self.sidebar.clone();
         let terminal = self.terminal.clone();
+        let tree = self.tree.clone();
         cx.defer(move |cx| {
             sidebar.update(cx, |_, cx| cx.notify());
             terminal.update(cx, |_, cx| cx.notify());
+            // 树面板不是裸 notify: 要走"根比对→按需重扫→同步 TreeState"
+            tree.update(cx, |panel, cx| panel.on_data_changed(cx));
         });
     }
 
@@ -728,7 +737,7 @@ mod tests {
 
         // hermetic: 注入测试专用 workspace, 不依赖本地 .workspaces.json
         let _ws_path = cx.update(|cx| {
-            app_entity.update(cx, |app, cx| inject_test_workspace(app, "row-click"))
+            app_entity.update(cx, |app, _cx| inject_test_workspace(app, "row-click"))
         });
         let (path, before) = cx.update(|cx| {
             let app = app_entity.read(cx);

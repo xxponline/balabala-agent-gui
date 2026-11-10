@@ -10,8 +10,10 @@ mod app;
 mod pane;
 mod shell;
 mod sidebar;
+mod tree;
 mod ui;
 mod workspace;
+mod workspace_property_source;
 
 use app::TerminalApp;
 use gpui_kit::AppContext;
