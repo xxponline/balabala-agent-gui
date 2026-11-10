@@ -625,6 +625,8 @@ mod tests {
         }
         fn send_key(&mut self, _key: crossterm::event::KeyEvent) {}
         fn send_text(&mut self, _text: &str) {}
+        fn send_wheel(&mut self, _lines: i16) {}
+        fn send_click(&mut self, _x: u16, _y: u16) {}
         fn shutdown(&mut self) {}
         fn status(&self) -> SessionStatus {
             SessionStatus::Running

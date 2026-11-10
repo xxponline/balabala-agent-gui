@@ -49,6 +49,14 @@ pub trait AgentEntity {
     /// 把一段已提交文本送给会话（IME commit；preedit 不走这里）。
     fn send_text(&mut self, text: &str);
 
+    /// 把滚轮行数送给会话（负=上滚看更早、正=下滚看更新；像素累积与
+    /// Alt 倍率已在宿主侧完成 — terminal-pointer-and-scroll-input D1/D3）。
+    fn send_wheel(&mut self, lines: i16);
+
+    /// 把左键点击的 0-based 单元格坐标送给会话（与会话渲染帧同一
+    /// 坐标系；命中表在会话内部，宿主不解释坐标含义）。
+    fn send_click(&mut self, x: u16, y: u16);
+
     /// 主动关闭: 结束会话并终止 pi 子进程 (spec: Manual session close)。
     fn shutdown(&mut self);
 

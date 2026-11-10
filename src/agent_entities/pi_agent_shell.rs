@@ -146,6 +146,14 @@ impl AgentEntity for PiAgentShell {
         self.embed.inject_text(text);
     }
 
+    fn send_wheel(&mut self, lines: i16) {
+        self.embed.inject_wheel(lines);
+    }
+
+    fn send_click(&mut self, x: u16, y: u16) {
+        self.embed.inject_click(x, y);
+    }
+
     fn shutdown(&mut self) {
         // 退出事件循环并 join (线程侧杀 pi 子进程, spec: Manual session close)
         self.embed.shutdown();

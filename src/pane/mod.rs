@@ -13,6 +13,8 @@
 use gpui_kit::base::TestTextExt;
 use gpui_kit::component::dock::{BasePanel, Panel, PanelEvent};
 use gpui_kit::*;
+use std::cell::Cell;
+use std::rc::Rc;
 use vt100::Screen;
 
 use crate::agent_entities::SessionStatus;
@@ -38,6 +40,10 @@ fn keystroke_to_keyevents(key: &str, key_char: Option<&str>) -> Vec<crossterm::e
         "down" => Some(KeyCode::Down),
         "right" => Some(KeyCode::Right),
         "left" => Some(KeyCode::Left),
+        // 历史回看翻页 (terminal-pointer-and-scroll-input, spec: Page keys
+        // forwarded for history scrollback — pi 侧 KeyIntent::ScrollPage 消费)
+        "pageup" => Some(KeyCode::PageUp),
+        "pagedown" => Some(KeyCode::PageDown),
         _ => None,
     };
     if let Some(code) = special {
@@ -355,6 +361,76 @@ mod tests {
     }
 
     // ---------- 纯数据 (build_grid) ----------
+
+    /// 滚轮换算纯测 (task 3.2, spec: Wheel deltas accumulate to whole
+    /// lines / Remainder resets / Alt multiplies)。
+    /// 符号约定: gpui 正 y (触摸板上滑) → 发负行数 = pi 的"上滚看更早"
+    /// (standalone crossterm ScrollUp→-1 金标准; 2026-11-10 验收修正)。
+    #[test]
+    fn wheel_lines_for_accumulates_alt_and_resets() {
+        use super::{WheelAccumulator, wheel_lines_for};
+        use gpui_kit::{ScrollDelta, point, px};
+
+        let pix = |y: f32| ScrollDelta::Pixels(point(px(0.), px(y)));
+        let lines = |y: f32| ScrollDelta::Lines(gpui_kit::Point { x: 0.0, y });
+
+        let mut acc = WheelAccumulator::default();
+        // line_h 未测量 (0) → 拒绝一切输入 (防御)
+        assert_eq!(wheel_lines_for(&mut acc, &pix(42.), 0.0, false), None);
+
+        // 上滑 0.4 行/次 (gpui +y): 前两次 None (余数携带), 第三次 -1.2
+        // → Some(-1) — 负号 = 看更早
+        assert_eq!(wheel_lines_for(&mut acc, &pix(8.4), 21.0, false), None);
+        assert_eq!(wheel_lines_for(&mut acc, &pix(8.4), 21.0, false), None);
+        assert_eq!(
+            wheel_lines_for(&mut acc, &pix(8.4), 21.0, false),
+            Some(-1),
+            "累积 -1.2 行 → 发 -1 行 (余 -0.2 携带, 负=上滚看更早)"
+        );
+
+        // Alt 倍率: +1 行 gpui → -1 → ×5 保号
+        assert_eq!(
+            wheel_lines_for(&mut acc, &pix(21.0), 21.0, true),
+            Some(-(pi_shell_rs::app::scroll::ALT_WHEEL_MULTIPLIER as i16)),
+            "Alt 持有一行 = ALT_WHEEL_MULTIPLIER 行 (保符号)"
+        );
+
+        // Lines 直通: gpui +0.3 → -0.3; 余 -0.2-0.3=-0.5 → None
+        assert_eq!(wheel_lines_for(&mut acc, &lines(0.3), 21.0, false), None);
+
+        // line_h 变化 → 余数清零 (spec: Remainder resets on line height
+        // change): 清后 -0.7 单独 → None; 若未清则 -0.5-0.7=-1.2 → Some(-1)
+        assert_eq!(wheel_lines_for(&mut acc, &lines(0.2), 24.0, false), None);
+        assert_eq!(
+            wheel_lines_for(&mut acc, &lines(0.7), 24.0, false),
+            None,
+            "换行高后余数从零起算 (-0.7 → None)"
+        );
+        assert_eq!(
+            wheel_lines_for(&mut acc, &lines(0.4), 24.0, false),
+            Some(-1),
+            "-0.7-0.4=-1.1 → 发 -1"
+        );
+    }
+
+    /// 翻页键映射 (terminal-pointer-and-scroll-input task 2.3, spec: Page
+    /// keys forwarded for history scrollback)。
+    #[test]
+    fn page_keys_map_to_crossterm_paging() {
+        use super::keystroke_to_keyevents;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        assert_eq!(
+            keystroke_to_keyevents("pageup", None),
+            vec![KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)],
+            "pageup → crossterm PageUp"
+        );
+        assert_eq!(
+            keystroke_to_keyevents("pagedown", None),
+            vec![KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)],
+            "pagedown → crossterm PageDown"
+        );
+    }
 
     #[test]
     fn mixed_ascii_cjk_emoji_rows_sum_to_grid_columns() {
@@ -839,6 +915,14 @@ pub struct TerminalPanel {
     /// 面板焦点 (原 TerminalApp::pane_focus 迁入; 4.1):
     /// `track_focus` 挂在 `#terminal-pane`, 一步切焦点/IME handler 均用它。
     focus: FocusHandle,
+    /// `#terminal-grid` 子元素的窗口坐标 bounds (task 3.1/4.1, design D4):
+    /// origin 作点击换算减项, size 作越界判定 (spec: Clicks outside the
+    /// grid area)。prepaint 期直写 (render 中不得 update 实体 → Rc<Cell>
+    /// 裸闭包, gpui-component 库测试同款)。pub(crate): 测试/点击读。
+    pub(crate) grid_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// 滚轮像素/行混合累积器 (task 3.2, spec: Wheel deltas accumulate to
+    /// whole lines — 慢滚不丢、余数跨事件携带、line_h 变化清零)。
+    wheel: WheelAccumulator,
 }
 
 impl TerminalPanel {
@@ -846,6 +930,8 @@ impl TerminalPanel {
         Self {
             app,
             focus: cx.focus_handle(),
+            grid_bounds: Rc::new(Cell::new(Bounds::default())),
+            wheel: WheelAccumulator::default(),
         }
     }
 
@@ -878,6 +964,124 @@ impl TerminalPanel {
             cx.stop_propagation(); // 防双发 (见上)
         }
     }
+
+    /// 滚轮转发 (task 3.2, design D2/D3/D6): hover 归属 (不查焦点),
+    /// 换算/累积/Alt 倍率经 `wheel_lines_for` 纯函数, 发整行给会话。
+    /// 无论是否凑满行都 stop_propagation — 外层滚动容器永不接管
+    /// (spec: Wheel input follows hover and stops propagation)。
+    fn handle_scroll(
+        &mut self,
+        event: &ScrollEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        let line_h = f32::from(grid_metrics(window).1);
+        let Some(lines) = wheel_lines_for(&mut self.wheel, &event.delta, line_h, event.modifiers.alt)
+        else {
+            return; // 未凑满一行 (余数已携带)
+        };
+        let app = self.app.clone();
+        app.update(cx, |app, cx| app.send_wheel(lines, cx)).ok();
+    }
+
+    /// 左键单元格坐标转发 (task 4.1, design D4, spec: Terminal area click
+    /// coordinates forwarded): 窗口坐标 − grid bounds.origin ÷ cell 尺寸;
+    /// grid 外 (状态条/边框) 或非左键 → 不发。坐标系 = 会话帧 0-based,
+    /// 命中在会话内部。
+    fn forward_click_coordinate(
+        &self,
+        event: &ClickEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ClickEvent::Mouse(mouse) = event else {
+            return; // 键盘/触控点击不发坐标
+        };
+        if mouse.down.button != gpui_kit::MouseButton::Left {
+            return;
+        }
+        let grid = self.grid_bounds.get();
+        let rel_x = mouse.down.position.x - grid.origin.x;
+        let rel_y = mouse.down.position.y - grid.origin.y;
+        if rel_x < px(0.) || rel_y < px(0.) || rel_x >= grid.size.width || rel_y >= grid.size.height {
+            return; // spec: outside the grid area → nothing
+        }
+        let (cell_w, line_h) = grid_metrics(window);
+        let (cell_w, line_h) = (f32::from(cell_w), f32::from(line_h));
+        if cell_w <= 0.0 || line_h <= 0.0 {
+            return;
+        }
+        let col = (f32::from(rel_x) / cell_w) as u16;
+        let row = (f32::from(rel_y) / line_h) as u16;
+        // 尾带防护: bounds 可能比 cols×cell_w 宽出不到一格 (floor 账目,
+        // 与 propagate_grid_size 同源), 超出整格数即越界
+        if col >= (f32::from(grid.size.width) / cell_w) as u16
+            || row >= (f32::from(grid.size.height) / line_h) as u16
+        {
+            return;
+        }
+        let app = self.app.clone();
+        app.update(cx, |app, cx| app.send_click(col, row, cx)).ok();
+    }
+}
+
+/// 滚轮累积器 (task 3.2): 像素差按行高折行、余数跨事件携带、
+/// line_h 变化时清零 (spec: Remainder resets on line height change)。
+/// 纯数据 — 无窗口依赖, 单测直驱。
+#[derive(Default)]
+struct WheelAccumulator {
+    /// 未凑成整行的余数 (行单位, 与整数部分同号)。
+    remainder: f32,
+    /// 当前行高 (px); 0 = 尚未测量, 拒绝一切输入。
+    line_h: f32,
+}
+
+impl WheelAccumulator {
+    fn set_line_h(&mut self, line_h: f32) {
+        if self.line_h != line_h {
+            self.line_h = line_h;
+            self.remainder = 0.0; // 字号/度量变更 → 余数作废
+        }
+    }
+
+    /// 累积一次输入 (行单位), 返回本次可发送的整数行 (向零取整)。
+    fn add(&mut self, delta_lines: f32) -> i16 {
+        if !delta_lines.is_finite() || !self.line_h.is_finite() || self.line_h <= 0.0 {
+            return 0;
+        }
+        self.remainder += delta_lines;
+        let whole = self.remainder.trunc();
+        self.remainder -= whole;
+        whole.clamp(i16::MIN as f32, i16::MAX as f32) as i16
+    }
+}
+
+/// 滚轮事件 → 本次应发送的行数 (None = 未凑满整行)。spec: 像素累积 /
+/// Line 直通 / Alt 倍率 (design D2/D3 — 换算与倍率全在宿主侧)。
+fn wheel_lines_for(
+    acc: &mut WheelAccumulator,
+    delta: &ScrollDelta,
+    line_h: f32,
+    alt: bool,
+) -> Option<i16> {
+    acc.set_line_h(line_h);
+    // 符号适配 (2026-11-10 headed 验收: 触摸板方向反了): gpui ScrollDelta
+    // 的 y 符号与 pi 的行数约定相反 — 金标准是 pi standalone 的 crossterm
+    // 路径 (ScrollUp → -1 = 上滚看更早), 此处把 gpui delta 翻转成同一约定。
+    let delta_lines = match delta {
+        ScrollDelta::Pixels(p) => -f32::from(p.y) / line_h,
+        ScrollDelta::Lines(l) => -l.y,
+    };
+    let n = acc.add(delta_lines);
+    if n == 0 {
+        return None;
+    }
+    Some(if alt {
+        n.saturating_mul(pi_shell_rs::app::scroll::ALT_WHEEL_MULTIPLIER as i16)
+    } else {
+        n
+    })
 }
 
 impl BasePanel for TerminalPanel {
@@ -974,9 +1178,12 @@ impl Render for TerminalPanel {
                 .ok();
                 cx.stop_propagation();
             }))
-            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+            .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                // 一步聚焦保持 (spec: claims keyboard focus for the pane)
                 this.focus.focus(window, cx);
                 cx.notify();
+                // 网格内左键 → 会话帧单元坐标 (task 4.1)
+                this.forward_click_coordinate(event, window, cx);
             }))
             .child(match pane_data {
                 None => render_empty(),
@@ -995,6 +1202,25 @@ impl Render for TerminalPanel {
                         .children(starting.then(starting_placeholder))
                         .child(
                             div()
+                                // 子元素 prepaint bounds → 窗口原点直存
+                                // (task 3.1): 点击坐标换算的减项; 裸闭包
+                                // 不走 entity update, render 期安全。
+                                // 必须在 .id() 之前挂 (inherent Div 方法,
+                                // Stateful 包装后不可见)
+                                .on_children_prepainted({
+                                    let bounds = self.grid_bounds.clone();
+                                    move |children, _window, _cx| {
+                                        if let Some(b) = children.first() {
+                                            bounds.set(*b);
+                                        }
+                                    }
+                                })
+                                // 滚轮 (task 3.2): 挂网格区域 = spec 的
+                                // “terminal area” 界 (状态条上不滚); hover
+                                // 归属由库的 should_handle_scroll 判定
+                                .on_scroll(cx.listener(|this, event, window, cx| {
+                                    this.handle_scroll(event, window, cx);
+                                }))
                                 // 网格区域锚点: 自适应测量的 bounds
                                 // 即此 div (canvas size_full 同界),
                                 // 测试经此断言换算 (test_support 在

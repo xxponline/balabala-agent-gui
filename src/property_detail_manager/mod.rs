@@ -219,10 +219,21 @@ mod tests {
         parser: vt100::Parser,
         keys: Rc<Cell<usize>>,
         texts: Rc<Cell<usize>>,
+        /// 累计滚轮行数 (2.2/3.x 观测)。
+        wheels: Rc<Cell<i64>>,
+        /// 最近一次点击坐标 (2.2/4.x 观测)。
+        clicks: Rc<Cell<Option<(u16, u16)>>>,
     }
 
     impl CountingAgent {
-        fn new(name: &str, ws: &Path, keys: Rc<Cell<usize>>, texts: Rc<Cell<usize>>) -> Self {
+        fn new(
+            name: &str,
+            ws: &Path,
+            keys: Rc<Cell<usize>>,
+            texts: Rc<Cell<usize>>,
+            wheels: Rc<Cell<i64>>,
+            clicks: Rc<Cell<Option<(u16, u16)>>>,
+        ) -> Self {
             Self {
                 name: name.to_string(),
                 ws: ws.to_path_buf(),
@@ -233,6 +244,8 @@ mod tests {
                 ),
                 keys,
                 texts,
+                wheels,
+                clicks,
             }
         }
     }
@@ -257,6 +270,12 @@ mod tests {
             let _ = text;
             self.texts.set(self.texts.get() + 1);
         }
+        fn send_wheel(&mut self, lines: i16) {
+            self.wheels.set(self.wheels.get() + i64::from(lines));
+        }
+        fn send_click(&mut self, x: u16, y: u16) {
+            self.clicks.set(Some((x, y)));
+        }
         fn shutdown(&mut self) {}
         fn status(&self) -> SessionStatus {
             SessionStatus::Running
@@ -273,12 +292,19 @@ mod tests {
         cx: &mut TestAppContext,
         app: &gpui_kit::Entity<TerminalApp>,
         tag: &str,
-    ) -> (Rc<Cell<usize>>, Rc<Cell<usize>>) {
+    ) -> (
+        Rc<Cell<usize>>,
+        Rc<Cell<usize>>,
+        Rc<Cell<i64>>,
+        Rc<Cell<Option<(u16, u16)>>>,
+    ) {
         let ws = std::env::temp_dir().join(format!("pdm-ws-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
         std::fs::create_dir_all(&ws).unwrap();
         let keys = Rc::new(Cell::new(0usize));
         let texts = Rc::new(Cell::new(0usize));
+        let wheels = Rc::new(Cell::new(0i64));
+        let clicks = Rc::new(Cell::new(None));
         cx.update(|cx| {
             app.update(cx, |app, cx| {
                 app.workspaces.push(Workspace::new(ws.clone()));
@@ -288,6 +314,8 @@ mod tests {
                         &ws,
                         keys.clone(),
                         texts.clone(),
+                        wheels.clone(),
+                        clicks.clone(),
                     )))
                 });
                 let id = agent.entity_id();
@@ -297,7 +325,7 @@ mod tests {
             });
         });
         cx.run_until_parked();
-        (keys, texts)
+        (keys, texts, wheels, clicks)
     }
 
     // ---------- 2.2 tab 条常驻 ----------
@@ -327,6 +355,230 @@ mod tests {
             .expect("update window");
         assert!(title_there, "单 console 签时顶栏常驻 (render_title 顶栏在场)");
         assert!(not_tab_strip, "单签形态为 simple title 而非 tab 条 (Auto 样式)");
+    }
+
+    // ---------- 2.2 滚轮/点击分发 ----------
+    // ---------- 3.2 滚轮链路 ----------
+    // ---------- 3.3 滚轮 hover 归属 ----------
+    // ---------- 4.1 点击坐标转发 ----------
+
+    #[gpui_kit::test]
+    fn click_inside_grid_delivers_cell_coordinate(cx: &mut TestAppContext) {
+        use gpui_kit::point;
+
+        let (handle, app) = open_app(cx);
+        let (_keys, _texts, _wheels, clicks) = inject_session(cx, &app, "clickcell");
+        let term_focus = cx.update(|cx| app.read(cx).terminal.read(cx).focus_handle(cx));
+        let _ = render(handle, cx);
+
+        let (cell_w, line_h) = cx
+            .update_window(handle, |_, window, _| crate::pane::grid_metrics(window))
+            .expect("grid_metrics");
+        // 点网格内第 10 列第 5 行的格子中心 → (10, 5)
+        let target = point(
+            gpui_kit::px(f32::from(cell_w) * 10.5),
+            gpui_kit::px(f32::from(line_h) * 5.5),
+        );
+        cx.update_window(handle, |_, window, cx| {
+            window.click_at("terminal-grid", target, cx);
+        })
+        .expect("click_at");
+        cx.run_until_parked();
+
+        assert_eq!(
+            clicks.get(),
+            Some((10, 5)),
+            "网格内左键 → 0-based 单元格坐标 (窗口坐标 − grid origin ÷ cell 尺寸)"
+        );
+        let cf = cx.update(|cx| app.read(cx).click_forwards);
+        assert_eq!(cf, 1, "入口计数");
+        let focused = cx
+            .update_window(handle, |_, window, cx| window.focused(cx))
+            .expect("update window");
+        assert_eq!(
+            focused,
+            Some(term_focus),
+            "点击仍一步聚焦 console pane (既有语义保持)"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn click_outside_grid_sends_nothing(cx: &mut TestAppContext) {
+        use gpui_kit::point;
+
+        let (handle, app) = open_app(cx);
+        let (_keys, _texts, _wheels, clicks) = inject_session(cx, &app, "clickout");
+        let term_focus = cx.update(|cx| app.read(cx).terminal.read(cx).focus_handle(cx));
+        let _ = render(handle, cx);
+
+        // 点 terminal-pane 顶部 (status bar 区, grid 上方) → 坐标为负 → 不发
+        cx.update_window(handle, |_, window, cx| {
+            window.click_at("terminal-pane", point(gpui_kit::px(5.), gpui_kit::px(5.)), cx);
+        })
+        .expect("click_at");
+        cx.run_until_parked();
+
+        assert_eq!(clicks.get(), None, "grid 外点击不发坐标 (spec)");
+        let cf = cx.update(|cx| app.read(cx).click_forwards);
+        assert_eq!(cf, 0, "入口零计数");
+        let focused = cx
+            .update_window(handle, |_, window, cx| window.focused(cx))
+            .expect("update window");
+        assert_eq!(
+            focused,
+            Some(term_focus),
+            "grid 外点击仍聚焦 pane (status bar 点击语义不变)"
+        );
+    }
+
+
+    #[gpui_kit::test]
+    fn wheel_unreachable_while_viewer_active(cx: &mut TestAppContext) {
+        use gpui_kit::ScrollDelta;
+        use gpui_kit::point;
+
+        let (handle, app) = open_app(cx);
+        let (_keys, _texts, wheels, _clicks) = inject_session(cx, &app, "wheelhover");
+        let _ = render(handle, cx);
+
+        // 开 viewer → console 面板不再渲染 (spec: Wheel while a viewer tab
+        // is active reaches no session)
+        let path = write_temp_file("hover", "rs", "fn hover_probe() {}");
+        open_object_in(
+            cx,
+            handle,
+            &app,
+            OpenObject {
+                path: PathBuf::from(&path),
+                kind: SourceNodeKind::File,
+            },
+        );
+        let _ = render(handle, cx);
+        let console_gone = cx
+            .update_window(handle, |_, window, _cx| window.try_find("terminal-grid").is_none())
+            .expect("update window");
+        assert!(console_gone, "viewer active → terminal-grid 不渲染 (handler 不存在)");
+
+        // 滚 viewer 区域 (console 无 handler) → session 零收
+        cx.update_window(handle, |_, window, cx| {
+            window.scroll(
+                "viewer-pane",
+                ScrollDelta::Pixels(point(gpui_kit::px(0.), gpui_kit::px(-42.))),
+                cx,
+            );
+        })
+        .expect("scroll");
+        cx.run_until_parked();
+
+        assert_eq!(wheels.get(), 0, "viewer active 滚轮不进 session");
+        let wf = cx.update(|cx| app.read(cx).wheel_forwards);
+        assert_eq!(wf, 0, "入口零计数");
+    }
+
+
+    #[gpui_kit::test]
+    fn wheel_accumulates_pixels_through_panel(cx: &mut TestAppContext) {
+        use gpui_kit::ScrollDelta;
+        use gpui_kit::point;
+
+        let (handle, app) = open_app(cx);
+        let (_keys, _texts, wheels, _clicks) = inject_session(cx, &app, "wheelchain");
+        let _ = render(handle, cx);
+
+        let line_h = cx
+            .update_window(handle, |_, window, _| f32::from(crate::pane::grid_metrics(window).1))
+            .expect("grid_metrics");
+        assert!(line_h > 0., "行高可测得");
+
+        let scroll_px = |cx: &mut TestAppContext, dy: f32| {
+            cx.update_window(handle, |_, window, cx| {
+                window.scroll(
+                    "terminal-grid",
+                    ScrollDelta::Pixels(point(gpui_kit::px(0.), gpui_kit::px(dy))),
+                    cx,
+                );
+            })
+            .expect("scroll");
+            cx.run_until_parked();
+        };
+
+        // 慢滚 gpui 正 delta 0.4 行 ×3 → 前两次无发送, 第三次发 -1 行
+        // (符号翻转: gpui +y 上滑 → pi 负 = 上滚看更早, 2026-11-10 验收)
+        scroll_px(cx, line_h * 0.4);
+        scroll_px(cx, line_h * 0.4);
+        assert_eq!(wheels.get(), 0, "未凑满一行不发送 (余数携带)");
+        scroll_px(cx, line_h * 0.4);
+        assert_eq!(wheels.get(), -1, "-1.2 行 → 发 -1 行 (负=看更早)");
+
+        // 快滚一次 5 行 → 一次发 -5 (累积 -0.2-5=-5.2 → -5)
+        scroll_px(cx, line_h * 5.);
+        assert_eq!(wheels.get(), -6, "整数行不丢");
+
+        let wf = cx.update(|cx| app.read(cx).wheel_forwards);
+        assert_eq!(wf, 2, "入口计数 = 两次发送");
+    }
+
+
+    #[gpui_kit::test]
+    fn grid_origin_tracks_terminal_grid_bounds(cx: &mut TestAppContext) {
+        let (handle, app) = open_app(cx);
+        let _ = inject_session(cx, &app, "origin");
+        let _ = render(handle, cx); // render_frame + run_until_parked → defer 已 flush
+
+        let (observed, stored) = cx
+            .update_window(handle, |_, window, cx| {
+                let bounds = window
+                    .try_find("terminal-grid")
+                    .expect("terminal-grid 应渲染 (有 active session)")
+                    .bounds();
+                let origin = app.read(cx).terminal.read(cx).grid_bounds.get().origin;
+                (bounds.origin, origin)
+            })
+            .expect("update window");
+        assert_eq!(
+            observed, stored,
+            "grid_origin 必须等于 terminal-grid 实际 bounds 原点 (D4 换算减项)"
+        );
+        assert!(
+            observed.x > px(0.) && observed.y > px(0.),
+            "原点非零 (状态条/内边距在网格上方左侧, 实测 {observed:?})"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn wheel_and_click_reach_active_session(cx: &mut TestAppContext) {
+        let (handle, app) = open_app(cx);
+        let (_keys, _texts, wheels, clicks) = inject_session(cx, &app, "wheel");
+        let _ = handle;
+
+        // 转发: 载荷累计 + 入口计数 (task 2.2 观测口)
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.send_wheel(-3, cx);
+                app.send_wheel(5, cx);
+                app.send_click(12, 7, cx);
+            });
+        });
+        assert_eq!(wheels.get(), 2, "行数载荷累计 (-3+5)");
+        assert_eq!(clicks.get(), Some((12, 7)), "坐标载荷原样送达");
+        let (wf, cf) = cx.update(|cx| {
+            let app = app.read(cx);
+            (app.wheel_forwards, app.click_forwards)
+        });
+        assert_eq!((wf, cf), (2, 1), "入口计数 = 转发次数");
+
+        // 无 active session: 不 panic、不计数、不转发 (task 2.2 边界)
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.active = None;
+                app.send_wheel(9, cx);
+                app.send_click(0, 0, cx);
+            });
+        });
+        let wf = cx.update(|cx| app.read(cx).wheel_forwards);
+        assert_eq!(wf, 2, "无会话不计数");
+        assert_eq!(wheels.get(), 2, "无会话不转发");
+        assert_eq!(clicks.get(), Some((12, 7)), "无会话坐标不变");
     }
 
     // ---------- 1.x dedup 生命周期 ----------
@@ -617,7 +869,7 @@ mod tests {
     #[gpui_kit::test]
     fn keystrokes_follow_active_tab(cx: &mut TestAppContext) {
         let (handle, app) = open_app(cx);
-        let (keys, texts) = inject_session(cx, &app, "keys");
+        let (keys, texts, _wheels, _clicks) = inject_session(cx, &app, "keys");
         let term_focus = cx.update(|cx| app.read(cx).terminal.read(cx).focus_handle(cx));
         let _ = render(handle, cx);
 
@@ -679,7 +931,7 @@ mod tests {
     #[gpui_kit::test]
     fn ime_commit_follows_active_tab(cx: &mut TestAppContext) {
         let (handle, app) = open_app(cx);
-        let (keys, texts) = inject_session(cx, &app, "ime");
+        let (keys, texts, _wheels, _clicks) = inject_session(cx, &app, "ime");
         let term_focus = cx.update(|cx| app.read(cx).terminal.read(cx).focus_handle(cx));
         let _ = render(handle, cx);
 

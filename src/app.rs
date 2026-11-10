@@ -42,6 +42,9 @@ pub struct TerminalApp {
     pub tree: Entity<TreePanel>,
     /// 节流 drain 任务; drop 会取消循环 (design D3)
     _update_task: Option<Task<()>>,
+    /// 输入触发的快速 drain burst (design D7): 8ms×4 拍取到帧即停,
+    /// 新输入 drop 旧 task 重置; 消除 50ms 主循环的相位抖动卡顿
+    _input_drain_task: Option<Task<()>>,
     /// 进行中的异步文件夹选择任务 (design D8; 换新对话框时旧任务被取消)
     _dialog_task: Option<Task<()>>,
     /// 累计实际传播的网格 resize 次数 (诊断/测试观测: 输入型重绘不增)
@@ -50,6 +53,11 @@ pub struct TerminalApp {
     /// Keyboard input forwarding - Tab 的端到端守卫; pi 收到 Tab 无可见
     /// 反应, 只能在转发边界计数验证 — 见 spike F3 结论)
     pub tab_forwards: usize,
+    /// 累计转发给会话的滚轮事件次数 (诊断/测试观测: terminal-pointer-and-
+    /// scroll-input — 行数载荷由 CountingAgent 端累计, 这里计入口次数)
+    pub wheel_forwards: usize,
+    /// 累计转发给会话的点击坐标次数 (同上, 载荷在假会话端断言)
+    pub click_forwards: usize,
     /// 默认打开系统的 dedup 表 (center-slot-multi-tab, design D1):
     /// key = 对象绝对路径字符串 (与 SourceNode.id 同一身份体系),
     /// value = 已开面板的 PanelId; 签关闭时经 `open_tab_removed` 摘除。
@@ -78,9 +86,12 @@ impl TerminalApp {
             active: None,
             save_error: None,
             _update_task: None,
+            _input_drain_task: None,
             _dialog_task: None,
             grid_resizes: 0,
             tab_forwards: 0,
+            wheel_forwards: 0,
+            click_forwards: 0,
             open_tabs: HashMap::new(),
             dock_area,
             sidebar,
@@ -178,18 +189,44 @@ impl TerminalApp {
         if key.code == crossterm::event::KeyCode::Tab {
             self.tab_forwards += 1; // 诊断/测试观测 (spec: Tab 转发边界)
         }
-        let Some(session) = self.active_session() else {
+        let Some(session) = self.active_session().cloned() else {
             return;
         };
         session.update(cx, |s, _| s.0.send_key(key));
+        self.kick_input_drain(cx); // 快速 drain (design D7): pi 收键即重绘
     }
 
     /// 把一段已提交文本（IME commit / 粘贴）送给 active session。
     fn send_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        let Some(session) = self.active_session() else {
+        let Some(session) = self.active_session().cloned() else {
             return;
         };
         session.update(cx, |s, _| s.0.send_text(text));
+        self.kick_input_drain(cx); // 快速 drain (design D7)
+    }
+
+    /// 把滚轮行数送给 active session (task 2.2)。无 active session 时不
+    /// 计数不转发 (与 send_text 同款: 无收者即无动作)。
+    pub(crate) fn send_wheel(&mut self, lines: i16, cx: &mut Context<Self>) {
+        // cloned() 先释放对 self 的借用, 计数才可写 (无会话则提前返回
+        // — 不计数, 见 task 2.2 边界)
+        let Some(session) = self.active_session().cloned() else {
+            return;
+        };
+        self.wheel_forwards += 1;
+        session.update(cx, |s, _| s.0.send_wheel(lines));
+        self.kick_input_drain(cx); // 快速 drain (design D7): 滚动帧即到即显
+    }
+
+    /// 把左键单元格坐标送给 active session (task 2.2; 坐标系 = 会话帧
+    /// 0-based, 命中在会话内部)。
+    pub(crate) fn send_click(&mut self, x: u16, y: u16, cx: &mut Context<Self>) {
+        let Some(session) = self.active_session().cloned() else {
+            return;
+        };
+        self.click_forwards += 1;
+        session.update(cx, |s, _| s.0.send_click(x, y));
+        self.kick_input_drain(cx); // 快速 drain (design D7)
     }
 
     /// 把 (cols, rows) 分发给所有会话 (Exited 会话自行跳过, spec:
@@ -233,6 +270,7 @@ impl TerminalApp {
                 f32::from(cell_w),
                 f32::from(line_h)
             );
+            self.kick_input_drain(cx); // 快速 drain (design D7): 拖窗重排即显
         }
     }
 
@@ -416,6 +454,27 @@ impl TerminalApp {
 
     /// 启动 50ms 节流的 poll 循环 (design D3): 每 tick drain 所有
     /// session, 只在消费了事件时 notify (替代旧的每帧全量重绘)。
+    /// 输入后的快速 drain (design D7, 2026-11-10 headed 验收追加):
+    /// 滚动卡顿主因 = 50ms 主循环相位抖动 — 输入后 8ms×4 拍快速采样,
+    /// 取到新帧即停 (pi 每事件通常 1 帧, 4 拍覆盖其线程调度+重绘时延);
+    /// 连续输入 drop 旧 task 重置 (风暴不叠加); 空闲仍靠主循环。
+    fn kick_input_drain(&mut self, cx: &mut Context<Self>) {
+        let weak = cx.entity().downgrade();
+        self._input_drain_task = Some(cx.spawn(async move |_this, cx: &mut AsyncApp| {
+            for _ in 0..4 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(8))
+                    .await;
+                let got = weak
+                    .update(cx, |app, cx| app.poll_sessions(cx))
+                    .unwrap_or(false);
+                if got {
+                    break;
+                }
+            }
+        }));
+    }
+
     pub fn start_update_loop(&mut self, cx: &mut Context<Self>) {
         let weak = cx.entity().downgrade();
         self._update_task = Some(cx.spawn(async move |_this, cx: &mut AsyncApp| {
@@ -439,7 +498,9 @@ impl TerminalApp {
     /// 遍历所有 session entity, poll 并按需 notify。
     /// session 自身 notify 走根读取链路 (现行为); 同时转发到面板
     /// (spike §10.5: 面板自读不重建) — 输出滚动 + sidebar badge 同帧刷新。
-    fn poll_sessions(&mut self, cx: &mut Context<Self>) {
+    /// 返回是否消费到新帧 (design D7: burst 据此"取到帧即停";
+    /// 主循环忽略返回值)。
+    fn poll_sessions(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         for ws in &self.workspaces {
             for session in &ws.agents {
@@ -454,6 +515,7 @@ impl TerminalApp {
         if changed {
             self.notify_panels(cx);
         }
+        changed
     }
 }
 
@@ -645,6 +707,123 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
         path
+    }
+
+    /// 输入触发的快速 drain (task 5.4, design D7): 测试 app 不启主循环
+    /// (`start_update_loop` 只在 main.rs 调) → 消费帧的唯一途径是输入后
+    /// 的 burst。断言链: stub 启动帧经手动 poll 清场 (顺带验证
+    /// `poll_sessions` 返回值), 注入输入 → 真实等待 pi 重绘写入 →
+    /// run_until_parked 只跑 burst → 新帧被消费 (screen 出现注入字符)。
+    #[gpui_kit::test]
+    fn input_kick_drains_frames_before_main_tick(cx: &mut TestAppContext) {
+        use std::time::{Duration, Instant};
+
+        cx.update(gpui_kit::init);
+        let (handle, app_entity) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1000.), px(600.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| TerminalApp::new(window, cx).expect(".workspaces.json 加载"))
+                },
+            )
+            .expect("open test window")
+        });
+        let _ = handle;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("input-kick-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let stub = write_stub(&dir);
+        app_entity.update(cx, |app, cx| {
+            inject_test_workspace(app, "kick");
+            let shell = PiAgentShell::new_with_pi_bin(
+                "pi-t".into(),
+                std::env::temp_dir(),
+                Some(stub.to_str().unwrap().to_string()),
+            )
+            .expect("stub embed spawn");
+            let e = cx.new(|_| AgentSession(Box::new(shell)));
+            let id = e.entity_id();
+            app.workspaces.last_mut().expect("测试 workspace").agents.push(e);
+            app.active = Some(id);
+            assert!(
+                app._input_drain_task.is_none(),
+                "输入前无 burst (主循环也未启动)"
+            );
+        });
+
+        // 等 stub 启动帧到达并手动消费 (真实时间等子进程; 主循环不存在)
+        // — 顺带验证 poll_sessions 的返回值语义 (design D7)
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = cx.update(|cx| {
+                app_entity.update(cx, |app, cx| app.poll_sessions(cx))
+            });
+            if got {
+                break;
+            }
+            assert!(Instant::now() < deadline, "stub 启动帧未到达");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // 注入输入 (kick 创建 burst) → 真实等待 pi 重绘写入 buffer
+        cx.update(|cx| {
+            app_entity.update(cx, |app, cx| {
+                app.send_key(
+                    crossterm::event::KeyEvent::new(
+                        crossterm::event::KeyCode::Char('汉'),
+                        crossterm::event::KeyModifiers::NONE,
+                    ),
+                    cx,
+                );
+                assert!(
+                    app._input_drain_task.is_some(),
+                    "send_key 尾部必须 kick burst (design D7)"
+                );
+            });
+        });
+        assert!(
+            !cx.update(|cx| app_entity.read(cx)
+                .active_session()
+                .map(|s| s.read(cx).0.screen().contents().contains('汉'))
+                .unwrap_or(false)),
+            "burst 尚未跑前 screen 不含注入字符 (帧仍在 buffer)"
+        );
+        // 逐轮: 真实等待 pi 重绘 → 推进虚拟时钟 (burst 的 8ms timer 必须
+        // 靠 advance_clock 到期 — run_until_parked 不推进时钟, 这正是
+        // burst 空转的机制坑) → 只读断言。消费完全归因于 burst:
+        // 主循环未启动, 检查路径不调 poll。
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            std::thread::sleep(Duration::from_millis(30)); // pi 线程重绘时延
+            cx.executor().advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+            let got = cx.update(|cx| {
+                app_entity.read(cx)
+                    .active_session()
+                    .map(|s| s.read(cx).0.screen().contents().contains('汉'))
+                    .unwrap_or(false)
+            });
+            if got {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "burst 未在主循环缺席下消费到输入响应帧 (advance_clock 已推进)"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[gpui_kit::test]
