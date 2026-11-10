@@ -359,7 +359,267 @@ mod tests {
 
     // ---------- 2.2 滚轮/点击分发 ----------
     // ---------- 3.2 滚轮链路 ----------
+    // ---------- 4.1 Cmd+C 复制 ----------
+
+    /// 拖选辅助: row0 中心 → row2 中心 (建立选区, on_click 定界建快照)。
+    fn drag_select_rows(
+        cx: &mut TestAppContext,
+        handle: gpui_kit::AnyWindowHandle,
+        from_row: usize,
+        to_row: usize,
+    ) {
+        let (from, to) = cx
+            .update_window(handle, |_, window, _| {
+                let b0 = window.find(("grid-row", from_row)).bounds();
+                let b2 = window.find(("grid-row", to_row)).bounds();
+                (
+                    gpui_kit::Point::new(
+                        b0.origin.x + b0.size.width / 2.,
+                        b0.origin.y + b0.size.height / 2.,
+                    ),
+                    gpui_kit::Point::new(
+                        b2.origin.x + b2.size.width / 2.,
+                        b2.origin.y + b2.size.height / 2.,
+                    ),
+                )
+            })
+            .expect("行 bounds");
+        cx.update_window(handle, |_, window, cx| window.drag(from, to, cx))
+            .expect("drag");
+        cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn cmd_c_copies_selection_to_clipboard(cx: &mut TestAppContext) {
+        let (handle, app) = open_app(cx);
+        let (_keys, _texts, _wheels, _clicks) = inject_session(cx, &app, "copy");
+        let _ = render(handle, cx);
+
+        // 预置剪贴板标记 (隔离 + 可断言被覆盖)
+        cx.update(|cx| {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("MARKER".to_string()))
+        });
+
+        // 拖选建立选区 (真实定界路径)
+        drag_select_rows(cx, handle, 0, 2);
+        let range = cx.update(|cx| app.read(cx).terminal.read(cx).selection);
+        assert!(range.is_some(), "拖选建立选区");
+
+        // Cmd+C → 剪贴板 == 实时选区文本 (spec: 复制内容实时读, 哨兵保证一致)
+        cx.update_window(handle, |_, window, cx| {
+            let mut scope = window.within("terminal-pane");
+            scope.press("cmd-c", cx);
+        })
+        .expect("press cmd-c");
+        cx.run_until_parked();
+
+        let expected = cx.update(|cx| app.read(cx).terminal.read(cx).selection_text_now(cx));
+        let clip = cx.update(|cx| cx.read_from_clipboard())
+            .and_then(|i| i.text());
+        assert_eq!(
+            clip.as_deref(),
+            expected.as_deref(),
+            "剪贴板内容 == 实时选区文本 (spec: Copy selected text)"
+        );
+        assert_ne!(clip.as_deref(), Some("MARKER"), "标记被覆盖");
+    }
+
+    #[gpui_kit::test]
+    fn cmd_c_without_selection_leaves_clipboard(cx: &mut TestAppContext) {
+        let (handle, app) = open_app(cx);
+        let (_keys, _texts, _wheels, _clicks) = inject_session(cx, &app, "copy-none");
+        let _ = render(handle, cx);
+
+        cx.update(|cx| {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("MARKER".to_string()))
+        });
+        // press 需要 scope 内观测焦点 (本测试无 drag, 手动聚焦终端面板)
+        let term_focus = cx.update(|cx| app.read(cx).terminal.read(cx).focus_handle(cx));
+        cx.update_window(handle, |_, window, cx| {
+            term_focus.clone().focus(window, cx);
+        })
+        .expect("focus");
+        cx.run_until_parked();
+
+        // 无选区按 Cmd+C → 剪贴板不变 (spec: SHALL NOT write to the clipboard)
+        cx.update_window(handle, |_, window, cx| {
+            let mut scope = window.within("terminal-pane");
+            scope.press("cmd-c", cx);
+        })
+        .expect("press cmd-c");
+        cx.run_until_parked();
+
+        let clip = cx.update(|cx| cx.read_from_clipboard())
+            .and_then(|i| i.text());
+        assert_eq!(clip.as_deref(), Some("MARKER"), "无选区不动剪贴板");
+    }
+
+    // ---------- 3.1 快照哨兵 ----------
+
+    #[gpui_kit::test]
+    fn selection_survives_unrelated_frames(cx: &mut TestAppContext) {
+        let (handle, app) = open_app(cx);
+        let (_keys, _texts, _wheels, _clicks) = inject_session(cx, &app, "sentinel");
+        let _ = render(handle, cx);
+
+        // 拖选 (真实路径: on_click 定界 → 建立快照守卫)
+        let (from, to) = cx
+            .update_window(handle, |_, window, _| {
+                let b0 = window.find(("grid-row", 0usize)).bounds();
+                let b2 = window.find(("grid-row", 2usize)).bounds();
+                (
+                    gpui_kit::Point::new(
+                        b0.origin.x + b0.size.width / 2.,
+                        b0.origin.y + b0.size.height / 2.,
+                    ),
+                    gpui_kit::Point::new(
+                        b2.origin.x + b2.size.width / 2.,
+                        b2.origin.y + b2.size.height / 2.,
+                    ),
+                )
+            })
+            .expect("行 bounds");
+        cx.update_window(handle, |_, window, cx| window.drag(from, to, cx))
+            .expect("drag");
+        cx.run_until_parked();
+        let before = cx.update(|cx| app.read(cx).terminal.read(cx).selection);
+        assert!(before.is_some(), "拖选建立选区 (守卫应已建立)");
+
+        // 无关帧到达: 同内容重绘 (notify → render → 哨兵比对通过) → 保留
+        // (spec: Selection survives unrelated frame updates)
+        cx.update(|cx| {
+            app.update(cx, |app, cx| app.notify_panels(cx));
+        });
+        let _ = render(handle, cx);
+        let after = cx.update(|cx| app.read(cx).terminal.read(cx).selection);
+        assert_eq!(
+            after, before,
+            "选区文本未变 → 无关帧不清 (spec: Unrelated output keeps the selection)"
+        );
+    }
+
+    // ---------- 2.2 手势分离 ----------
+
+    #[gpui_kit::test]
+    fn drag_selection_sends_no_click_coordinate(cx: &mut TestAppContext) {
+        let (handle, app) = open_app(cx);
+        let (_keys, _texts, _wheels, clicks) = inject_session(cx, &app, "gesture");
+        let _ = render(handle, cx);
+
+        // 拖选 (down → move 越阈值 → up) → 不发 TUI 坐标 (spec)
+        let (from, to) = cx
+            .update_window(handle, |_, window, _| {
+                let b0 = window.find(("grid-row", 0usize)).bounds();
+                let b3 = window.find(("grid-row", 3usize)).bounds();
+                (
+                    gpui_kit::Point::new(
+                        b0.origin.x + b0.size.width / 2.,
+                        b0.origin.y + b0.size.height / 2.,
+                    ),
+                    gpui_kit::Point::new(
+                        b3.origin.x + b3.size.width / 2.,
+                        b3.origin.y + b3.size.height / 2.,
+                    ),
+                )
+            })
+            .expect("行 bounds");
+        cx.update_window(handle, |_, window, cx| window.drag(from, to, cx))
+            .expect("drag");
+        cx.run_until_parked();
+        assert_eq!(
+            clicks.get(),
+            None,
+            "拖选手势不发坐标 (spec: Drag selection delivers no coordinate)"
+        );
+        let cf = cx.update(|cx| app.read(cx).click_forwards);
+        assert_eq!(cf, 0, "入口零计数");
+
+        // 纯点击 (无位移) → 维持现状转发
+        cx.update_window(handle, |_, window, cx| {
+            window.click("terminal-grid", cx);
+        })
+        .expect("click");
+        cx.run_until_parked();
+        assert!(
+            clicks.get().is_some(),
+            "纯点击仍转发坐标 (精确 cell 换算由 4.1 测试覆盖, 此处断言发生)"
+        );
+        let cf = cx.update(|cx| app.read(cx).click_forwards);
+        assert_eq!(cf, 1, "入口 +1");
+    }
+
     // ---------- 3.3 滚轮 hover 归属 ----------
+    // ---------- 2.1 选区手势与 overlay ----------
+
+    #[gpui_kit::test]
+    fn drag_builds_selection_overlay(cx: &mut TestAppContext) {
+        let (handle, app) = open_app(cx);
+        let (_keys, _texts, _wheels, _clicks) = inject_session(cx, &app, "sel");
+        let _ = render(handle, cx);
+
+        // 拖动: row0 中心 → row3 中心 (跨 4 行, 距离 >> 3px 阈值)
+        let (from, to) = cx
+            .update_window(handle, |_, window, _| {
+                let b0 = window.find(("grid-row", 0usize)).bounds();
+                let b3 = window.find(("grid-row", 3usize)).bounds();
+                (
+                    gpui_kit::Point::new(
+                        b0.origin.x + b0.size.width / 2.,
+                        b0.origin.y + b0.size.height / 2.,
+                    ),
+                    gpui_kit::Point::new(
+                        b3.origin.x + b3.size.width / 2.,
+                        b3.origin.y + b3.size.height / 2.,
+                    ),
+                )
+            })
+            .expect("行 bounds");
+        cx.update_window(handle, |_, window, cx| window.drag(from, to, cx))
+            .expect("drag");
+        cx.run_until_parked();
+
+        // 状态: 选区建立且跨 row0..row3 (spec: 拖动扩展选区)
+        let range = cx.update(|cx| app.read(cx).terminal.read(cx).selection);
+        let range = range.expect("拖选建立选区");
+        let (r0, r1) = (
+            range.anchor.row.min(range.focus.row),
+            range.anchor.row.max(range.focus.row),
+        );
+        assert_eq!((r0, r1), (0, 3), "选区跨 row0..row3 (anchor↔focus 规范化)");
+
+        // overlay: 按行分 4 段矩形在场 (spec: overlay highlight per row)
+        let rects = cx
+            .update_window(handle, |_, window, _| {
+                window
+                    .elements()
+                    .iter()
+                    .filter(|e| format!("{:?}", e.path()).contains("sel-rect"))
+                    .count()
+            })
+            .expect("elements");
+        assert_eq!(rects, 4, "overlay 按行分 4 段");
+
+        // 首段矩形贴行顶: top ≈ 0 (相对 grid), 高 = 行高
+        let first = cx
+            .update_window(handle, |_, window, _| {
+                window
+                    .elements()
+                    .iter()
+                    .find(|e| format!("{:?}", e.path()).contains("sel-rect"))
+                    .map(|e| e.bounds())
+            })
+            .expect("elements");
+        // 4 段按 path 序, 首段未必 row0 — 只断言高度一致为行高
+        if let Some(b) = first {
+            let line_h = cx
+                .update_window(handle, |_, window, _| {
+                    f32::from(crate::pane::grid_metrics(window).1)
+                })
+                .expect("metrics");
+            assert!((f32::from(b.size.height) - line_h).abs() < 1.0, "段高=行高");
+        }
+    }
+
     // ---------- 4.1 点击坐标转发 ----------
 
     #[gpui_kit::test]

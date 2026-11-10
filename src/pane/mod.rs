@@ -18,7 +18,7 @@ use std::rc::Rc;
 use vt100::Screen;
 
 use crate::agent_entities::SessionStatus;
-use crate::app::{TerminalApp, TerminalTab};
+use crate::app::{TerminalApp, TerminalCopy, TerminalTab};
 use crate::ui::{bg_to_gpui, fg_to_gpui};
 
 /// 网格最小尺寸 (spec: Tiny pane clamps to minimum size; design D2)
@@ -289,7 +289,7 @@ fn build_grid(screen: &Screen) -> Vec<Vec<Segment>> {
 /// 数据经 [`build_grid`] 从 screen 快照成拥有值 (元素树要求 'static);
 /// 段盒 `overflow_hidden` + `whitespace_nowrap` — 字形墨迹溢出时裁剪
 /// 而不换行/撑宽 (与真实终端一致)。
-pub fn terminal_grid(screen: &Screen, window: &Window) -> Div {
+pub fn terminal_grid(screen: &Screen, window: &Window, selection: Option<CellRange>) -> Div {
     let cell_w = cell_width(window);
     let rows = build_grid(screen);
 
@@ -318,6 +318,42 @@ pub fn terminal_grid(screen: &Screen, window: &Window) -> Div {
                         .bg(seg.bg)
                         .child(seg.text)
                 }))
+        }))
+        // 选区 overlay (task 2.1): 行之后追加 = 画在文本上层;
+        // 绝对定位相对 grid, rect = (col×cell_w, row×line_h) 纯数学
+        .children(selection.map(|range| selection_overlay(range, screen, window)))
+}
+
+/// 选区高亮层 (task 2.1, spec: rendered as an overlay highlight covering
+/// the cell rectangle): 按行分段, 首行从 anchor 列、末行到 focus 列、
+/// 中间行整行; 半透明系统蓝。
+fn selection_overlay(range: CellRange, screen: &Screen, window: &Window) -> Div {
+    let cell_w = f32::from(cell_width(window));
+    let line_h = f32::from(grid_metrics(window).1);
+    let (_, cols_nz) = screen.size();
+    let (start, end) = range.normalized();
+    let full_w = f32::from(cols_nz.get()) * cell_w;
+    div()
+        .absolute()
+        .size_full()
+        .children((start.row..=end.row).map(|row| {
+            let from = if row == start.row { start.col } else { 0 };
+            let to = if row == end.row {
+                end.col.saturating_add(1)
+            } else {
+                cols_nz.get()
+            };
+            let x = f32::from(from) * cell_w;
+            let w = (f32::from(to) * cell_w).min(full_w) - x;
+            div()
+                .id(("sel-rect", usize::from(row)))
+                .test_support() // 观测锚点 (无 test-support 时 no-op)
+                .absolute()
+                .left(px(x))
+                .top(px(f32::from(row) * line_h))
+                .w(px(w.max(0.)))
+                .h(px(line_h))
+                .bg(rgba(0x0078D959)) // 系统蓝 #0078D9 @ 35% (0xRRGGBBAA)
         }))
 }
 
@@ -361,6 +397,135 @@ mod tests {
     }
 
     // ---------- 纯数据 (build_grid) ----------
+
+    /// 选区文本组装纯测 (terminal-text-selection task 1.2, spec:
+    /// Copy selection — 尾空格去除/宽字符单次/闭区间单格非空)。
+    #[test]
+    fn selection_text_assembles_cells() {
+        use super::{CellPos, CellRange, selection_text};
+
+        // row0 = "ab   " (真实尾随空格), row1 = "> 中 ok" (CJK 宽字符)
+        let p = parser_with("ab   \r\n\u{1b}[2;1H> \u{4e2d} ok\r\n");
+        let screen = p.screen();
+
+        // 单行含尾空格: 闭区间 (0,0)-(0,4) → trim_end → "ab"
+        let r = CellRange {
+            anchor: CellPos { row: 0, col: 0 },
+            focus: CellPos { row: 0, col: 4 },
+        };
+        assert_eq!(selection_text(screen, r), "ab", "行尾随空格去除");
+
+        // 单格: (1,2)-(1,2) 落在宽字符上 → 非空 (库 Equal 分支半开坑被 +1 绕开)
+        let single = CellRange {
+            anchor: CellPos { row: 1, col: 2 },
+            focus: CellPos { row: 1, col: 2 },
+        };
+        assert_eq!(selection_text(screen, single), "\u{4e2d}", "单格选区非空且宽字符完整");
+
+        // 多行跨 CJK: (0,1)-(1,6) → "b" + 换行 + "> 中 ok"
+        let multi = CellRange {
+            anchor: CellPos { row: 0, col: 1 },
+            focus: CellPos { row: 1, col: 6 },
+        };
+        let text = selection_text(screen, multi);
+        assert_eq!(text, "b\n> \u{4e2d} ok", "多行: 首行到尾去空、末行到 end 含入");
+        assert_eq!(
+            text.matches('\u{4e2d}').count(),
+            1,
+            "宽字符续格不产生重复 (spec: CJK appears once)"
+        );
+
+        // 反向 range 规范化后同结果
+        let reversed = CellRange {
+            anchor: CellPos { row: 1, col: 6 },
+            focus: CellPos { row: 0, col: 1 },
+        };
+        assert_eq!(selection_text(screen, reversed), text, "反向选区结果一致");
+    }
+
+    /// 选区状态与换算纯测 (terminal-text-selection task 1.1, spec:
+    /// Terminal area text selection — 规范化 + 出界 clamp)。
+    #[test]
+    fn selection_range_normalizes_and_clamps() {
+        use super::{CellPos, CellRange, cell_at};
+
+        // 反向拖选 (往上/左拖) → start ≤ end 规范化
+        let reversed = CellRange {
+            anchor: CellPos { row: 5, col: 8 },
+            focus: CellPos { row: 2, col: 3 },
+        };
+        let (s, e) = reversed.normalized();
+        assert_eq!((s, e), (CellPos { row: 2, col: 3 }, CellPos { row: 5, col: 8 }));
+
+        // 正向不变; 单格 (anchor == focus)
+        let single = CellRange {
+            anchor: CellPos { row: 1, col: 1 },
+            focus: CellPos { row: 1, col: 1 },
+        };
+        let (s, e) = single.normalized();
+        assert_eq!((s, e), (CellPos { row: 1, col: 1 }, CellPos { row: 1, col: 1 }));
+
+        // cell_at: 网格原点 (100,50), 格 8×20, 10 列 × 4 行
+        let grid = Bounds {
+            origin: Point::new(px(100.), px(50.)),
+            size: size(px(80.), px(80.)),
+        };
+        // 格内: 相对 (24,25) → col=3 row=1
+        assert_eq!(
+            cell_at(Point::new(px(124.), px(75.)), grid, 8., 20., 10, 4),
+            CellPos { row: 1, col: 3 }
+        );
+        // 负值 (点在网格左上外) → clamp 到 (0,0)
+        assert_eq!(
+            cell_at(Point::new(px(50.), px(10.)), grid, 8., 20., 10, 4),
+            CellPos { row: 0, col: 0 },
+            "spec: clamps to the grid edge"
+        );
+        // 超界 (右下外) → 最后一行/列
+        assert_eq!(
+            cell_at(Point::new(px(1000.), px(999.)), grid, 8., 20., 10, 4),
+            CellPos { row: 3, col: 9 }
+        );
+        // 尾带: 网格宽 84px (10.5 格, floor 账目), rel=83 → 10 → min(9)=9
+        let wide = Bounds {
+            origin: Point::new(px(100.), px(50.)),
+            size: size(px(84.), px(80.)),
+        };
+        assert_eq!(
+            cell_at(Point::new(px(183.), px(69.)), wide, 8., 20., 10, 4),
+            CellPos { row: 0, col: 9 },
+            "尾带不越出最后一列"
+        );
+
+        // 度量未就绪防御
+        assert_eq!(
+            cell_at(Point::new(px(124.), px(75.)), grid, 0., 20., 10, 4),
+            CellPos { row: 0, col: 0 }
+        );
+    }
+
+    /// 哨兵判定纯测 (terminal-text-selection task 3.1, spec: Selection
+    /// cleared when its content changes / survives unrelated updates)。
+    #[test]
+    fn selection_snapshot_detects_drift() {
+        use super::selection_stale;
+
+        // 快照未建立 (拖动中) → 不清
+        assert!(!selection_stale("abc", &None), "未建立守卫不清 (拖动中不定界)");
+        // 同文本 → 保留 (无关输出不误伤)
+        assert!(
+            !selection_stale("abc", &Some("abc".into())),
+            "文本未变 → 保留"
+        );
+        // 漂移 → 清
+        assert!(
+            selection_stale("xyz", &Some("abc".into())),
+            "文本被顶走 → 清 (spec: streaming push)"
+        );
+        // 空白选区守卫: 同空保留; 内容顶入则清
+        assert!(!selection_stale("", &Some("".into())), "同空保留");
+        assert!(selection_stale("x", &Some("".into())), "空白选区被内容顶入 → 清");
+    }
 
     /// 滚轮换算纯测 (task 3.2, spec: Wheel deltas accumulate to whole
     /// lines / Remainder resets / Alt multiplies)。
@@ -516,7 +681,9 @@ mod tests {
 
     impl Render for GridFixture {
         fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child(terminal_grid(self.parser.screen(), window))
+            div()
+                .size_full()
+                .child(terminal_grid(self.parser.screen(), window, None))
         }
     }
 
@@ -923,6 +1090,14 @@ pub struct TerminalPanel {
     /// 滚轮像素/行混合累积器 (task 3.2, spec: Wheel deltas accumulate to
     /// whole lines — 慢滚不丢、余数跨事件携带、line_h 变化清零)。
     wheel: WheelAccumulator,
+    /// 文本选区 (terminal-text-selection task 2.1): 锚点/焦点 cell,
+    /// overlay 与哨兵/复制共用。
+    pub(crate) selection: Option<CellRange>,
+    /// 当前左键按选手势 (task 2.1; on_click 消费 moved 后复位)。
+    press: Option<Press>,
+    /// 选区文本快照 (task 3.1, spec 哨兵): 定界时建立 (Some), 清选区时
+    /// 一并清 (None = 未建立守卫, 拖动中不定界不比对)。
+    selection_snapshot: Option<String>,
 }
 
 impl TerminalPanel {
@@ -932,6 +1107,9 @@ impl TerminalPanel {
             focus: cx.focus_handle(),
             grid_bounds: Rc::new(Cell::new(Bounds::default())),
             wheel: WheelAccumulator::default(),
+            selection: None,
+            press: None,
+            selection_snapshot: None,
         }
     }
 
@@ -985,6 +1163,53 @@ impl TerminalPanel {
         app.update(cx, |app, cx| app.send_wheel(lines, cx)).ok();
     }
 
+    /// Cmd+C 复制 (task 4.1, spec: Copy selection with Cmd+C): 先内联
+    /// 哨兵判定 (design D3 — 帧到 notify 与 render 之间存在 defer 窗口,
+    /// 复制前必须保证内容未漂), 漂了则清选区本次不复制; 同则写剪贴板。
+    /// 无选区 → 不动剪贴板 (spec)。
+    fn handle_copy(&mut self, cx: &mut Context<Self>) {
+        let Some(live) = self.selection_text_now(cx) else {
+            return; // 无选区
+        };
+        if selection_stale(&live, &self.selection_snapshot) {
+            self.selection = None;
+            self.selection_snapshot = None;
+            cx.notify();
+            return;
+        }
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(live));
+    }
+
+    /// 当前选区的实时文本 (active session screen + selection_text;
+    /// 无会话/无选区 → None)。哨兵比对与 Cmd+C 复制共用同一读取路径。
+    pub(crate) fn selection_text_now(&self, cx: &App) -> Option<String> {
+        let range = self.selection?;
+        let app = self.app.upgrade()?;
+        let app = app.read(cx);
+        let session = app.active_session()?;
+        Some(selection_text(session.read(cx).0.screen(), range))
+    }
+
+    /// 窗口坐标 → 选区 cell (task 2.1): grid_bounds 换算 + screen 行列
+    /// 上限 clamp (spec: clamps to the grid edge)。无 active session 时
+    /// 退化到 80×24 上限 (仍可选, 只是 clamp 边界保守)。
+    fn cell_of(&self, pos: Point<Pixels>, window: &Window, cx: &App) -> CellPos {
+        let grid = self.grid_bounds.get();
+        let (cell_w, line_h) = grid_metrics(window);
+        let (cols, rows) = self
+            .app
+            .upgrade()
+            .and_then(|app| {
+                let app = app.read(cx);
+                app.active_session().map(|s| {
+                    let (r, c) = s.read(cx).0.screen().size();
+                    (c.get(), r.get())
+                })
+            })
+            .unwrap_or((80, 24));
+        cell_at(pos, grid, f32::from(cell_w), f32::from(line_h), cols, rows)
+    }
+
     /// 左键单元格坐标转发 (task 4.1, design D4, spec: Terminal area click
     /// coordinates forwarded): 窗口坐标 − grid bounds.origin ÷ cell 尺寸;
     /// grid 外 (状态条/边框) 或非左键 → 不发。坐标系 = 会话帧 0-based,
@@ -1024,6 +1249,99 @@ impl TerminalPanel {
         let app = self.app.clone();
         app.update(cx, |app, cx| app.send_click(col, row, cx)).ok();
     }
+}
+
+/// 选区单元格位置 (row, col — 行优先, 与 overlay 分行一致;
+/// terminal-text-selection task 1.1)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct CellPos {
+    pub row: u16,
+    pub col: u16,
+}
+
+/// 选区范围: anchor = 按下锚点, focus = 拖动当前点。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct CellRange {
+    pub anchor: CellPos,
+    pub focus: CellPos,
+}
+
+impl CellRange {
+    /// 规范化: 行列字典序 start ≤ end (spec: normalized so start
+    /// precedes end, across rows)。反向拖选 (往上/左) 也得到合法区间。
+    fn normalized(&self) -> (CellPos, CellPos) {
+        let (a, f) = (self.anchor, self.focus);
+        if (a.row, a.col) <= (f.row, f.col) {
+            (a, f)
+        } else {
+            (f, a)
+        }
+    }
+}
+
+/// 一次左键按选手势 (task 2.1): `moved` 越过阈值即判为拖选 (design D2,
+/// 与 TUI 点击坐标分离的依据)。
+#[derive(Clone, Copy)]
+struct Press {
+    down_pos: Point<Pixels>,
+    moved: bool,
+}
+
+/// 拖选阈值 (px): 小于此距离的位移仍是"点击"。
+const DRAG_THRESHOLD_PX: f32 = 3.0;
+
+/// 像素 → cell (窗口坐标; `grid` = 网格窗口 bounds; cols/rows = 网格
+/// 行列上限)。出界 clamp (spec: clamps to the grid edge): 负值 → 0,
+/// 超界/尾带 → 最后一行/列。`cell_at` 与点击坐标换算同源
+/// (grid_bounds.origin + grid_metrics, design D4)。
+fn cell_at(
+    pos: Point<Pixels>,
+    grid: Bounds<Pixels>,
+    cell_w: f32,
+    line_h: f32,
+    cols: u16,
+    rows: u16,
+) -> CellPos {
+    if cell_w <= 0.0 || line_h <= 0.0 || cols == 0 || rows == 0 {
+        return CellPos { row: 0, col: 0 }; // 度量未就绪的防御退化
+    }
+    // 负值 → 0 行/列; 超界或尾带 (floor 账目) → min 到最后一行/列
+    let clamp_axis = |rel: f32, cell: f32, cells: u16| -> u16 {
+        if rel <= 0.0 {
+            0
+        } else {
+            ((rel / cell) as u16).min(cells - 1)
+        }
+    };
+    let col = clamp_axis(f32::from(pos.x - grid.origin.x), cell_w, cols);
+    let row = clamp_axis(f32::from(pos.y - grid.origin.y), line_h, rows);
+    CellPos { row, col }
+}
+
+/// 选区文本组装 (task 1.2; 哨兵与 Cmd+C 复制共用)。
+///
+/// 复用 vt100 官方 [`Screen::contents_between`] — 其文档明言为 clipboard
+/// selection 设计: 软换行行不插 \n、宽字符续格跳过、行尾空 cell 不输出。
+/// 闭区间语义靠尾列 +1 闭合 (库是半开边界; 单格 sc==ec 原生返回空, +1 绕开);
+/// 再按行 trim_end (spec: trailing whitespace per row removed)。
+fn selection_text(screen: &Screen, range: CellRange) -> String {
+    let (start, end) = range.normalized();
+    let raw = screen.contents_between(
+        start.row,
+        start.col,
+        end.row,
+        end.col.saturating_add(1),
+    );
+    raw.split('\n')
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 哨兵判定 (task 3.1, spec: Selection cleared when its content changes):
+/// 快照未建立 (None, 拖动中) → 不清; 建立后实时文本与快照漂移 → 清。
+fn selection_stale(live: &str, snapshot: &Option<String>) -> bool {
+    snapshot.as_ref().is_some_and(|s| s != live)
 }
 
 /// 滚轮累积器 (task 3.2): 像素差按行高折行、余数跨事件携带、
@@ -1129,7 +1447,22 @@ impl Render for TerminalPanel {
         let Some(app) = self.app.upgrade() else {
             return div().into_any_element();
         };
+        // 哨兵 (task 3.1, spec: Selection cleared when its content changes):
+        // render = 帧到达路径 (帧到必 render); 实时选区文本 ≠ 快照 →
+        // 内容被顶走/重排 → 本帧即清。无会话 (切走/空态) 同样失效。
+        if self.selection.is_some() {
+            let live = self.selection_text_now(cx);
+            let stale = match &live {
+                Some(live) => selection_stale(live, &self.selection_snapshot),
+                None => true, // 无会话: 选区失效
+            };
+            if stale {
+                self.selection = None;
+                self.selection_snapshot = None;
+            }
+        }
         // 快照先行 (每帧现读 active session — design §7.2; 拥有值进元素树)
+        let selection = self.selection;
         let pane_data = app.read(cx).active_session().map(|session| {
             let s = session.read(cx);
             PaneData {
@@ -1137,7 +1470,7 @@ impl Render for TerminalPanel {
                 path: s.0.ws_path().to_string_lossy().to_string(),
                 name: s.0.name().to_string(),
                 status: s.0.status(),
-                grid: terminal_grid(s.0.screen(), window),
+                grid: terminal_grid(s.0.screen(), window, selection),
             }
         });
         let focus = self.focus.clone();
@@ -1159,6 +1492,9 @@ impl Render for TerminalPanel {
             .min_h(px(0.))
             .key_context("Terminal")
             .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &TerminalCopy, _window, cx| {
+                this.handle_copy(cx);
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);
             }))
@@ -1178,10 +1514,72 @@ impl Render for TerminalPanel {
                 .ok();
                 cx.stop_propagation();
             }))
+            // ---- 选区手势 (terminal-text-selection task 2.1, design D2) ----
+            // 挂 pane (与 on_click 同层): hover 门更宽, 拖出网格由 cell_at
+            // clamp 到边缘 (spec: clamps to the grid edge)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                let grid = this.grid_bounds.get();
+                let p = event.position;
+                let inside = p.x >= grid.origin.x
+                    && p.y >= grid.origin.y
+                    && p.x < grid.origin.x + grid.size.width
+                    && p.y < grid.origin.y + grid.size.height;
+                if !inside {
+                    return; // 网格外按下: 不开手势 (旧选区不动)
+                }
+                this.press = Some(Press { down_pos: p, moved: false });
+                this.selection = None; // 新按下清旧选区 (点击即取消选择)
+                this.selection_snapshot = None; // 守卫随选区撤销
+                cx.notify();
+            }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                let Some(press) = this.press.as_mut() else {
+                    return;
+                };
+                let dx = f32::from(event.position.x - press.down_pos.x);
+                let dy = f32::from(event.position.y - press.down_pos.y);
+                if !press.moved && (dx * dx + dy * dy).sqrt() > DRAG_THRESHOLD_PX {
+                    press.moved = true;
+                }
+                if !press.moved {
+                    return;
+                }
+                let down = press.down_pos;
+                let focus_pos = event.position;
+                let cell = this.cell_of(down, window, cx);
+                this.selection = Some(CellRange {
+                    anchor: cell,
+                    focus: this.cell_of(focus_pos, window, cx),
+                });
+                cx.notify();
+            }))
+            // 出界收尾: up 不在 pane 内时 click 不会 fire, press 必须复位
+            // (否则下次点击误判 dragged); 已扩展的选区保留
+            .on_mouse_exit(cx.listener(|this, _event: &MouseExitEvent, _window, cx| {
+                if this.press.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                 // 一步聚焦保持 (spec: claims keyboard focus for the pane)
                 this.focus.focus(window, cx);
                 cx.notify();
+                // 手势分离 (task 2.2, spec: Drag selection delivers no
+                // coordinate): 本次手势拖过 (moved) 或选区仍在 (出界收尾后
+                // press 已清但选区保留) → 拖选, 不发坐标; 纯点击维持转发。
+                // down 时 selection 已被清 → is_some 即"本手势拖过"。
+                let dragged =
+                    this.press.map(|p| p.moved).unwrap_or(false) || this.selection.is_some();
+                this.press = None; // 一次手势一个判定, 消费即复位
+                if dragged {
+                    // 定界: 建立快照守卫 (spec: snapshot while a selection
+                    // is established) — 此后每帧比对
+                    this.selection_snapshot = this.selection_text_now(cx);
+                    return;
+                }
                 // 网格内左键 → 会话帧单元坐标 (task 4.1)
                 this.forward_click_coordinate(event, window, cx);
             }))

@@ -22,7 +22,7 @@ use crate::workspace::{Workspace, store};
 // Tab 在 Terminal context 下的转发动作: gpui-base 的 Root 全局绑定
 // `tab` → 焦点遍历会吞掉 Tab (原始 key event 不再派发), 更深的
 // Terminal context 绑定胜出 (design D5, spike 已验证)。
-actions!(terminal, [TerminalTab]);
+actions!(terminal, [TerminalTab, TerminalCopy]);
 
 pub struct TerminalApp {
     /// 所有 workspace (每个持有一个路径 + 该路径下的 agents)
@@ -69,7 +69,13 @@ impl TerminalApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Result<Self, String> {
         // Terminal context 下的 tab 终端转发绑定 (Root 的焦点遍历
         // 绑定在更浅的 context, 被这条压过 — design D5)
-        cx.bind_keys([KeyBinding::new("tab", TerminalTab, Some("Terminal"))]);
+        cx.bind_keys([
+            KeyBinding::new("tab", TerminalTab, Some("Terminal")),
+            // 复制选区 (terminal-text-selection task 4.1, spec: Cmd+C):
+            // Terminal context 深于全局, 不与文本框的 cmd-c 抢;
+            // modifiers.platform 已被 handle_key_down 拦, 不漏给会话
+            KeyBinding::new("cmd-c", TerminalCopy, Some("Terminal")),
+        ]);
 
         let paths = store::load()?;
         let workspaces = paths.into_iter().map(Workspace::new).collect();
