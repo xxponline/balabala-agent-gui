@@ -13,9 +13,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use gpui_kit::{App, AsyncApp, Task, WeakEntity};
+use gpui_kit::{App, AsyncApp, Task, WeakEntity, Window};
 
 use crate::app::TerminalApp;
+use crate::property_detail_manager::OpenObject;
 use crate::workspace::store;
 
 use super::filter::Ruleset;
@@ -291,9 +292,27 @@ impl WorkspacePropertySource for FileTreeSource {
         }
     }
 
-    fn open(&mut self, _item_id: &str) {
-        // v1 no-op (spec: no visible effect beyond selection highlight)。
-        // TODO: 默认打开系统另行立项后在此接入。
+    fn open(&mut self, item_id: &str, window: &mut Window, cx: &mut App) {
+        // 查权威树得 kind (tasks 4.1) → 构造中立 OpenObject → app 分发。
+        // 树中不存在的 id → no-op; 目录 kind 在 handler 认领阶段被拒,
+        // 天然 no-op (spec: Unclaimed object opens nothing)。
+        let kind = {
+            let guard = self.inner.lock().expect("source inner lock");
+            guard
+                .canonical
+                .as_ref()
+                .and_then(|node| super::find_node_kind(node, item_id))
+        };
+        let Some(kind) = kind else {
+            return;
+        };
+        let obj = OpenObject {
+            path: PathBuf::from(item_id),
+            kind,
+        };
+        self.app
+            .update(cx, |app, cx| app.open_object(obj, window, cx))
+            .ok();
     }
 }
 

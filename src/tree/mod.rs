@@ -289,9 +289,11 @@ impl Render for TreePanel {
                             .on_click({
                                 let panel_weak = panel_weak.clone();
                                 let open_id = id.clone();
-                                move |_, _window, cx| {
+                                move |_, window, cx| {
                                     panel_weak
-                                        .update(cx, |panel, _cx| panel.source.open(&open_id))
+                                        .update(cx, |panel, cx| {
+                                            panel.source.open(&open_id, window, cx)
+                                        })
                                         .ok();
                                 }
                             })
@@ -353,15 +355,14 @@ impl Render for TreePanel {
             .size_full()
             .flex()
             .flex_col()
-            // 根级点击冒泡: 行 / ⟳ / × 全部经此把键盘交回终端 (spec: 键盘
-            // 转发; × 自身的 close_right_dock 也会聚焦, 幂等)
+            // 根级点击冒泡: 行 / ⟳ / × 全部经此把键盘交回 **active tab 的
+            // 面板** (design D6-3: console active 时即终端, 与旧行为逐字
+            // 同效; viewer active 时归 viewer; × 自身的 close_right_dock
+            // 也会聚焦, 幂等)
             .on_click(cx.listener(move |_, _event: &ClickEvent, window, cx| {
                 let app = app_refocus.clone();
-                app.update(cx, |app, cx| {
-                    let focus = app.terminal.read(cx).focus_handle(cx);
-                    focus.focus(window, cx);
-                })
-                .ok();
+                app.update(cx, |app, cx| app.focus_active_center_panel(window, cx))
+                    .ok();
             }))
             .child(
                 div()
@@ -440,7 +441,8 @@ mod tests {
     };
     use gpui_kit::test::{TestQueryExt, TestWindowExt};
     use gpui_kit::{
-        App, AppContext, Bounds, Point, TestAppContext, WindowBounds, WindowOptions, px, size,
+        App, AppContext, Bounds, Point, TestAppContext, Window, WindowBounds, WindowOptions, px,
+        size,
     };
     use crate::agent_entities::{AgentEntity, AgentSession, SessionStatus};
     use crate::workspace::Workspace;
@@ -449,9 +451,11 @@ mod tests {
     use std::rc::Rc;
 
     /// 返回嵌套固定树的 stub 源 — 面板只经 trait 边界消费数据。
-    /// `opens` 记录 open 钩子调用次数 (task 4.1 断言)。
+    /// `opens` 记录 open 钩子调用次数 (task 4.1 断言); `app` 供与真实源
+    /// 同款的 `open_object` 分发 (stub 也走真实链路)。
     struct StubSource {
         opens: Rc<Cell<usize>>,
+        app: gpui_kit::WeakEntity<TerminalApp>,
     }
 
     fn stub_tree() -> SourceView {
@@ -477,6 +481,14 @@ mod tests {
                     SourceNode {
                         id: "/stub/stub-top.rs".to_string(),
                         label: "stub-top.rs".to_string(),
+                        kind: SourceNodeKind::File,
+                        children: Vec::new(),
+                    },
+                    // 无 handler 认领的文件行 (4.2: console active 场景
+                    // 用它表达“行点击不持焦”现状保持)
+                    SourceNode {
+                        id: "/stub/stub-top.md".to_string(),
+                        label: "stub-top.md".to_string(),
                         kind: SourceNodeKind::File,
                         children: Vec::new(),
                     },
@@ -508,8 +520,29 @@ mod tests {
                 _ => Vec::new(),
             }
         }
-        fn open(&mut self, _item_id: &str) {
+        fn open(&mut self, item_id: &str, window: &mut Window, cx: &mut App) {
             self.opens.set(self.opens.get() + 1);
+            // 与真实源同款分发 (tasks 4.1): 查 stub 权威树得 kind →
+            // open_object (证明钩子端到端落到默认打开系统)
+            let kind = {
+                let view = stub_tree();
+                match &view {
+                    SourceView::Tree { node, .. } => {
+                        crate::workspace_property_source::find_node_kind(node, item_id)
+                    }
+                    _ => None,
+                }
+            };
+            let Some(kind) = kind else {
+                return;
+            };
+            let obj = crate::property_detail_manager::OpenObject {
+                path: PathBuf::from(item_id),
+                kind,
+            };
+            self.app
+                .update(cx, |app, cx| app.open_object(obj, window, cx))
+                .ok();
         }
     }
 
@@ -545,8 +578,10 @@ mod tests {
         // resolve_active_root 读 app, 包在 app.update 里会重入 panic
         // ("cannot read TerminalApp while it is already being updated")。
         let opens = Rc::new(Cell::new(0));
+        let weak_app = cx.update(|_| app.downgrade());
         let source = StubSource {
             opens: opens.clone(),
+            app: weak_app,
         };
         let tree = cx.update(|cx| app.read(cx).tree.clone());
         tree.update(cx, |panel, cx| panel.set_source(Box::new(source), cx));
@@ -915,13 +950,22 @@ mod tests {
         })
         .expect("update window");
 
-        // 文件行: 再来一次
+        // 文件行: 再来一次 → 除钩子计数外, 真实分发必须落到默认打开
+        // 系统: open_object 认领 .rs → 中槽出现 viewer 签 (tasks 4.1)
         cx.update_window(handle, |_, window, cx| {
             window.click("cell-/stub/stub-top.rs", cx);
         })
         .expect("update window");
         cx.run_until_parked();
         assert_eq!(opens.get(), 2, "文件行点击 → open 钩子恰一次");
+        let opened = cx.update(|cx| {
+            let app = app.read(cx);
+            app.open_tabs.contains_key("/stub/stub-top.rs")
+        });
+        assert!(
+            opened,
+            "open 钩子必须端到端分发到 open_object (.rs 行 → viewer 签登记)"
+        );
     }
 
     #[gpui_kit::test]
@@ -942,9 +986,11 @@ mod tests {
         .expect("update window");
         cx.run_until_parked();
 
-        // 点树行 → 根级 on_click 冒泡把键盘/IME 交回终端面板
+        // 点无 handler 认领的文件行 → 不开签 (console 仍 active) → 根级
+        // on_click 冒泡把键盘/IME 交回 active tab 面板 = 终端面板
+        // (design D6-3: console active 场景与旧行为逐字同效)
         cx.update_window(handle, |_, window, cx| {
-            window.click("cell-/stub/stub-top.rs", cx);
+            window.click("cell-/stub/stub-top.md", cx);
         })
         .expect("update window");
         cx.run_until_parked();
@@ -954,7 +1000,71 @@ mod tests {
         assert_eq!(
             focused,
             Some(term_focus),
-            "树行点击后键盘焦点必须回到终端面板 (spec: 键盘转发 — 树不持焦)"
+            "console active 时树行点击后键盘焦点必须回到终端面板 (spec: 键盘转发 — 树不持焦)"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn tree_click_moves_keyboard_to_viewer_tab(cx: &mut TestAppContext) {
+        use gpui_kit::Focusable;
+
+        let (handle, app) = open_app(cx);
+        inject_stub(cx, &app);
+        render(handle, cx);
+
+        let term_focus = cx.update(|cx| app.read(cx).terminal.read(cx).focus_handle(cx));
+
+        // 点 .rs 行 → open 分发 → viewer 签开且成 active tab
+        cx.update_window(handle, |_, window, cx| {
+            window.click("cell-/stub/stub-top.rs", cx);
+        })
+        .expect("update window");
+        cx.run_until_parked();
+        render(handle, cx);
+
+        // active tab 面板 = viewer (dedup 表里该对象的面板)
+        let viewer_focus = cx.update(|cx| {
+            let app = app.read(cx);
+            let panel_id = app
+                .open_tabs
+                .get("/stub/stub-top.rs")
+                .copied()
+                .expect("点 .rs 行应开 viewer 签");
+            let area = app.dock_area.read(cx);
+            area.panel(panel_id)
+                .expect("viewer 面板在 dock 中")
+                .focus_handle(cx)
+        });
+        assert_ne!(
+            viewer_focus, term_focus,
+            "viewer 焦点 handle 必须区别于终端"
+        );
+
+        // 模拟 dock TabGroup 把焦点交给 viewer (tab 切换的内建行为)
+        cx.update_window(handle, |_, window, cx| {
+            viewer_focus.clone().focus(window, cx);
+        })
+        .expect("update window");
+        cx.run_until_parked();
+
+        // 树行点击冒泡 → 焦点交回 active tab 面板 = viewer (非终端)
+        cx.update_window(handle, |_, window, cx| {
+            window.click("cell-/stub/stub-top.md", cx);
+        })
+        .expect("update window");
+        cx.run_until_parked();
+
+        let focused = cx.update_window(handle, |_, window, cx| window.focused(cx))
+            .expect("update window");
+        assert_eq!(
+            focused,
+            Some(viewer_focus),
+            "viewer active 时树行点击后焦点必须交回 viewer 面板 (design D6-3)"
+        );
+        assert_ne!(
+            focused,
+            Some(term_focus),
+            "焦点不得落回终端面板"
         );
     }
 

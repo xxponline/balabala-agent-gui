@@ -17,7 +17,7 @@ pub use filetree::resolve_active_root;
 
 use std::path::{Path, PathBuf};
 
-use gpui_kit::{App, WeakEntity};
+use gpui_kit::{App, WeakEntity, Window};
 
 use crate::app::TerminalApp;
 
@@ -104,8 +104,19 @@ pub trait WorkspacePropertySource {
     /// 执行菜单功能，返回效果意图（面板落地）。
     fn execute(&mut self, item_id: &str, func_id: &str) -> Vec<SourceEffect>;
 
-    /// 左键默认打开钩子——v1 no-op（TODO: 默认打开系统，另行立项）。
-    fn open(&mut self, item_id: &str);
+    /// 左键默认打开钩子 (center-slot-multi-tab: 接默认打开系统)——
+    /// 数据源查权威树得 kind → 构造 `OpenObject` → `TerminalApp::`
+    /// `open_object` 分发 (签名收 `window` 是 EditorState 构造所需;
+    /// 效果仍由 app 层落地, 与 `SourceEffect` 分工一致)。
+    fn open(&mut self, item_id: &str, window: &mut Window, cx: &mut App);
+}
+
+/// 在权威树中按绝对路径 id 查找节点种类 (open 钩子的 kind 依据)。
+pub fn find_node_kind(node: &SourceNode, id: &str) -> Option<SourceNodeKind> {
+    if node.id == id {
+        return Some(node.kind);
+    }
+    node.children.iter().find_map(|child| find_node_kind(child, id))
 }
 
 /// 源工厂签名。

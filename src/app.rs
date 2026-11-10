@@ -3,14 +3,17 @@
 //! 行为规格见 openspec/specs/{agent-shell,workspace-management}。
 //! sidebar 3.x 接入, 终端面板 4.x 接入。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui_kit::*;
 use gpui_kit::component::dock::{DockArea, DockPlacement};
+use gpui_kit::base::dock::PanelId;
 
 use crate::agent_entities::{AgentSession, PiAgentShell};
 use crate::pane::TerminalPanel;
+use crate::property_detail_manager::{OpenObject, active_center_panel_id, handler_for};
 use crate::shell;
 use crate::sidebar::{SidebarEvent, SidebarPanel};
 use crate::tree::TreePanel;
@@ -47,6 +50,10 @@ pub struct TerminalApp {
     /// Keyboard input forwarding - Tab 的端到端守卫; pi 收到 Tab 无可见
     /// 反应, 只能在转发边界计数验证 — 见 spike F3 结论)
     pub tab_forwards: usize,
+    /// 默认打开系统的 dedup 表 (center-slot-multi-tab, design D1):
+    /// key = 对象绝对路径字符串 (与 SourceNode.id 同一身份体系),
+    /// value = 已开面板的 PanelId; 签关闭时经 `open_tab_removed` 摘除。
+    pub(crate) open_tabs: HashMap<String, PanelId>,
 }
 
 impl TerminalApp {
@@ -74,6 +81,7 @@ impl TerminalApp {
             _dialog_task: None,
             grid_resizes: 0,
             tab_forwards: 0,
+            open_tabs: HashMap::new(),
             dock_area,
             sidebar,
             terminal,
@@ -284,6 +292,61 @@ impl TerminalApp {
         focus.focus(window, cx);
     }
 
+    /// 默认打开系统统一后端 (center-slot-multi-tab, design D1)。
+    ///
+    /// 接受数据源封装的 [`OpenObject`] → 查 dedup: 命中 `select_panel`
+    /// 聚焦既有签 (不重复开); 未命中按注册表顺序找认领 handler, 尾插
+    /// 新签并登记。无 handler 认领 → no-op (spec: Unclaimed object opens
+    /// nothing)。
+    pub fn open_object(
+        &mut self,
+        obj: OpenObject,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = obj.path.to_string_lossy().into_owned();
+        if let Some(&panel) = self.open_tabs.get(&key) {
+            self.dock_area
+                .update(cx, |area, cx| area.select_panel(panel, window, cx));
+            // 库的 select_panel/add 不内建聚焦 (只有点击 tab 的
+            // TabGroup::select_tab 才 focus_active_panel) — 键盘/IME 随
+            // active tab 要求显式交焦 (spec: Keystrokes follow the active tab)
+            self.focus_active_center_panel(window, cx);
+            return;
+        }
+        let Some(handler) = handler_for(&obj) else {
+            return; // 无认领者: 不可见 (spec: Unclaimed object opens nothing)
+        };
+        let panel = handler.create_panel(&obj, window, cx);
+        let panel_id = panel.panel_id(cx);
+        self.dock_area.update(cx, |area, cx| {
+            // 尾插 + activate (InsertTarget::Tabs{ix:None}) — console 保 index 0
+            area.add_panel_view(panel, DockPlacement::Center, None, window, cx);
+        });
+        self.open_tabs.insert(key, panel_id);
+        self.focus_active_center_panel(window, cx);
+    }
+
+    /// 签关闭回调 (EditorPanel::on_removed → design D5): 从 dedup 摘除,
+    /// 同对象后续可重开 (spec: Reopen after close creates a fresh tab)。
+    pub fn open_tab_removed(&mut self, panel_id: PanelId) {
+        self.open_tabs.retain(|_, id| *id != panel_id);
+    }
+
+    /// 把键盘/IME 焦点交回中心 active tab 的面板 (design D6-3):
+    /// console active 时即终端面板 (与旧“树点击交回终端”逐字同效),
+    /// viewer active 时归 viewer。无 center 面板时不动作。
+    pub fn focus_active_center_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let area = self.dock_area.read(cx);
+        let Some(panel_id) = active_center_panel_id(area) else {
+            return;
+        };
+        let Some(handle) = area.panel(panel_id).map(|panel| panel.focus_handle(cx)) else {
+            return;
+        };
+        handle.focus(window, cx);
+    }
+
     /// sidebar 事件漏斗单一入口 (design D3): SidebarPanel 的所有交互
     /// 经此进入 model；SelectAgent 的一步切焦点也收拢在此 (3.2, spec:
     /// one-step focus — 选中即把键盘/IME 焦点交给 pane)。
@@ -293,14 +356,23 @@ impl TerminalApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // 一步切焦点 (spec one-step focus) + "点击不离开终端" (spec: 窗口聚焦
-        // 即转发; workspace 行点击不得抢键盘焦点): dock 的左 TabGroup 会把
-        // sidebar 内的点击焦点抢给 sidebar 面板 (真机实测 focus -> elsewhere),
-        // 不交回则无 Terminal context, 打字/Tab 全断。放 match 前 = 所有 arm
-        // (含 NewWorkspace 对话框路径) 共用; 焦点目标与 active 无关, 先聚焦
-        // 后改 model 无害。
-        let focus = self.terminal.read(cx).focus_handle(cx);
-        focus.focus(window, cx);
+        // 会话相关事件先把中心切回 console 签 (spec: sidebar select returns
+        // to the console tab — viewer 点 sidebar agent 必须一步回 console
+        // + session 焦点); 然后统一把焦点交回 active tab 面板 (design D6):
+        // dock 的左 TabGroup 会把 sidebar 内的点击焦点抢给 sidebar 面板
+        // (真机实测 focus -> elsewhere), 不交回则键盘/IME 全断。放 match
+        // 前 = 所有 arm (含 NewWorkspace 对话框路径) 共用。
+        if matches!(
+            ev,
+            SidebarEvent::NewAgent(_)
+                | SidebarEvent::SelectAgent(_)
+                | SidebarEvent::CloseAgent(_)
+        ) {
+            let console = PanelId::from(self.terminal.entity_id());
+            self.dock_area
+                .update(cx, |area, cx| area.select_panel(console, window, cx));
+        }
+        self.focus_active_center_panel(window, cx);
         match ev {
             SidebarEvent::NewWorkspace => {
                 // 异步对话框: 变更在完成回调里, 面板转发也在那里 (见 create_workspace)

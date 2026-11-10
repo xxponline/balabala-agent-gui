@@ -8,6 +8,7 @@
 mod agent_entities;
 mod app;
 mod pane;
+mod property_detail_manager;
 mod shell;
 mod sidebar;
 mod tree;
@@ -19,7 +20,12 @@ use app::TerminalApp;
 use gpui_kit::AppContext;
 
 fn main() {
-    gpui_kit::application().run(|cx| {
+    gpui_kit::application()
+        // 图标资产 (tab 关闭 × 等 SVG): gpui 的默认 AssetSource 是 `()`,
+        // 不挂 gpui_kit::assets::Assets 则所有 svg 加载失败 (空白按钮, 2026-11-10
+        // headed 验收实测)
+        .with_assets(gpui_kit::assets::Assets)
+        .run(|cx| {
         gpui_kit::init(cx);
         // 关窗即退: gpui 的 Default 在 macOS 上是 Explicit (实测关窗
         // 进程残留); LastWindowClosed 与 eframe 原行为一致, 否则

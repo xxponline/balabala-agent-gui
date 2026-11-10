@@ -893,8 +893,19 @@ impl BasePanel for TerminalPanel {
 }
 
 impl Panel for TerminalPanel {
+    fn title(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        // 顶栏/多签 tab 的 console 标题 (tasks 2.1)。固定字面量而非
+        // 随 session 名抖动; 未来要展示活动 session 名在此扩展。
+        // test_support + id: 观测锚点 (try_find_by_label("console") 断言口;
+        // test_support 要求既有 ElementId)。
+        div().id("console-title").test_support().text_sm().child("console")
+    }
     fn title_bar(&self, _: &App) -> bool {
-        false // D8: spec 状态条在面板内, 不加第二层标题
+        // true (2026-11-10 headed 验收追加): 顶栏常驻 — 单 console 签时
+        // Auto 样式画 simple title 栏 (显示 console), 多签时为 tab 条;
+        // 左右槽 title_bar=false 不受影响 (方案 B, 用户选定)。
+        // 注意: 这不与 D8 冲突 — 状态条仍在面板内, 顶栏只是中槽的签/标题。
+        true
     }
     fn inner_padding(&self, _: &App) -> bool {
         false // D8: 面板自带 chrome

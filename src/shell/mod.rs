@@ -1,9 +1,10 @@
 //! 外壳装配：DockArea 三槽（左 sidebar | 中心终端 | 右文件树）。
 //!
 //! design D1（采用 gpui-component DockArea）/ D5（左 dock 不可关）/
-//! D8（chrome 全 title_bar=false）；spike §10.5 关键实证：
+//! D8（左右槽 title_bar=false; 中槽 console title_bar=true — 2026-11-10
+//! 验收追加顶栏常驻, 方案 B）；spike §10.5 关键实证：
 //! - **注册必须 `panel_handle` 包装**（`add_panel_view` / `panel_view`）——
-//!   裸 entity 绕过 `title_bar()=false` 判断，每槽多画 30px 标题栏，
+//!   裸 entity 绕过 title_bar 判断, 每槽多画 30px 标题栏，
 //!   压住 spec 置顶的 `+ new workspace`；
 //! - 顺序：先 add（按需建 dock）再 `set_dock_collapsible`（对不存在的
 //!   dock 是 no-op）。
@@ -11,9 +12,7 @@
 //! R3 外壳：`TerminalApp::render` 的外层容器承载本模块产出的 DockArea，
 //! 未来 titlebar/状态栏/覆盖层挂同一容器。
 
-use gpui_kit::component::dock::{
-    panel_handle, DockArea, DockLayout, DockPlacement, DockSkin,
-};
+use gpui_kit::component::dock::{panel_handle, DockArea, DockLayout, DockPlacement, DockSkin};
 use gpui_kit::*;
 
 use crate::app::TerminalApp;
@@ -39,8 +38,12 @@ pub fn build(
     window: &mut Window,
     cx: &mut Context<TerminalApp>,
 ) -> ShellParts {
-    let (dock_area, _skin) = DockSkin::dock_area("main", Some(1), window, cx);
-    // Some(1) = 持久化 schema 版本（D6: 本轮不 load/dump, 先占位）
+    let (dock_area, skin) = DockSkin::dock_area("main", Some(1), window, cx);
+    // Some(1) = 持久化 schema 版本 (D6: 本轮不 load/dump, 先占位)
+    // 关闭按钮默认关 (gpui-component: close_button_visible=false) —
+    // 多签后 viewer 签必须可关 (spec: 签关闭与去重表生命周期); gate
+    // 仍是 `closable`, console (closable=false) 不会出 ×。
+    skin.set_close_button_visible(true, cx);
 
     let sidebar = cx.new(|cx| SidebarPanel::new(weak_app.clone(), cx));
     let terminal = cx.new(|cx| TerminalPanel::new(weak_app.clone(), cx));
