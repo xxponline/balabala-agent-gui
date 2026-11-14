@@ -992,7 +992,7 @@ mod tests {
         // on_click 冒泡把键盘/IME 交回 active tab 面板 = 终端面板
         // (design D6-3: console active 场景与旧行为逐字同效)
         cx.update_window(handle, |_, window, cx| {
-            window.click("cell-/stub/stub-top.md", cx);
+            window.click("cell-/stub/stub-dir", cx);
         })
         .expect("update window");
         cx.run_until_parked();
@@ -1002,7 +1002,7 @@ mod tests {
         assert_eq!(
             focused,
             Some(term_focus),
-            "console active 时树行点击后键盘焦点必须回到终端面板 (spec: 键盘转发 — 树不持焦)"
+            "console active 时树行点击(未认领对象)后键盘焦点必须回到终端面板 (spec: 键盘转发 — 树不持焦)"
         );
     }
 
@@ -1049,9 +1049,10 @@ mod tests {
         .expect("update window");
         cx.run_until_parked();
 
-        // 树行点击冒泡 → 焦点交回 active tab 面板 = viewer (非终端)
+        // 树行点击冒泡 → 焦点交回 active tab 面板 = viewer (非终端);
+        // 重复点已开的 .rs 行 (dedup 聚焦不换面板, 焦点语义与原 md 行同效)
         cx.update_window(handle, |_, window, cx| {
-            window.click("cell-/stub/stub-top.md", cx);
+            window.click("cell-/stub/stub-top.rs", cx);
         })
         .expect("update window");
         cx.run_until_parked();

@@ -22,6 +22,7 @@ use crate::workspace::{Workspace, store};
 // Tab 在 Terminal context 下的转发动作: gpui-base 的 Root 全局绑定
 // `tab` → 焦点遍历会吞掉 Tab (原始 key event 不再派发), 更深的
 // Terminal context 绑定胜出 (design D5, spike 已验证)。
+use crate::property_detail_manager::md_panel::ToggleMdView;
 actions!(terminal, [TerminalTab, TerminalCopy]);
 
 pub struct TerminalApp {
@@ -75,6 +76,9 @@ impl TerminalApp {
             // Terminal context 深于全局, 不与文本框的 cmd-c 抢;
             // modifiers.platform 已被 handle_key_down 拦, 不漏给会话
             KeyBinding::new("cmd-c", TerminalCopy, Some("Terminal")),
+            // md 查看切换 (md-viewer-toggle task 3.1): context=None 任意
+            // context 匹配 — MdPanel 无专属 key_context, 且无键位冲突
+            KeyBinding::new("cmd-shift-m", ToggleMdView, None),
         ]);
 
         let paths = store::load()?;

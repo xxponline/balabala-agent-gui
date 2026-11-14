@@ -10,6 +10,7 @@
 //! （specs/center-tabs: Console is the permanent first center tab）。
 
 pub mod editor_panel;
+pub mod md_panel;
 
 use std::sync::Arc;
 
@@ -20,6 +21,7 @@ use gpui_kit::{Context, Window};
 use crate::app::TerminalApp;
 use crate::workspace_property_source::SourceNodeKind;
 use editor_panel::RustViewerHandler;
+use md_panel::MarkdownViewerHandler;
 
 /// 待打开对象的中立封装——不含 gpui 类型，可跨插件边界
 /// （design D2; `kind` 由数据源查权威树给出）。
@@ -47,8 +49,8 @@ pub trait OpenHandler: Send + Sync + 'static {
     ) -> Arc<dyn PanelView>;
 }
 
-/// 静态 handler 注册表（v1 仅 `.rs` 只读查看器）。
-static HANDLERS: &[&dyn OpenHandler] = &[&RustViewerHandler];
+/// 静态 handler 注册表（按序第一个认领者胜出; `.rs` 与 `.md` 只读查看器）。
+static HANDLERS: &[&dyn OpenHandler] = &[&RustViewerHandler, &MarkdownViewerHandler];
 
 /// 按注册顺序取第一个认领 `obj` 的 handler。
 pub(crate) fn handler_for(obj: &OpenObject) -> Option<&'static dyn OpenHandler> {
@@ -850,14 +852,14 @@ mod tests {
         assert_eq!(before.len(), 1, "初始仅 console 签");
         assert_eq!(before[0], console_id(cx, &app), "console 恒 index 0");
 
-        // 无 handler 认领: .md 文件 + 目录
-        let md = write_temp_file("noop", "md", "# 无 handler");
+        // 无 handler 认领: 非 rs/md 文件 + 目录 (md 现由 md viewer 认领)
+        let unclaimed = write_temp_file("noop", "toml", "k = 1");
         open_object_in(
             cx,
             handle,
             &app,
             OpenObject {
-                path: PathBuf::from(&md),
+                path: PathBuf::from(&unclaimed),
                 kind: SourceNodeKind::File,
             },
         );
@@ -1040,7 +1042,7 @@ mod tests {
     fn rs_file_opens_viewer_non_rs_noop(cx: &mut TestAppContext) {
         let (handle, app) = open_app(cx);
         let rs = write_temp_file("claim", "rs", "fn claim_probe() {}");
-        let md = write_temp_file("claim", "md", "# no claim");
+        let unclaimed = write_temp_file("claim", "toml", "k = 1");
 
         open_object_in(
             cx,
@@ -1066,7 +1068,7 @@ mod tests {
             handle,
             &app,
             OpenObject {
-                path: PathBuf::from(&md),
+                path: PathBuf::from(&unclaimed),
                 kind: SourceNodeKind::File,
             },
         );
@@ -1082,8 +1084,261 @@ mod tests {
         assert_eq!(
             center_tabs(cx, &app).0.len(),
             2,
-            ".md / 目录不认领 → 无新签 (spec scenario: Non-rs file has no viewer)"
+            ".toml / 目录不认领 → 无新签 (spec scenario: Non-viewer file has no viewer)"
         );
+        let _ = render(handle, cx);
+    }
+
+    // ---------- md-viewer-toggle (1.3 / 2.x / 3.x / 4.x) ----------
+
+    use crate::property_detail_manager::md_panel::{MdPanel, ViewMode};
+
+    /// md 面板实体（dedup 表 → dock → 两跳 downcast, viewer_entity 同款）。
+    fn md_panel_entity(
+        cx: &mut TestAppContext,
+        app: &gpui_kit::Entity<TerminalApp>,
+        key: &str,
+    ) -> gpui_kit::Entity<MdPanel> {
+        cx.update(|cx| {
+            let app = app.read(cx);
+            let panel_id = *app.open_tabs.get(key).expect("dedup 表登记 md viewer");
+            let area = app.dock_area.read(cx);
+            let handle = area.panel(panel_id).expect("md viewer 在 dock 中");
+            let wrapped = PanelHandle::of(handle).expect("panel_handle 包装");
+            wrapped
+                .panel()
+                .as_any()
+                .downcast_ref::<gpui_kit::Entity<MdPanel>>()
+                .expect("inner 是 Entity<MdPanel>")
+                .clone()
+        })
+    }
+
+    fn open_md(
+        cx: &mut TestAppContext,
+        handle: AnyWindowHandle,
+        app: &gpui_kit::Entity<TerminalApp>,
+        path: &str,
+    ) {
+        open_object_in(
+            cx,
+            handle,
+            app,
+            OpenObject {
+                path: PathBuf::from(path),
+                kind: SourceNodeKind::File,
+            },
+        );
+    }
+
+    /// 关闭 md 签（remove_panel; on_removed 摘 dedup — close_viewer 同款）。
+    fn close_md(
+        cx: &mut TestAppContext,
+        handle: AnyWindowHandle,
+        app: &gpui_kit::Entity<TerminalApp>,
+        md: gpui_kit::Entity<MdPanel>,
+    ) {
+        cx.update_window(handle, |_, window, cx| {
+            let area = app.read(cx).dock_area.clone();
+            area.update(cx, |area, cx| area.remove_panel(md, window, cx));
+        })
+        .expect("update window");
+        cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn md_opens_rendered_with_dual_states(cx: &mut TestAppContext) {
+        let (handle, app) = open_app(cx);
+        let md = write_temp_file("md-open", "md", "# 标题\n\n正文 `code`");
+        open_md(cx, handle, &app, &md);
+
+        assert_eq!(center_tabs(cx, &app).0.len(), 2, ".md → 开 md viewer 签 (2.1)");
+        let panel = md_panel_entity(cx, &app, &md);
+        let (mode, title, has_md, has_editor) = cx.update(|cx| {
+            let p = panel.read(cx);
+            (
+                p.view_mode,
+                p.title.clone(),
+                p.md_state.entity_id(),
+                p.editor.entity_id(),
+            )
+        });
+        assert_eq!(mode, ViewMode::Rendered, "默认渲染视图 (1.3, proposal 定案)");
+        let expected = std::path::Path::new(&md)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(title.to_string(), expected, "tab 标题 = 文件名");
+        // 双态 state 构造期都在 (D3): entity_id 稳定即两态在场
+        assert_ne!(has_md, has_editor, "两态是不同实体 (1.3)");
+        let _ = render(handle, cx);
+    }
+
+    #[gpui_kit::test]
+    fn md_dedup_close_reopen_resets_to_rendered(cx: &mut TestAppContext) {
+        let (handle, app) = open_app(cx);
+        let md = write_temp_file("md-dedup", "md", "# dedup");
+        open_md(cx, handle, &app, &md);
+        open_md(cx, handle, &app, &md);
+        assert_eq!(
+            center_tabs(cx, &app).0.len(),
+            2,
+            "同一 md 开两次仍单签 (2.2 dedup)"
+        );
+
+        // 切到 source (按钮点击, 端到端)
+        let panel = md_panel_entity(cx, &app, &md);
+        let _ = render(handle, cx);
+        cx.update_window(handle, |_, window, cx| window.click("md-toggle", cx))
+            .expect("click toggle");
+        cx.run_until_parked();
+        let mode = cx.update(|cx| panel.read(cx).view_mode);
+        assert_eq!(mode, ViewMode::Source, "按钮切换到源码 (3.2)");
+
+        // 关签 → 摘 dedup → 重开 → 回渲染 (4.2 不记忆)
+        close_md(cx, handle, &app, panel);
+        assert!(
+            cx.update(|cx| !app.read(cx).open_tabs.contains_key(&md)),
+            "关签摘 dedup (2.2)"
+        );
+        open_md(cx, handle, &app, &md);
+        let reopened = md_panel_entity(cx, &app, &md);
+        let mode = cx.update(|cx| reopened.read(cx).view_mode);
+        assert_eq!(
+            mode,
+            ViewMode::Rendered,
+            "重开回渲染视图 (spec: Reopen resets to rendered)"
+        );
+        let _ = render(handle, cx);
+    }
+
+    #[gpui_kit::test]
+    fn md_toggle_action_dispatches_in_place(cx: &mut TestAppContext) {
+        let (handle, app) = open_app(cx);
+        let md = write_temp_file("md-action", "md", "# action");
+        open_md(cx, handle, &app, &md);
+        let panel = md_panel_entity(cx, &app, &md);
+        let _ = render(handle, cx);
+
+        // action 路径 (3.1): on_action 沿焦点路径冒泡 → 先聚焦面板再 dispatch
+        let focus = cx.update(|cx| panel.read(cx).focus_handle(cx));
+        cx.update_window(handle, |_, window, cx| {
+            focus.clone().focus(window, cx);
+        })
+        .expect("focus");
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            let mut scope = window.within("md-pane");
+            scope.press("cmd-shift-m", cx);
+        })
+        .expect("press");
+        cx.run_until_parked();
+        let mode = cx.update(|cx| panel.read(cx).view_mode);
+        assert_eq!(mode, ViewMode::Source, "action 切到源码 (3.1)");
+        assert_eq!(
+            center_tabs(cx, &app).0.len(),
+            2,
+            "切换不重建 tab (spec: in place, 无第二签)"
+        );
+
+        // 按钮路径同 body: 再点回渲染
+        cx.update_window(handle, |_, window, cx| window.click("md-toggle", cx))
+            .expect("click");
+        cx.run_until_parked();
+        let mode = cx.update(|cx| panel.read(cx).view_mode);
+        assert_eq!(mode, ViewMode::Rendered, "按钮切回渲染 (3.2)");
+        let _ = render(handle, cx);
+    }
+
+    #[gpui_kit::test]
+    fn md_toggle_absent_on_console_and_rs(cx: &mut TestAppContext) {
+        let (handle, app) = open_app(cx);
+        // console 恒为首签且默认 active (spec: permanent first tab)
+        let _ = render(handle, cx);
+        let has_toggle = cx.update_window(handle, |_, window, _| {
+            window.try_find("md-toggle").is_some()
+        })
+        .expect("find");
+        assert!(!has_toggle, "console 无切换按钮 (spec: no toggle)");
+
+        // 开 rs viewer (激活该签): 同样无
+        let rs = write_temp_file("md-none", "rs", "fn none() {}");
+        open_object_in(
+            cx,
+            handle,
+            &app,
+            OpenObject {
+                path: PathBuf::from(&rs),
+                kind: SourceNodeKind::File,
+            },
+        );
+        let _ = render(handle, cx);
+        let has_toggle = cx.update_window(handle, |_, window, _| {
+            window.try_find("md-toggle").is_some()
+        })
+        .expect("find");
+        assert!(!has_toggle, "rs viewer 无切换按钮 (spec: no toggle)");
+    }
+
+    #[gpui_kit::test]
+    fn md_readonly_source_mode(cx: &mut TestAppContext) {
+        let (handle, app) = open_app(cx);
+        let md = write_temp_file("md-ro", "md", "# readonly probe");
+        open_md(cx, handle, &app, &md);
+        let panel = md_panel_entity(cx, &app, &md);
+        let value = cx.update(|cx| panel.read(cx).editor.read(cx).value().to_string());
+        assert!(value.contains("# readonly probe"), "source 灌入: {value:?}");
+
+        // 切到 source (按钮), 键入不改内容 (spec: Viewer is read-only)
+        let _ = render(handle, cx);
+        cx.update_window(handle, |_, window, cx| window.click("md-toggle", cx))
+            .expect("click");
+        cx.run_until_parked();
+        let focus = cx.update(|cx| panel.read(cx).focus_handle(cx));
+        cx.update_window(handle, |_, window, cx| {
+            focus.clone().focus(window, cx);
+        })
+        .expect("focus");
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            let mut scope = window.within("md-source-pane");
+            scope.input("HACKED", cx);
+        })
+        .expect("input");
+        cx.run_until_parked();
+        let after = cx.update(|cx| panel.read(cx).editor.read(cx).value().to_string());
+        assert_eq!(after, value, "source 模式键入后内容不变 (4.1)");
+        let _ = render(handle, cx);
+    }
+
+    #[gpui_kit::test]
+    fn md_rendered_view_renders_format(cx: &mut TestAppContext) {
+        let (handle, app) = open_app(cx);
+        let md = write_temp_file("md-render", "md", "# 大标题\n\n- 项目一");
+        open_md(cx, handle, &app, &md);
+        let _ = render(handle, cx);
+
+        // 默认渲染: md-pane 在树, source pane 不在 (spec: opens rendered)
+        let (in_rendered, in_source) = cx.update_window(handle, |_, window, _| {
+            (window.try_find("md-pane").is_some(), window.try_find("md-source-pane").is_some())
+        })
+        .expect("find");
+        assert!(in_rendered, "默认渲染视图元素在场 (4.1)");
+        assert!(!in_source, "源码元素未挂载 (4.1)");
+
+        // 切 source: 反转
+        let panel = md_panel_entity(cx, &app, &md);
+        cx.update_window(handle, |_, window, cx| window.click("md-toggle", cx))
+            .expect("click");
+        cx.run_until_parked();
+        let _ = render(handle, cx);
+        let (in_rendered, in_source) = cx.update_window(handle, |_, window, _| {
+            (window.try_find("md-pane").is_some(), window.try_find("md-source-pane").is_some())
+        })
+        .expect("find");
+        assert!(!in_rendered && in_source, "切换后源码视图元素在场 (3.2/4.1)");
+        let _ = panel;
         let _ = render(handle, cx);
     }
 
