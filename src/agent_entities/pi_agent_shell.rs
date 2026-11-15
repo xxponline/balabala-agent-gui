@@ -62,12 +62,14 @@ impl PiAgentShell {
     /// 以指定 pi 二进制启动会话 (生产走 `None` = PATH 解析; 测试注入 stub)。
     ///
     /// 输入: name — sidebar 显示名; cwd — 工作目录; pi_bin — pi 可执行文件
-    ///       (None = resolve_binary())
+    ///       (None = Windows PATHEXT 解析, 解析不到再回退 resolve_binary())
     /// 输出: 成功返回就绪会话 (Starting 状态, 网格为回退尺寸);
     ///       失败 (pi 缺失/探活超时) 返回 Err, 不留下半开会话
     fn spawn(name: String, cwd: PathBuf, pi_bin: Option<String>) -> Result<Self, String> {
         let config = EmbedConfig {
-            pi_bin, // None: resolve_binary(): PI_BIN 覆盖或 PATH 里的 pi
+            // 测试注入的 pi_bin 优先; 否则 Windows 上做 PATHEXT 语义解析
+            // (见 resolve_pi_bin), 解析不到再回退 None = resolve_binary()
+            pi_bin: pi_bin.or_else(resolve_pi_bin),
             pi_args: Vec::new(),
             cwd: Some(cwd.clone()),
             cols: COLS,
@@ -104,6 +106,49 @@ impl PiAgentShell {
     ) -> Result<Self, String> {
         Self::spawn(name, cwd, pi_bin)
     }
+}
+
+/// Windows 上解析 pi 可执行文件; 其他平台恒 `None` (维持原样: 走
+/// `resolve_binary()` 的 `PI_BIN` 或 PATH 上的 `pi`)。
+///
+/// 为什么需要: `Command::new("pi")` 走 CreateProcess, 只尝试 `pi.exe`,
+/// 既不读 PATHEXT, 也不执行安装器放的无扩展名 sh 脚本 `bin\pi` /
+/// `bin\pi.cmd` — 报 `failed to spawn \`pi --mode rpc\`: program not found`
+/// (cargo run 实测)。而 `pi.cmd` 可被直接 spawn (CreateProcess 对
+/// .cmd 内部转 cmd.exe, 实测 RPC 握手通过)。
+///
+/// 解析顺序: `PI_BIN` 显式覆盖 → PATH 上逐目录按 pi.exe → pi.cmd →
+/// pi.bat 找 (cmd 的 PATHEXT 语义, 目录优先)。找不到返回 None,
+/// 保留原有 "pi" 报错路径, 不吞掉真正的缺装信息。
+#[cfg(windows)]
+fn resolve_pi_bin() -> Option<String> {
+    resolve_pi_bin_in(std::env::var("PI_BIN").ok(), std::env::var_os("PATH"))
+}
+
+/// [`resolve_pi_bin`] 的纯函数核心 (注入 env, 便于测试不改进程环境)。
+#[cfg(windows)]
+fn resolve_pi_bin_in(pi_bin: Option<String>, path: Option<std::ffi::OsString>) -> Option<String> {
+    if let Some(bin) = pi_bin {
+        if !bin.is_empty() {
+            return Some(bin);
+        }
+    }
+    let path = path?;
+    for dir in std::env::split_paths(&path) {
+        for ext in ["exe", "cmd", "bat"] {
+            let cand = dir.join(format!("pi.{ext}"));
+            if cand.is_file() {
+                return Some(cand.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// 非 Windows: 不做解析, 交回 pi-shell-rs 的 `resolve_binary()`。
+#[cfg(not(windows))]
+fn resolve_pi_bin() -> Option<String> {
+    None
 }
 
 impl AgentEntity for PiAgentShell {
@@ -210,6 +255,75 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
         path
+    }
+
+    /// Windows: 解析必须给出可直接 spawn 的文件, 否则
+    /// `Command::new("pi")` 报 program not found (cargo run 实测回归)。
+    #[cfg(windows)]
+    #[test]
+    fn resolve_pi_bin_resolves_to_existing_executable() {
+        // PI_BIN 显式覆盖优先 (同一分支)
+        assert_eq!(
+            resolve_pi_bin_in(
+                Some(r"C:\does\not\exist\pi.exe".into()),
+                Some(std::ffi::OsString::from("C:\\nowhere")),
+            )
+            .as_deref(),
+            Some(r"C:\does\not\exist\pi.exe"),
+            "PI_BIN 显式覆盖必须优先"
+        );
+
+        // 空 PI_BIN 视为未设置 (不 spawn "" )
+        assert!(
+            resolve_pi_bin_in(
+                Some(String::new()),
+                Some(std::ffi::OsString::from("C:\\nowhere"))
+            )
+            .is_none(),
+            "空 PI_BIN 必须跳过"
+        );
+
+        // PATH 解析 (若装了 pi): 结果必须是已存在的文件且带可执行后缀
+        if let Some(bin) = resolve_pi_bin() {
+            assert!(
+                std::path::Path::new(&bin).is_file(),
+                "解析结果必须存在: {bin}"
+            );
+            let lower = bin.to_ascii_lowercase();
+            assert!(
+                lower.ends_with(".exe") || lower.ends_with(".cmd") || lower.ends_with(".bat"),
+                "必须带 Windows 可执行后缀: {bin}"
+            );
+        }
+    }
+
+    /// 端到端: 生产路径 (pi_bin=None) 必须解析到可 spawn 的 pi 并完成探活
+    /// — 即 `cargo run` 报 `program not found` 的回归测试。未装 pi 则跳过。
+    #[test]
+    fn production_spawn_resolves_real_pi() {
+        if resolve_pi_bin().is_none() && std::env::var("PI_BIN").is_err() {
+            eprintln!("pi 不在 PATH 上, 跳过");
+            return;
+        }
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("pi-real-{unique}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // 真实生产入口 (None -> resolve_pi_bin -> pi --mode rpc 探活)
+        let shell = PiAgentShell::new("pi-real".into(), dir.clone())
+            .expect("生产路径必须能启动 pi (Windows: 不得报 program not found)");
+        assert_eq!(shell.status(), SessionStatus::Starting);
+        shell_embed_running(&shell);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// embed 句柄存活断言 (探活成功 = 子进程已拉起)
+    fn shell_embed_running(shell: &PiAgentShell) {
+        assert!(shell.embed.is_running(), "pi 子进程必须存活");
     }
 
     /// 把整个屏幕 dump 成带分隔符的字符串, 用于逐字节比较。
