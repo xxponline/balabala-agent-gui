@@ -10,8 +10,8 @@ rfd = "0.15.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 crossterm = "0.29.0"
-# 本地开发：直接引用 ref/ 下的副本，修改立即生效，不走网络
-pi-shell-rs = { path = "ref/pi-shell-rs" }
+# Cargo 需要 ssh:// 形式（scp 风格 git@host:path 不被 URL 解析器接受）
+pi-shell-rs = { git = "ssh://git@github.com/xxponline/pi-shell-rs.git" }
 
 [dev-dependencies]
 # 仅测试构建启用 (resolver 不会把 dev 特性并入 cargo build)：

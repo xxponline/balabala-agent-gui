@@ -1,0 +1,5 @@
+# pi-shell-rs 走 ssh:// git 依赖；libgit2 的 ssh-agent 认证在本机（ssh-agent 无密钥）会失败，
+# 交给 git CLI（直接读 ~/.ssh 默认密钥）。
+# 仅想本机生效可把这行移到 ~/.cargo/config.toml。
+[net]
+git-fetch-with-cli = true

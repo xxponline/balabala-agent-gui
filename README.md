@@ -51,7 +51,7 @@ src/
 ├── workspace_property_source/  文件树数据源 (插件化) / pluggable tree data source
 └── agent_entities/     会话实体 (pi-shell-rs 嵌入) / session entities
 
-ref/pi-shell-rs/        TUI 引擎 (本地 path 依赖) / TUI engine (local path dep)
+pi-shell-rs (git)       TUI 引擎 (ssh git 依赖) / TUI engine (ssh git dep)
 openspec/               spec-driven 规格与归档 / specs & archived changes
 ```
 
@@ -62,6 +62,8 @@ openspec/               spec-driven 规格与归档 / specs & archived changes
 前置要求 / Requirements:
 
 - Rust toolchain（edition 2024）
+- 可访问 `ssh://git@github.com/xxponline/pi-shell-rs.git` 的 SSH 密钥
+  （pi-shell-rs 为 git 依赖；本机 `net.git-fetch-with-cli = true`）
 - `pi` CLI 可用（pi-shell-rs 经 `resolve_binary` 拉起 `pi --mode rpc` 会话；
   the `pi` command must be resolvable in `PATH`）
 
