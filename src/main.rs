@@ -31,13 +31,9 @@ fn main() {
         // 进程残留); LastWindowClosed 与 eframe 原行为一致, 否则
         // drain 循环与 pty 子进程会随僵尸进程残留。
         cx.set_quit_mode(gpui_kit::QuitMode::LastWindowClosed);
-        // 当前版本强制浅色主题 (gpui-component 默认即 Light 且不跟随
-        // 系统外观; 这里显式声明意图, 防止未来版本引入自动跟随)
-        gpui_kit::component::theme::Theme::change(
-            gpui_kit::component::theme::ThemeMode::Light,
-            None,
-            cx,
-        );
+        // 主题跟随系统外观 (add-light-dark-theme D1): 不再强制 Light —
+        // gpui-component 默认 Light, TerminalApp::new 在窗口启动时
+        // sync_system_appearance 同步到系统外观并订阅后续热切换。
 
         let options = gpui_kit::WindowOptions {
             window_bounds: Some(gpui_kit::WindowBounds::centered(

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui_kit::*;
+use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::dock::{DockArea, DockPlacement};
 use gpui_kit::base::dock::PanelId;
 
@@ -48,6 +49,9 @@ pub struct TerminalApp {
     _input_drain_task: Option<Task<()>>,
     /// 进行中的异步文件夹选择任务 (design D8; 换新对话框时旧任务被取消)
     _dialog_task: Option<Task<()>>,
+    /// 系统外观订阅 (add-light-dark-theme D1): 启动同步 + 热切换时重新
+    /// sync 主题; 存实体上保活 (drop 即退订)
+    _appearance_subscription: Subscription,
     /// 累计实际传播的网格 resize 次数 (诊断/测试观测: 输入型重绘不增)
     pub grid_resizes: usize,
     /// 累计经 send_key 转发给会话的 Tab 键数 (诊断/测试观测: spec
@@ -91,6 +95,20 @@ impl TerminalApp {
             terminal,
             tree,
         } = shell::build(weak_app, window, cx);
+        // 主题跟随系统外观 (add-light-dark-theme D1): 启动同步一次,
+        // 并订阅外观变化 → 每次变化重新 sync (Theme::change 内部会
+        // refresh_windows, 全窗重渲即热切换生效), 并把新配色推给
+        // 所有活会话 (D4: 会话内容色随主题)。
+        gpui_kit::component::theme::Theme::sync_system_appearance(Some(window), cx);
+        let weak_for_theme = cx.weak_entity();
+        let appearance_subscription = window.observe_window_appearance(move |window, cx| {
+            gpui_kit::component::theme::Theme::sync_system_appearance(Some(window), cx);
+            // 主题已切 → 遍历活会话 set_theme (spec: Theme change updates
+            // live sessions — 不重启、不丢 scrollback)
+            if let Some(app) = weak_for_theme.upgrade() {
+                app.update(cx, |app, cx| app.push_tui_theme(cx));
+            }
+        });
         Ok(Self {
             workspaces,
             active: None,
@@ -98,6 +116,7 @@ impl TerminalApp {
             _update_task: None,
             _input_drain_task: None,
             _dialog_task: None,
+            _appearance_subscription: appearance_subscription,
             grid_resizes: 0,
             tab_forwards: 0,
             wheel_forwards: 0,
@@ -146,7 +165,7 @@ impl TerminalApp {
             (ws.new_agent_name(), ws.path.clone())
         };
 
-        match PiAgentShell::new(name, cwd) {
+        match PiAgentShell::new(name, cwd, crate::ui::tui_theme(cx.theme().mode)) {
             Ok(shell) => {
                 let entity = cx.new(|_| AgentSession(Box::new(shell)));
                 self.active = Some(entity.entity_id());
@@ -192,6 +211,16 @@ impl TerminalApp {
             .iter()
             .flat_map(|w| w.agents.iter())
             .find(|e| e.entity_id() == active)
+    }
+
+    /// 把当前主题的注入配色推给所有活会话 (add-light-dark-theme D4:
+    /// 外观变化时会话内容色跟随; spawn 时已注入, 此处只管热切换)。
+    fn push_tui_theme(&self, cx: &mut Context<Self>) {
+        let theme = crate::ui::tui_theme(cx.theme().mode);
+        for agent in self.workspaces.iter().flat_map(|w| w.agents.iter()) {
+            let theme = theme.clone();
+            agent.update(cx, |s, _| s.0.set_theme(theme));
+        }
     }
 
     /// 把一个键送给 active session。
@@ -657,8 +686,12 @@ mod tests {
     //! `gpui_kit::*` 把 `#[test]` 宏遮蔽掉)。
 
     use super::TerminalApp;
-    use crate::agent_entities::{AgentSession, PiAgentShell};
+    use crate::agent_entities::{AgentEntity, AgentSession, PiAgentShell, SessionStatus};
     use crate::workspace::Workspace;
+    use pi_shell_rs::app::theme::TuiTheme;
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
     use gpui_kit::Focusable;
     use crate::pane::{MIN_GRID_COLS, MIN_GRID_ROWS, grid_metrics};
     use gpui_kit::test::TestWindowExt;
@@ -678,6 +711,111 @@ mod tests {
         let full = path.to_string_lossy().to_string();
         app.workspaces.push(Workspace::new(path));
         full
+    }
+
+    /// 记录 set_theme 载荷的假会话 (add-light-dark-theme task 4.2)。
+    struct ThemeRecorder {
+        ws: PathBuf,
+        parser: vt100::Parser,
+        received: Rc<RefCell<Vec<TuiTheme>>>,
+    }
+
+    impl AgentEntity for ThemeRecorder {
+        fn name(&self) -> &str {
+            "recorder"
+        }
+        fn ws_path(&self) -> &Path {
+            &self.ws
+        }
+        fn screen(&self) -> &vt100::Screen {
+            self.parser.screen()
+        }
+        fn poll(&mut self) -> bool {
+            false
+        }
+        fn send_key(&mut self, _key: crossterm::event::KeyEvent) {}
+        fn send_text(&mut self, _text: &str) {}
+        fn send_wheel(&mut self, _lines: i16) {}
+        fn send_click(&mut self, _x: u16, _y: u16) {}
+        fn shutdown(&mut self) {}
+        fn status(&self) -> SessionStatus {
+            SessionStatus::Running
+        }
+        fn resize(&mut self, _cols: u16, _rows: u16) -> bool {
+            false
+        }
+        fn set_theme(&mut self, theme: TuiTheme) {
+            self.received.borrow_mut().push(theme);
+        }
+    }
+
+    /// task 4.2 (spec: Theme change updates live sessions): 外观切换 →
+    /// push_tui_theme 把当前主题的配色推给所有活会话 (不重启)。
+    #[gpui_kit::test]
+    fn theme_change_pushes_tui_theme_to_live_sessions(cx: &mut TestAppContext) {
+        use gpui_kit::component::theme::{Theme, ThemeMode};
+
+        cx.update(gpui_kit::init);
+        let (handle, app_entity) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1000.), px(600.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| TerminalApp::new(window, cx).expect(".workspaces.json 加载"))
+                },
+            )
+            .expect("open test window")
+        });
+        let _ = handle;
+
+        let received = Rc::new(RefCell::new(Vec::new()));
+        app_entity.update(cx, |app, cx| {
+            inject_test_workspace(app, "theme-push");
+            let ws_path = app.workspaces.last().expect("测试 workspace").path.clone();
+            let recorder = ThemeRecorder {
+                ws: ws_path,
+                parser: vt100::Parser::new(
+                    std::num::NonZeroU16::new(24).unwrap(),
+                    std::num::NonZeroU16::new(80).unwrap(),
+                    0,
+                ),
+                received: received.clone(),
+            };
+            app.workspaces
+                .last_mut()
+                .expect("测试 workspace")
+                .agents
+                .push(cx.new(|_| AgentSession(Box::new(recorder))));
+
+            // 启动同步后主题 = 系统外观 (测试平台 = Light) → 推浅色
+            app.push_tui_theme(cx);
+        });
+
+        let first = received.borrow().clone();
+        assert_eq!(first.len(), 1, "首个会话应收到一次配色");
+        assert_eq!(
+            first[0],
+            crate::ui::tui_theme(ThemeMode::Light),
+            "Light 主题下应推入浅色 TuiTheme"
+        );
+
+        // 切到 Dark → 再推 → 会话收到 pi 默认深色 (不重启会话)
+        cx.update(|cx| Theme::change(ThemeMode::Dark, None, cx));
+        app_entity.update(cx, |app, cx| app.push_tui_theme(cx));
+        let after = received.borrow().clone();
+        assert_eq!(after.len(), 2, "切换后应再收到一次配色");
+        assert_eq!(
+            after[1],
+            TuiTheme::default(),
+            "Dark 主题下应推入 pi dark.json 默认值"
+        );
+        assert_ne!(after[0], after[1], "两次配色必须不同");
     }
 
     /// 假 pi (sleepy 版): 每个响应前 sleep 1s — 让 badge 测试首帧确定为
@@ -717,6 +855,44 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
         path
+    }
+
+    /// add-light-dark-theme task 1.2: 主题跟随系统外观, 不被强制固定。
+    /// 先把 Theme 钉到 Dark (模拟“错误的固定状态”), 再构造 TerminalApp —
+    /// 其启动 sync 必须把模式拉回 `cx.window_appearance()` 推导值 (测试平台
+    /// 恒 Light); 若启动 sync 被删或有人恢复固定模式, 断言失败。
+    #[gpui_kit::test]
+    fn theme_follows_window_appearance_on_startup(cx: &mut TestAppContext) {
+        use gpui_kit::component::theme::{Theme, ThemeMode};
+
+        cx.update(gpui_kit::init);
+        // 钉到与外观推导值相反的模式, 证明启动 sync 真的执行了 (而非
+        // “恰好默认 Light 而已”)
+        cx.update(|cx| Theme::change(ThemeMode::Dark, None, cx));
+        let (_handle, _entity) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1000.), px(600.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| TerminalApp::new(window, cx).expect(".workspaces.json 加载"))
+                },
+            )
+            .expect("open test window")
+        });
+        cx.update(|cx| {
+            let expected = ThemeMode::from(cx.window_appearance());
+            assert_eq!(
+                Theme::global(cx).mode,
+                expected,
+                "主题必须跟随系统外观 (启动 sync), 而非被强制固定"
+            );
+        });
     }
 
     /// 输入触发的快速 drain (task 5.4, design D7): 测试 app 不启主循环
