@@ -13,9 +13,7 @@
 pub mod filetree;
 pub mod filter;
 
-pub use filetree::resolve_active_root;
-
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use gpui_kit::{App, WeakEntity, Window};
 
@@ -54,8 +52,8 @@ pub enum SourceEffect {
     RevealPath(PathBuf),
 }
 
-/// `view()` 拉取的视图状态；`root` 携带当前根路径，面板用它做
-/// "根路径变化才重扫" 的比对（file-tree spec: Tree scope）。
+/// `view()` 拉取的视图状态；`root` 携带当前根路径（面板降级态/header
+/// 展示用）。
 #[derive(Clone, Debug, PartialEq)]
 pub enum SourceView {
     /// 无活跃 workspace（或尚未初始化）——面板显示空态。
@@ -72,8 +70,9 @@ pub enum SourceView {
 }
 
 impl SourceView {
-    /// 当前根路径（无则 None）——面板据此判断是否需要触发重扫。
-    pub fn root(&self) -> Option<&Path> {
+    /// 当前根路径（无则 None）。
+    #[allow(dead_code)] // 面板重扫比对已收敛到 refresh_if_needed (D6)
+    pub fn root(&self) -> Option<&std::path::Path> {
         match self {
             SourceView::Empty => None,
             SourceView::Degraded { root, .. } | SourceView::Tree { root, .. } => Some(root),
@@ -83,7 +82,7 @@ impl SourceView {
 
 /// 数据源契约（dyn-safe，design D2）。
 ///
-/// 六个方法即插件边界的全部；v1 面板持 `Box<dyn _>`，未来动态加载
+/// 八个方法即插件边界的全部；v1 面板持 `Box<dyn _>`，未来动态加载
 /// 只需换注册表的构造方式，不改此契约。
 pub trait WorkspacePropertySource {
     /// 数据源显示名（面板标题与注册表语义依据，如 "文件树"）。
@@ -95,7 +94,19 @@ pub trait WorkspacePropertySource {
     /// 无活跃 workspace 时同步落入空态。
     fn refresh(&mut self, cx: &mut App);
 
-    /// part2：面板拉取的当前视图（含过滤求值结果）。
+    /// 通知路径入口（design D6; spec: In-flight scan is not restarted by
+    /// notifications）：同根（已落地**或扫描在途**）→ 早退 — 不读盘、
+    /// 不取消在途扫描；首载/根变化/清空 → 同 `refresh`。数据变化通知
+    /// 的重扫触发全部收敛于此，面板不再自行比对根。
+    fn refresh_if_needed(&mut self, cx: &mut App);
+
+    /// 视图代数（design D5; spec: Frame-driven notifications do not
+    /// rebuild the tree）：扫描落地/根变化/规则变化/显式刷新任一发生
+    /// 即 +1 — 面板以 `u64` 相等做 O(1) 失效检测，替代整树深比较。
+    fn view_generation(&self) -> u64;
+
+    /// part2：面板拉取的当前视图（含过滤求值结果）；代数未变时源侧
+    /// 返回缓存（design D5）。
     fn view(&self) -> SourceView;
 
     /// 右键菜单：功能描述由数据源提供。

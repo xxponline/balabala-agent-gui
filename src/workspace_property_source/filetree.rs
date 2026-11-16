@@ -1,8 +1,8 @@
 //! 文件树数据源——`WorkspacePropertySource` 的第一个实现（插件家族首发）。
 //!
 //! part1 职责（design D6/D7）：
-//! - 定位活动 workspace 根（`resolve_active_root`，面板"根变化才重扫"
-//!   的比对也复用它）；
+//! - 定位活动 workspace 根（`resolve_active_root`；通知路径的同根比对
+//!   也收敛在此 — `refresh_if_needed`，D6）；
 //! - 读 `.workspaces.json` 的 `file_tree` 规则区段（按根路径键控）；
 //! - 全量递归扫描（默认排除表 + 后台线程），落权威树；
 //! - `view()` 对权威树按 gitignore 式规则求值（**仅文件行**，目录恒显）。
@@ -43,12 +43,23 @@ pub const FUNC_REVEAL: &str = "reveal";
 struct SourceInner {
     /// 合成根（id = workspace 根路径；children = 顶层条目）；None = 未就绪。
     canonical: Option<SourceNode>,
-    /// 已定位/扫描中的根；None = 无活跃 workspace。
+    /// 已定位的根；None = 无活跃 workspace。refresh 入口即写入 —
+    /// 因此它同时表达"扫描中的根"与"已落地的根" (D6 分轨: 面板不再
+    /// 拿 last_synced 视图当当前根, 在途扫描不会被通知重启)。
     root: Option<PathBuf>,
     /// 降级信息（根不可读；落地时写入）。
     degraded: Option<String>,
     /// 当前生效的过滤规则（refresh 时重读）。
     rules: Vec<String>,
+    /// 视图代数 (design D5): refresh 入口与扫描落地各 +1 — 输入
+    /// (根/规则/权威树) 任一失效即推进; 面板以此做 O(1) 失效检测,
+    /// 替代整树深比较 (spec: Frame-driven notifications do not rebuild)。
+    generation: u64,
+    /// 视图缓存 (design D5): 代数命中 → 直接返回 (零过滤)。
+    cached_view: Option<(u64, SourceView)>,
+    /// 过滤重建计数 (task 4.1 测试缝: 证明缓存命中不重过滤)。
+    #[cfg(test)]
+    filter_runs: u64,
 }
 
 impl SourceInner {
@@ -71,6 +82,53 @@ impl SourceInner {
                 self.degraded = Some(message);
             }
         }
+        // 扫描落地 (design D5 失效源之一) → 视图代数 +1
+        self.bump();
+    }
+
+    /// 视图代数推进 (缓存失效)。调用点 = refresh 入口 (覆盖根变化/
+    /// 规则变化/显式刷新三个失效源) 与 land (扫描落地) — D5 的四个
+    /// 失效源全部落在增量点旁。
+    fn bump(&mut self) {
+        self.generation += 1;
+    }
+
+    /// 带代数缓存的视图 (design D5): 代数未变 → 返回缓存副本 (零过滤);
+    /// 变化 → 重算一次并回填。`FileTreeSource::view` 委托于此。
+    fn view(&mut self) -> SourceView {
+        if let Some((generation, cached)) = &self.cached_view {
+            if *generation == self.generation {
+                return cached.clone();
+            }
+        }
+        #[cfg(test)]
+        {
+            self.filter_runs += 1;
+        }
+        let view = self.compute_view();
+        self.cached_view = Some((self.generation, view.clone()));
+        view
+    }
+
+    /// 由权威树 + 规则求值视图 (原 view 主体, 仅代数变化时执行)。
+    fn compute_view(&self) -> SourceView {
+        if let Some(message) = &self.degraded {
+            return SourceView::Degraded {
+                root: self.root.clone().expect("degraded implies root"),
+                message: message.clone(),
+            };
+        }
+        match (&self.root, &self.canonical) {
+            (Some(root), Some(node)) => {
+                let ruleset = Ruleset::compile(&self.rules);
+                SourceView::Tree {
+                    root: root.clone(),
+                    node: filter_tree(node, &node.id, &ruleset),
+                    rules: self.rules.clone(),
+                }
+            }
+            _ => SourceView::Empty,
+        }
     }
 }
 
@@ -82,6 +140,9 @@ pub struct FileTreeSource {
     /// 刷新任务存根——drop 会取消 future（app.rs 同款约定）；
     /// 新 refresh 覆盖旧任务 = 新扫描取代在途旧扫描（supersede）。
     _refresh_task: Option<Task<()>>,
+    /// 后台扫描启动计数 (task 5.1 测试缝): 每次 spawn 扫描 +1。
+    #[cfg(test)]
+    scan_starts: std::rc::Rc<std::cell::Cell<u64>>,
 }
 
 impl FileTreeSource {
@@ -91,13 +152,22 @@ impl FileTreeSource {
             rules_path,
             inner: Arc::new(Mutex::new(SourceInner::default())),
             _refresh_task: None,
+            #[cfg(test)]
+            scan_starts: std::rc::Rc::new(std::cell::Cell::new(0)),
         }
+    }
+
+    /// task 5.1 测试缝: 扫描启动计数句柄 (源 Box 化进面板前克隆出来)。
+    #[cfg(test)]
+    pub(crate) fn scan_starts_handle(&self) -> std::rc::Rc<std::cell::Cell<u64>> {
+        self.scan_starts.clone()
     }
 }
 
 /// 定位活动 agent 所属 workspace 的根路径（file-tree spec: Tree scope）。
 ///
-/// 面板用同一函数做"根变化才重扫"的比对，避免解析逻辑重复。
+/// `refresh` / `refresh_if_needed` 用它定位期望根 — 通知路径的
+/// "同根才不重扫"比对也收敛在源内 (design D6, 面板不再自行比对)。
 pub fn resolve_active_root(app: &WeakEntity<TerminalApp>, cx: &App) -> Option<PathBuf> {
     let app = app.upgrade()?;
     let app = app.read(cx);
@@ -228,6 +298,10 @@ impl WorkspacePropertySource for FileTreeSource {
                     // 同根 (⟳ 刷新): 保留旧树直到新扫描落地
                 }
             }
+            // 显式 refresh 入口必使代数 +1 (design D5): 根变化/规则变化/
+            // 显式刷新三个失效源都经此; 同根同规则的 ⟳ 也失效 —
+            // 用户可见的逃生舱 (Risks: manual refresh always bumps)。
+            guard.bump();
         }
         let Some(root) = root else { return };
 
@@ -246,27 +320,34 @@ impl WorkspacePropertySource for FileTreeSource {
             app.update(cx, |app, cx| app.notify_panels(cx)).ok();
         });
         self._refresh_task = Some(task);
+        #[cfg(test)]
+        self.scan_starts.set(self.scan_starts.get() + 1);
+    }
+
+    fn refresh_if_needed(&mut self, cx: &mut App) {
+        // 通知路径 (design D6; spec: In-flight scan is not restarted by
+        // notifications): 期望根 == 源当前根 (已落地**或扫描在途** —
+        // root 在 refresh 入口即写入) → 无失效事件: 早退 — 不读规则盘、
+        // 不取消在途扫描 (spec: notification O(1), no disk reads)。
+        // 降级态同根也不自动重试 — 只有 ⟳ / 根再变才重扫。
+        let expected = resolve_active_root(&self.app, cx);
+        {
+            let guard = self.inner.lock().expect("source inner lock");
+            if guard.root == expected {
+                return;
+            }
+        }
+        // 首载 (None→Some) / 根变化 / 清空 (Some→None) → 强制重扫
+        self.refresh(cx);
+    }
+
+    fn view_generation(&self) -> u64 {
+        self.inner.lock().expect("source inner lock").generation
     }
 
     fn view(&self) -> SourceView {
-        let guard = self.inner.lock().expect("source inner lock");
-        if let Some(message) = &guard.degraded {
-            return SourceView::Degraded {
-                root: guard.root.clone().expect("degraded implies root"),
-                message: message.clone(),
-            };
-        }
-        match (&guard.root, &guard.canonical) {
-            (Some(root), Some(node)) => {
-                let ruleset = Ruleset::compile(&guard.rules);
-                SourceView::Tree {
-                    root: root.clone(),
-                    node: filter_tree(node, &node.id, &ruleset),
-                    rules: guard.rules.clone(),
-                }
-            }
-            _ => SourceView::Empty,
-        }
+        // 代数缓存 (design D5): 未失效 → 直接返回缓存 (零过滤)
+        self.inner.lock().expect("source inner lock").view()
     }
 
     fn menu(&self, _item_id: &str) -> Vec<MenuDesc> {
@@ -404,6 +485,57 @@ mod tests {
         std::fs::write(&file, "x").unwrap();
         assert!(scan_root(&file).is_err());
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn view_cache_hits_on_unchanged_generation() {
+        // task 4.1 (spec: Unchanged view serves from cache): 代数未变的
+        // 两次 view() 第二次走缓存 — filter_runs (过滤路径 spy) 不增。
+        let root = temp_root("cache");
+        touch(&root.join("src/main.rs"));
+        touch(&root.join("notes.log"));
+        let tree = scan_root(&root).expect("root 可读");
+
+        let mut inner = SourceInner::default();
+        inner.canonical = Some(tree);
+        inner.root = Some(root.clone());
+        inner.rules = vec!["*.log".to_string()];
+        inner.generation = 1;
+
+        // 首取: 计算一次 (规则 *.log 生效)
+        let v1 = inner.view();
+        assert_eq!(inner.filter_runs, 1, "首 view 必须重过滤");
+        let SourceView::Tree { node, .. } = &v1 else {
+            panic!("有权威树应得 Tree 视图");
+        };
+        assert!(find(&node.children, "notes.log").is_none(), "*.log 被过滤");
+        assert!(find(&node.children, "src").is_some());
+
+        // 同代数再取: 缓存命中, 不再过滤
+        let v2 = inner.view();
+        assert_eq!(inner.filter_runs, 1, "同代数必须走缓存 (不重过滤)");
+        assert_eq!(v1, v2, "缓存视图与首算视图一致");
+
+        // 代数推进 (扫描落地/规则变化/显式刷新) → 重算一次
+        inner.generation += 1;
+        let v3 = inner.view();
+        assert_eq!(inner.filter_runs, 2, "代数变化必须重过滤");
+        assert_eq!(v1, v3, "输入未变时重算结果一致 (非陈旧缓存)");
+
+        // 代数再推进 + 规则变化 → 新过滤结果 (非陈旧)
+        inner.generation += 1;
+        inner.rules = Vec::new();
+        let v4 = inner.view();
+        assert_eq!(inner.filter_runs, 3, "规则变化后重过滤");
+        let SourceView::Tree { node, .. } = &v4 else {
+            panic!("应得 Tree 视图");
+        };
+        assert!(
+            find(&node.children, "notes.log").is_some(),
+            "清空规则后文件回来 (缓存不得陈旧)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

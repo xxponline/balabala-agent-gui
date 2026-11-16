@@ -16,9 +16,10 @@
 //! 重建都不丢展开；同步时按新树裁剪陈旧 id。
 
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use gpui_kit::base::TestTextExt;
-use gpui_kit::component::dock::{BasePanel, Panel, PanelEvent};
+use gpui_kit::component::dock::{BasePanel, DockPlacement, Panel, PanelEvent};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::tree::{TreeEvent, TreeItem, TreeState, tree};
@@ -27,8 +28,8 @@ use gpui_kit::*;
 use crate::app::TerminalApp;
 use crate::workspace::store;
 use crate::workspace_property_source::{
-    create_source, resolve_active_root, SourceEffect, SourceNode, SourceNodeKind, SourceView,
-    WorkspacePropertySource, DEFAULT_SOURCE_ID,
+    create_source, SourceEffect, SourceNode, SourceNodeKind, SourceView, WorkspacePropertySource,
+    DEFAULT_SOURCE_ID,
 };
 
 pub struct TreePanel {
@@ -42,9 +43,14 @@ pub struct TreePanel {
     /// 展开态集合（design D4：UI 状态不跨数据源边界）。
     expanded: HashSet<String>,
     /// 全部目录 id（`is_folder()` 对空目录为 false → 图标/chevron 兜底）。
-    dir_ids: HashSet<String>,
+    /// Rc 包裹: render 每帧只需引用计数 +1 — 不做整集合克隆
+    /// (spec: Keystrokes do not pay tree cost)。
+    dir_ids: Rc<HashSet<String>>,
     /// 最近一次同步进 `tree_state` 的视图（render 读缓存，避免每帧克隆）。
     last_synced: Option<SourceView>,
+    /// 最近同步的视图代数 (design D5): epoch 相等比对替代整树深比较 —
+    /// 代数未变的通知零工作 (spec: Data-change notification is O(1))。
+    last_generation: Option<u64>,
     /// `TreeEvent` 订阅（drop 即退订 → 必须存住）。
     _tree_events: Subscription,
 }
@@ -71,8 +77,9 @@ impl TreePanel {
             source,
             tree_state,
             expanded: HashSet::new(),
-            dir_ids: HashSet::new(),
+            dir_ids: Rc::new(HashSet::new()),
             last_synced: None,
+            last_generation: None,
             _tree_events: tree_events,
         }
     }
@@ -85,31 +92,49 @@ impl TreePanel {
         cx: &mut Context<Self>,
     ) {
         self.source = source;
+        self.last_synced = None;
+        self.last_generation = None; // 换源 → epoch 重新对齐 (防代数巧合命中)
         self.on_data_changed(cx);
     }
 
     /// 数据变化入口（app 的 `notify_panels` 转发名单对树面板调用）：
-    /// 1. **重扫粒度 = 根路径变化**（spec: 同 workspace 切 agent 不重扫）；
-    /// 2. 拉视图 →（有变化时）推入 `TreeState` → 重渲。
+    /// 0. **可见性闸门**（design D7; spec: Tree panel skips work while not
+    ///    rendered）：右 dock 关闭 → 面板未渲染 → 触碰源之前早退；
+    /// 1. **重扫粒度 = 根路径变化**（spec: 同 workspace 切 agent 不重扫;
+    ///    D6: 在途扫描的根也算当前根 → 通知不重启扫描，比对收敛在源侧
+    ///    `refresh_if_needed`）；
+    /// 2. **epoch 比对**（design D5）：代数未变 → 零工作（无视图克隆、
+    ///    无整树深比较）；变化才 `view()` → 推入 `TreeState` → 重渲。
     pub(crate) fn on_data_changed(&mut self, cx: &mut Context<Self>) {
-        // 比对"期望根 (活动 workspace)"与"源当前根": 变了才触发 part1 重扫;
-        // 降级态 (根已知但不可读) 不自动重试 — 只有 ⟳ / 根再变才重扫。
-        let expected = resolve_active_root(&self.app, cx);
-        let current = self
-            .last_synced
-            .as_ref()
-            .and_then(|view| view.root())
-            .map(std::path::Path::to_path_buf);
-        if expected != current {
-            self.source.refresh(cx);
+        if !self.right_dock_open(cx) {
+            return; // 隐藏期间的通知零源工作 (spec: Hidden panel costs nothing)
         }
-        let view = self.source.view();
-        let changed = self.last_synced.as_ref() != Some(&view);
-        if changed {
+        self.source.refresh_if_needed(cx);
+        self.sync_if_generation_changed(cx);
+        cx.notify();
+    }
+
+    /// 右 dock 是否开着（6.1 闸门依据）：dock 关闭 = 面板未渲染；
+    /// app 实体已释放也按未渲染处理。
+    fn right_dock_open(&self, cx: &App) -> bool {
+        self.app.upgrade().is_some_and(|app| {
+            app.read(cx)
+                .dock_area
+                .read(cx)
+                .is_dock_open(DockPlacement::Right)
+        })
+    }
+
+    /// epoch 同步（design D5/D7，`on_data_changed` 与 render 惰性检查
+    /// 共用）：代数变化才拉视图 → 推入 `TreeState`。
+    fn sync_if_generation_changed(&mut self, cx: &mut Context<Self>) {
+        let generation = self.source.view_generation();
+        if self.last_generation != Some(generation) {
+            let view = self.source.view();
             self.sync_tree(&view, cx);
             self.last_synced = Some(view);
+            self.last_generation = Some(generation);
         }
-        cx.notify();
     }
 
     /// DTO → `TreeItem` 推入（适配器核心，design D3）：
@@ -130,7 +155,7 @@ impl TreePanel {
             _ => (Vec::new(), HashSet::new(), HashSet::new()),
         };
         self.expanded.retain(|id| all_ids.contains(id)); // 刷新后裁剪
-        self.dir_ids = dirs;
+        self.dir_ids = Rc::new(dirs);
         self.tree_state
             .update(cx, |state, cx| state.set_items(items, cx));
     }
@@ -220,6 +245,10 @@ impl Focusable for TreePanel {
 
 impl Render for TreePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 惰性 epoch 检查 (design D7; spec: Reopening the dock shows the
+        // current tree): 隐藏期间错过的失效在渲染路径补同步 — 重开 dock
+        // 即显示最后失效时的内容, 不因曾隐藏而重扫。
+        self.sync_if_generation_changed(cx);
         let app_refocus = self.app.clone();
         let title = self.source.name().to_string();
         // 只读规则摘要 (spec: header chrome; 数据来自源当前生效规则)
@@ -451,10 +480,15 @@ mod tests {
     use std::rc::Rc;
 
     /// 返回嵌套固定树的 stub 源 — 面板只经 trait 边界消费数据。
-    /// `opens` 记录 open 钩子调用次数 (task 4.1 断言); `app` 供与真实源
-    /// 同款的 `open_object` 分发 (stub 也走真实链路)。
+    /// `opens` 记录 open 钩子调用次数 (task 4.1 断言); `views` 记录
+    /// `view()` 调用次数 (task 4.2 spy: epoch 未变的通知不得拉视图);
+    /// `app` 供与真实源同款的 `open_object` 分发 (stub 也走真实链路)。
     struct StubSource {
         opens: Rc<Cell<usize>>,
+        views: Rc<Cell<usize>>,
+        /// `refresh`/`refresh_if_needed` 调用计数 (task 6.1 spy:
+        /// 隐藏期间的通知不得触碰源)。
+        refreshes: Rc<Cell<usize>>,
         app: gpui_kit::WeakEntity<TerminalApp>,
     }
 
@@ -501,8 +535,19 @@ mod tests {
         fn name(&self) -> &str {
             "stub-tree"
         }
-        fn refresh(&mut self, _cx: &mut App) {}
+        fn refresh(&mut self, _cx: &mut App) {
+            self.refreshes.set(self.refreshes.get() + 1);
+        }
+        fn refresh_if_needed(&mut self, _cx: &mut App) {
+            // 无内部状态: 通知无需重扫 (与真实源的同根早退同效);
+            // 计数仅为 6.1 闸门 spy (调用本身即"源工作")
+            self.refreshes.set(self.refreshes.get() + 1);
+        }
+        fn view_generation(&self) -> u64 {
+            0 // 视图恒定 → 代数恒定 (面板只同步首次)
+        }
         fn view(&self) -> SourceView {
+            self.views.set(self.views.get() + 1);
             stub_tree()
         }
         fn menu(&self, _item_id: &str) -> Vec<MenuDesc> {
@@ -581,6 +626,8 @@ mod tests {
         let weak_app = cx.update(|_| app.downgrade());
         let source = StubSource {
             opens: opens.clone(),
+            views: Rc::new(Cell::new(0)),
+            refreshes: Rc::new(Cell::new(0)),
             app: weak_app,
         };
         let tree = cx.update(|cx| app.read(cx).tree.clone());
@@ -1157,6 +1204,291 @@ mod tests {
             source.execute("/a/proj/main.rs", "unknown-func").is_empty(),
             "未知功能 → 无效果"
         );
+    }
+
+    /// task 4.2 (spec: Data-change notification is O(1) when nothing
+    /// changed / Unchanged view serves from cache): epoch 未变的通知
+    /// 不得拉视图 — `StubSource.view` 计数 spy。set_source 同步恰一次;
+    /// 之后 5 次 `notify_panels` 计数不动 (旧实现每次通知都 view() +
+    /// 整树深比较 → 计数随通知增长)。
+    #[gpui_kit::test]
+    fn unchanged_epoch_notification_does_not_rebuild_view(cx: &mut TestAppContext) {
+        let (handle, app_entity) = open_app(cx);
+        let opens = Rc::new(Cell::new(0));
+        let views = Rc::new(Cell::new(0));
+        let refreshes = Rc::new(Cell::new(0));
+        let weak_app = cx.update(|_| app_entity.downgrade());
+        let source = StubSource {
+            opens: opens.clone(),
+            views: views.clone(),
+            refreshes: refreshes.clone(),
+            app: weak_app,
+        };
+        let tree = cx.update(|cx| app_entity.read(cx).tree.clone());
+        tree.update(cx, |panel, cx| panel.set_source(Box::new(source), cx));
+        cx.run_until_parked();
+
+        assert_eq!(views.get(), 1, "set_source 首次同步恰拉一次视图");
+        for _ in 0..5 {
+            app_entity.update(cx, |app, cx| app.notify_panels(cx));
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            views.get(),
+            1,
+            "epoch 未变的 5 次通知一次都不得重建视图 (spec: O(1) notification)"
+        );
+
+        // 未重建不等于不渲染: 面板仍从缓存出内容 (spec: cached view
+        // still renders the same content)
+        render(handle, cx);
+        cx.update_window(handle, |_, window, _cx| {
+            assert!(
+                window.try_find_by_label("stub-top.rs").is_some(),
+                "缓存视图照常渲染"
+            );
+        })
+        .expect("update window");
+    }
+
+    /// task 5.1+5.2 (spec: In-flight scan is not restarted by
+    /// notifications): 扫描在途期间的连续数据通知 — 恰一次扫描、代数
+    /// 不动; 随后 pump 扫描单次落地并上屏 (Typing during initial scan
+    /// lets it finish — 原实现每帧重启扫描 → 本测红)。
+    #[gpui_kit::test]
+    fn notifications_during_inflight_scan_start_exactly_one_scan(cx: &mut TestAppContext) {
+        use crate::workspace_property_source::filetree::FileTreeSource;
+        let (handle, app) = open_app(cx);
+        let ws = temp_ws("slowscan");
+        std::fs::write(ws.join("slow-a.txt"), "x").unwrap();
+
+        let weak = cx.update(|_| app.downgrade());
+        let source = FileTreeSource::new(weak, PathBuf::from("/nonexistent-filetree-rules"));
+        let scans = source.scan_starts_handle();
+        let tree = cx.update(|cx| app.read(cx).tree.clone());
+        tree.update(cx, |panel, cx| panel.set_source(Box::new(source), cx));
+
+        // 激活 → 首次通知 (defer 于 update finish flush) → refresh 启动
+        // 扫描; 不 pump → 后台扫描保持在途 (TestDispatcher 显式 tick)
+        app.update(cx, |app, cx| {
+            app.workspaces.push(Workspace::new(ws.clone()));
+            let agent = cx.new(|_| AgentSession(Box::new(FakeAgent::new("pi-1", &ws))));
+            let id = agent.entity_id();
+            app.workspaces
+                .last_mut()
+                .expect("注入的 workspace")
+                .agents
+                .push(agent);
+            app.active = Some(id);
+            app.notify_panels(cx);
+        });
+        assert_eq!(scans.get(), 1, "首载恰启动一次扫描");
+        let (gen_inflight, view) = cx.update(|cx| {
+            let panel = app.read(cx).tree.read(cx);
+            (panel.source.view_generation(), panel.source.view())
+        });
+        assert!(
+            matches!(view, SourceView::Empty),
+            "扫描在途: 尚未落地 (view = Empty)"
+        );
+
+        // 在途期间的连续帧 (打字消费): 5 次数据通知
+        for _ in 0..5 {
+            tree.update(cx, |panel, cx| panel.on_data_changed(cx));
+        }
+        assert_eq!(scans.get(), 1, "在途扫描不得被通知重启 (恰一次, 5.1)");
+        let gen_after = cx.update(|cx| app.read(cx).tree.read(cx).source.view_generation());
+        assert_eq!(gen_after, gen_inflight, "通知未触发 refresh (代数不动)");
+
+        // pump → 扫描单次落地 (5.2) → 内容上屏
+        cx.run_until_parked();
+        assert_eq!(scans.get(), 1, "落地不增扫描数 (single completion)");
+        render(handle, cx);
+        cx.update_window(handle, |_, window, _cx| {
+            assert!(
+                window.try_find_by_label("slow-a.txt").is_some(),
+                "扫描落地后文件上屏"
+            );
+        })
+        .expect("update window");
+    }
+
+    /// spec scenario Explicit refresh still restarts: 在途扫描期间的
+    /// 显式刷新 (⟳ 处理器同路径 `source.refresh`) 必须启动新扫描 —
+    /// 通知幂等 (refresh_if_needed) 不影响显式路径。
+    #[gpui_kit::test]
+    fn explicit_refresh_restarts_inflight_scan(cx: &mut TestAppContext) {
+        use crate::workspace_property_source::filetree::FileTreeSource;
+        let (handle, app) = open_app(cx);
+        let ws = temp_ws("explicit-restart");
+        std::fs::write(ws.join("restart-a.txt"), "x").unwrap();
+
+        let weak = cx.update(|_| app.downgrade());
+        let source = FileTreeSource::new(weak, PathBuf::from("/nonexistent-filetree-rules"));
+        let scans = source.scan_starts_handle();
+        let tree = cx.update(|cx| app.read(cx).tree.clone());
+        tree.update(cx, |panel, cx| panel.set_source(Box::new(source), cx));
+        app.update(cx, |app, cx| {
+            app.workspaces.push(Workspace::new(ws.clone()));
+            let agent = cx.new(|_| AgentSession(Box::new(FakeAgent::new("pi-1", &ws))));
+            let id = agent.entity_id();
+            app.workspaces
+                .last_mut()
+                .expect("注入的 workspace")
+                .agents
+                .push(agent);
+            app.active = Some(id);
+            app.notify_panels(cx);
+        });
+        assert_eq!(scans.get(), 1, "首载扫描在途");
+
+        // 显式刷新 → 必须重启 (新扫描取代在途旧扫描)
+        tree.update(cx, |panel, cx| panel.source.refresh(cx));
+        assert_eq!(scans.get(), 2, "显式刷新在在途期间仍启动新扫描 (spec)");
+
+        cx.run_until_parked();
+        assert_eq!(scans.get(), 2, "新扫描单次落地");
+        render(handle, cx);
+        cx.update_window(handle, |_, window, _cx| {
+            assert!(
+                window.try_find_by_label("restart-a.txt").is_some(),
+                "重启后的扫描内容上屏"
+            );
+        })
+        .expect("update window");
+    }
+
+    /// task 6.1 (spec: Hidden panel costs nothing per frame): 右 dock
+    /// 关闭期间的数据通知不得触碰源 — refresh/view spy 计数均不动;
+    /// 重开后缓存视图照常渲染且不触发刷新 (spec: Rendering again shows
+    /// the current cached view without requiring a rescan)。
+    #[gpui_kit::test]
+    fn hidden_panel_notifications_do_no_source_work(cx: &mut TestAppContext) {
+        let (handle, app_entity) = open_app(cx);
+        let opens = Rc::new(Cell::new(0));
+        let views = Rc::new(Cell::new(0));
+        let refreshes = Rc::new(Cell::new(0));
+        let weak_app = cx.update(|_| app_entity.downgrade());
+        let source = StubSource {
+            opens: opens.clone(),
+            views: views.clone(),
+            refreshes: refreshes.clone(),
+            app: weak_app,
+        };
+        let tree = cx.update(|cx| app_entity.read(cx).tree.clone());
+        tree.update(cx, |panel, cx| panel.set_source(Box::new(source), cx));
+        render(handle, cx); // 可见状态: tree-close 按钮在帧中
+
+        // 关闭右 dock (× → close_right_dock); 再渲一帧确认面板未渲染
+        cx.update_window(handle, |_, window, cx| {
+            window.click("tree-close".to_string(), cx)
+        })
+        .expect("update window");
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("update window");
+        cx.update_window(handle, |_, window, _cx| {
+            assert!(
+                window.try_find("tree-root").is_none(),
+                "dock 关闭 → 面板未渲染"
+            );
+        })
+        .expect("update window");
+
+        // 隐藏期间 5 次数据通知 → 零源工作 (闸门先于一切源调用)
+        let (v0, r0) = (views.get(), refreshes.get());
+        for _ in 0..5 {
+            app_entity.update(cx, |app, cx| app.notify_panels(cx));
+            cx.run_until_parked();
+        }
+        assert_eq!(views.get(), v0, "隐藏期间不得拉视图");
+        assert_eq!(refreshes.get(), r0, "隐藏期间不得触碰 refresh 路径");
+
+        // 重开 (toggle-dock:Right) → 渲染缓存内容, 不触发刷新/重扫
+        cx.update_window(handle, |_, window, cx| {
+            window.click("toggle-dock:Right".to_string(), cx)
+        })
+        .expect("update window");
+        render(handle, cx);
+        cx.update_window(handle, |_, window, _cx| {
+            assert!(
+                window.try_find_by_label("stub-top.rs").is_some(),
+                "重开显示缓存视图"
+            );
+        })
+        .expect("update window");
+        assert_eq!(refreshes.get(), r0, "重开不触发源刷新 (无重扫)");
+        assert_eq!(views.get(), v0, "epoch 未变: 重开渲染不重拉视图");
+    }
+
+    /// task 6.2 (spec: Reopening the dock shows the current tree): 隐藏
+    /// 期间落地的扫描推进代数但通知被闸门拦下; 重开渲染的惰性 epoch
+    /// 检查补同步 → 最后失效时的内容上屏, 且不因曾隐藏而重扫。
+    #[gpui_kit::test]
+    fn reopen_after_hidden_shows_landed_scan_without_rescan(cx: &mut TestAppContext) {
+        use crate::workspace_property_source::filetree::FileTreeSource;
+        let (handle, app) = open_app(cx);
+        let ws = temp_ws("reopen");
+        std::fs::write(ws.join("reopen-a.txt"), "x").unwrap();
+
+        // 注入 + 激活, 不 pump → 首扫在途 (TestDispatcher 显式 tick)
+        let weak = cx.update(|_| app.downgrade());
+        let source = FileTreeSource::new(weak, PathBuf::from("/nonexistent-filetree-rules"));
+        let scans = source.scan_starts_handle();
+        let tree = cx.update(|cx| app.read(cx).tree.clone());
+        tree.update(cx, |panel, cx| panel.set_source(Box::new(source), cx));
+        app.update(cx, |app, cx| {
+            app.workspaces.push(Workspace::new(ws.clone()));
+            let agent = cx.new(|_| AgentSession(Box::new(FakeAgent::new("pi-1", &ws))));
+            let id = agent.entity_id();
+            app.workspaces
+                .last_mut()
+                .expect("注入的 workspace")
+                .agents
+                .push(agent);
+            app.active = Some(id);
+            app.notify_panels(cx);
+        });
+        assert_eq!(scans.get(), 1, "首扫在途");
+
+        // 渲染一帧 (空态) → 关闭 dock → 确认面板未渲染 (扫描仍在途)
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("update window");
+        cx.update_window(handle, |_, window, cx| {
+            window.click("tree-close".to_string(), cx)
+        })
+        .expect("update window");
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("update window");
+        cx.update_window(handle, |_, window, _cx| {
+            assert!(window.try_find("tree-root").is_none(), "dock 关闭 → 未渲染");
+        })
+        .expect("update window");
+
+        // 隐藏期间: 新文件落盘 + pump → 扫描落地 (代数推进),
+        // 落地通知被闸门拦下 → 面板代数仍停在隐藏前
+        std::fs::write(ws.join("reopen-b.txt"), "x").unwrap();
+        cx.run_until_parked();
+        assert_eq!(scans.get(), 1, "落地不启动新扫描");
+
+        // 重开 → 渲染路径惰性 epoch 检查 → 最后失效时的内容上屏
+        cx.update_window(handle, |_, window, cx| {
+            window.click("toggle-dock:Right".to_string(), cx)
+        })
+        .expect("update window");
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("update window");
+        cx.update_window(handle, |_, window, _cx| {
+            assert!(
+                window.try_find_by_label("reopen-a.txt").is_some(),
+                "重开显示最后失效时的树"
+            );
+            assert!(
+                window.try_find_by_label("reopen-b.txt").is_some(),
+                "隐藏期间落地的扫描内容也在 (epoch 补同步)"
+            );
+        })
+        .expect("update window");
+        assert_eq!(scans.get(), 1, "重开不因曾隐藏而重扫 (spec: no rescan)");
     }
 
     #[gpui_kit::test]

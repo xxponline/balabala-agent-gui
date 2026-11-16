@@ -15,6 +15,7 @@ use gpui_kit::component::dock::{BasePanel, Panel, PanelEvent};
 use gpui_kit::*;
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Mutex;
 use vt100::Screen;
 
 use crate::agent_entities::SessionStatus;
@@ -69,9 +70,56 @@ fn keystroke_to_keyevents(key: &str, key_char: Option<&str>) -> Vec<crossterm::e
     vec![]
 }
 
-/// 网格字体 (与 row/segment 的 text_size 同源)。
-const GRID_FONT_FAMILY: &str = "Menlo";
+/// 网格等宽字体候选表 (change fix-windows-font-drift-and-input-lag, D1):
+/// 按平台优先级排序, 取宿主实际安装的第一个。Menlo 仅 macOS 自带; Windows
+/// 上缺 Menlo 时 gpui 按字形回退到非等宽字体 → cell_w 与实际 advance 不
+/// 一致 → 行内漂移 (本次修复的根因)。
+const GRID_FONT_FALLBACKS: &[&str] = &[
+    "Menlo",            // macOS 自带等宽
+    "Cascadia Mono",    // Windows 10+ 自带
+    "Consolas",         // Windows 长期自带 (Office/.NET 捆绑)
+    "Ubuntu Sans Mono", // Linux 常见
+    "DejaVu Sans Mono", // Linux 通用兜底
+];
 const GRID_FONT_SIZE_PX: f32 = 13.;
+/// 等宽校验容差 (D2): 四类代表字形的 advance 极差超过此值 → 启动诊断。
+const MONOSPACE_TOLERANCE_PX: f32 = 0.5;
+
+/// 已解析字体缓存 (D1 "resolved once"): 运行期首个字体表非空的解析结果
+/// 进程级复用, 避免每帧枚举系统字体。测试构建 (cfg!(test)) 不读写 —
+/// mock 文本系统 (NoopTextSystem) 的字体表为空, 若落缓存会毒化同一测试
+/// 进程里后续的真实字体回归测试 (task 3.1)。
+static GRID_FONT_CACHE: Mutex<Option<SharedString>> = Mutex::new(None);
+/// 等宽校验去重 (D2): 每个字体族只在首次度量时校验一次。
+static GRID_FONT_VERIFIED: Mutex<Option<SharedString>> = Mutex::new(None);
+
+/// 网格字体唯一解析入口 (D1): 按 [`GRID_FONT_FALLBACKS`] 顺序取宿主已
+/// 安装的第一个候选; 字体表不可用/全部缺失时退回首候选 — 该退化情形由
+/// [`verify_grid_font_monospace`] 的启动诊断负责暴露 (D2, 永不硬失败)。
+/// `grid_metrics` 与 terminal_grid 行渲染共用此函数, 度量与绘制不可能分歧。
+fn grid_font_family(window: &Window) -> SharedString {
+    if !cfg!(test) {
+        if let Some(cached) = GRID_FONT_CACHE.lock().unwrap().clone() {
+            return cached;
+        }
+    }
+    let available = window.text_system().all_font_names();
+    let resolved: SharedString = pick_grid_font_family(&available).into();
+    if !cfg!(test) && !available.is_empty() {
+        *GRID_FONT_CACHE.lock().unwrap() = Some(resolved.clone());
+    }
+    resolved
+}
+
+/// 候选表选择 (纯函数, 单测入口): 字体表按序命中首个已安装候选;
+/// 空表 (mock/字体枚举不可用) 或全部缺失 → 首候选。
+fn pick_grid_font_family(available: &[String]) -> &'static str {
+    GRID_FONT_FALLBACKS
+        .iter()
+        .copied()
+        .find(|candidate| available.iter().any(|name| name.as_str() == *candidate))
+        .unwrap_or(GRID_FONT_FALLBACKS[0])
+}
 
 /// active 面板的状态数据 (拥有值; gpui 元素树要求 'static)。
 pub struct PaneData {
@@ -84,8 +132,8 @@ pub struct PaneData {
     pub grid: Div,
 }
 
-/// 没有 active session 时的居中占位。
-pub fn render_empty() -> Div {
+/// 没有 active session 时的居中占位 (`font` = 解析后的网格字体)。
+pub fn render_empty(font: &str) -> Div {
     div()
         .size_full()
         .flex()
@@ -93,7 +141,7 @@ pub fn render_empty() -> Div {
         .items_center()
         .justify_center()
         .gap_1()
-        .font_family("Menlo")
+        .font_family(font)
         .text_sm()
         .text_color(rgb(0x969696)) // 原版同款灰 (150,150,150)
         .child("no agent selected")
@@ -128,11 +176,11 @@ pub fn status_bar(data: &PaneData) -> Div {
 }
 
 /// `Starting` 状态的占位文本 (首个字节到达后消失)。
-pub fn starting_placeholder() -> Div {
+pub fn starting_placeholder(font: &str) -> Div {
     div()
         .px_3()
         .py_2()
-        .font_family("Menlo")
+        .font_family(font)
         // 浅色主题: 比原版的 (229,193,16) 更深的琥珀色才可读 (D9)
         .text_color(rgb(0x8f6f00))
         .child("waiting for pi to start...")
@@ -152,22 +200,31 @@ pub fn cell_width(window: &Window) -> Pixels {
 
 /// 网格度量: (单元格宽, 行高) — 自适应换算与渲染共享的唯一真相 (design D2)。
 ///
-/// 单元格宽 = Menlo 13px 的等宽 advance (排版取均值);
+/// 单元格宽 = 解析后网格字体 ([`grid_font_family`]) 13px 的等宽 advance
+/// (排版取均值); 首次度量时执行等宽校验 (design D2)。
 /// 行高 = 默认 line_height (phi×字号) 经 pixel_snap, 与 gpui 文本布局
 /// `plain_line_height` 同式 — 必须等于 terminal_grid 行的实际绘制高度,
 /// 否则 floor 换算会多算/少算一行 (单测断言二者相等)。
 /// 依赖排版缓存, 同一帧内重复调用返回相同值 (单测锁定)。
 pub fn grid_metrics(window: &Window) -> (Pixels, Pixels) {
     const SAMPLE: &str = "MMMMMMMMMM";
+    let family = grid_font_family(window);
+    verify_grid_font_monospace(window, &family);
     let runs = [TextRun {
         len: SAMPLE.len(),
-        font: font(GRID_FONT_FAMILY),
+        font: font(family),
         ..Default::default()
     }];
     let layout = window
         .text_system()
         .layout_line(SAMPLE.into(), px(GRID_FONT_SIZE_PX), &runs, None);
     let cell_w = px(f32::from(layout.width) / SAMPLE.len() as f32);
+    // D3 (task 2.1): 吸附到布局量化网格 — gpui 把盒宽/原点吸附到设备
+    // 像素 (window.pixel_snap 同式), 格宽若不落网上, 每个盒被独立取整:
+    // 宽字符段 (2×cell) 与单格段取整不一致 → 格边界错位 (漂移回来)。
+    // 吸附后 cols × cell_w 恒为设备像素整数倍 → 绘制位置恰为
+    // N × cell_w (±0.5px), 选区 overlay/自适应换算也同源对齐。
+    let cell_w = window.pixel_snap(cell_w);
     let mut style = TextStyle::default();
     style.font_size = AbsoluteLength::Pixels(px(GRID_FONT_SIZE_PX));
     let line_h = window.pixel_snap(
@@ -178,10 +235,67 @@ pub fn grid_metrics(window: &Window) -> (Pixels, Pixels) {
     (cell_w, line_h)
 }
 
+/// 等宽校验判定 (D2, 纯函数): 四类代表字形 (M/a/空格/—) 的 advance
+/// 极差 > 容差 → 返回点名字体与各字形 advance 的诊断文本; 否则 None
+/// (静默通过)。
+fn monospace_diagnostic(family: &str, samples: &[(char, f32)], tolerance: f32) -> Option<String> {
+    let mut iter = samples.iter().map(|&(_, advance)| advance);
+    let first = iter.next()?;
+    let (min, max) = iter.fold((first, first), |(min, max), a| (min.min(a), max.max(a)));
+    if max - min <= tolerance {
+        return None;
+    }
+    let list = samples
+        .iter()
+        .map(|(ch, a)| format!("{ch:?}={a:.2}px"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!(
+        "non-monospace grid font: {family:?} advance spread {:.2}px exceeds {tolerance}px tolerance at {}px: {list}",
+        max - min,
+        GRID_FONT_SIZE_PX
+    ))
+}
+
+/// 等宽校验: 量解析字体 13px 下 M/a/空格/— 的 advance 并判定 (返回
+/// 诊断文本; 等宽 → None)。与 Window 解耦 — 单测直接喂 stub 文本系统
+/// 走完整测量路径 (task 1.2)。
+fn grid_monospace_diagnostic(text_system: &TextSystem, family: &str) -> Option<String> {
+    let font_id = text_system.resolve_font(&font(family));
+    let samples: Vec<(char, f32)> = ['M', 'a', ' ', '—']
+        .into_iter()
+        .map(|ch| {
+            (
+                ch,
+                f32::from(text_system.layout_width(font_id, px(GRID_FONT_SIZE_PX), ch)),
+            )
+        })
+        .collect();
+    monospace_diagnostic(family, &samples, MONOSPACE_TOLERANCE_PX)
+}
+
+/// 启动等宽校验 (D2, spec: Resolved font verified as monospace): 首次
+/// 度量时执行 [`grid_monospace_diagnostic`], 有偏差 → eprintln! 诊断
+/// (点名字体与发散值); 每字体族只查一次, 只告警不硬失败。
+fn verify_grid_font_monospace(window: &Window, family: &SharedString) {
+    {
+        let mut done = GRID_FONT_VERIFIED.lock().unwrap();
+        if done.as_deref() == Some(family.as_str()) {
+            return;
+        }
+        *done = Some(family.clone());
+    }
+    if let Some(msg) = grid_monospace_diagnostic(window.text_system(), family) {
+        eprintln!("[terminal-grid] {msg}");
+    }
+}
+
 /// 一段同色 (fg, bg) 的连续单元格。固定宽度契约: 段宽 =
 /// `cols × cell_width`, 因此行总宽恒等于 `网格列数 × cell_width`。
+/// design D3: `cells` 逐格 (文本, 列宽) — 渲染成定宽内联格块, 字形
+/// 位置 = 格索引 × cell_w, 不随前导字形 advance 漂移 (task 2.1)。
 struct Segment {
-    text: String,
+    cells: Vec<(String, u16)>,
     fg: Rgba,
     bg: Rgba,
     /// 该段占的终端列数 (宽字符记 2)。
@@ -200,6 +314,8 @@ struct Segment {
 ///   光标视觉后移 (每个中文字 +1 个半角 cell)。独立成段后: 每字独占
 ///   2-cell 盒, 字起点间距 = 2×cell (标准全角字距), 文字段总宽 = 段
 ///   强制宽, 光标紧贴文字尾 (仅剩字形侧边距)。
+///   (D3 逐格定宽块落地后, 空隙累积已在块边界阻断 — 本捷径保留,由
+///    现有 CJK 场景测试锁定, task 2.2: keep/simplify。)
 fn build_grid(screen: &Screen) -> Vec<Vec<Segment>> {
     let (rows_nz, cols_nz) = screen.size();
     let (rows, cols) = (rows_nz.get(), cols_nz.get());
@@ -212,8 +328,11 @@ fn build_grid(screen: &Screen) -> Vec<Vec<Segment>> {
     for r in 0..rows {
         let mut segments: Vec<Segment> = Vec::new();
         let (mut cur_fg, mut cur_bg) = (default_fg, default_bg);
-        let mut cur_text = String::new();
+        let mut cur_cells: Vec<(String, u16)> = Vec::new();
         let mut cur_cols = 0u16;
+        // 待并空白列数 (字形不可见的 nbsp/空格) — 收段/遇可见格时一次性
+        // 入账为单条目 (卡顿修复: 逐格建元素是每帧构建成本主因)
+        let mut blank_run = 0u16;
 
         let mut c = 0u16;
         while c < cols {
@@ -240,9 +359,17 @@ fn build_grid(screen: &Screen) -> Vec<Vec<Segment>> {
                 std::mem::swap(&mut fg, &mut bg);
             }
 
-            if (fg, bg) != (cur_fg, cur_bg) && !cur_text.is_empty() {
+            // 空白格 (字形不可见) 并入待并空白段 — 典型终端屏多数格为
+            // 空白, 合并后渲染为单盒 (宽 = k × cell_w, 设备网格上精确);
+            // 记录文本 = k×nbsp, 测试按字符数推列 (task: 卡顿修复)。
+            let is_blank = text == "\u{00a0}" || text == " ";
+            if (fg, bg) != (cur_fg, cur_bg) && (!cur_cells.is_empty() || blank_run > 0) {
+                if blank_run > 0 {
+                    cur_cells.push(("\u{00a0}".repeat(blank_run as usize), blank_run));
+                    blank_run = 0;
+                }
                 segments.push(Segment {
-                    text: std::mem::take(&mut cur_text),
+                    cells: std::mem::take(&mut cur_cells),
                     fg: cur_fg,
                     bg: cur_bg,
                     cols: std::mem::take(&mut cur_cols),
@@ -250,23 +377,34 @@ fn build_grid(screen: &Screen) -> Vec<Vec<Segment>> {
             }
             cur_fg = fg;
             cur_bg = bg;
-            cur_text.push_str(text);
+            if is_blank {
+                blank_run += cols_here;
+            } else {
+                if blank_run > 0 {
+                    cur_cells.push(("\u{00a0}".repeat(blank_run as usize), blank_run));
+                    blank_run = 0;
+                }
+                cur_cells.push((text.to_string(), cols_here));
+            }
             cur_cols += cols_here;
             c += 1;
             // F2 修复: 宽字符立即独立成段 (见函数文档) — 否则同色合并段内
             // 文字按半角推进排不满全角段宽, 空隙随字数累积。
-            if cols_here == 2 && !cur_text.is_empty() {
+            if cols_here == 2 && !cur_cells.is_empty() {
                 segments.push(Segment {
-                    text: std::mem::take(&mut cur_text),
+                    cells: std::mem::take(&mut cur_cells),
                     fg: cur_fg,
                     bg: cur_bg,
                     cols: std::mem::take(&mut cur_cols),
                 });
             }
         }
-        if !cur_text.is_empty() {
+        if blank_run > 0 {
+            cur_cells.push(("\u{00a0}".repeat(blank_run as usize), blank_run));
+        }
+        if !cur_cells.is_empty() {
             segments.push(Segment {
-                text: cur_text,
+                cells: cur_cells,
                 fg: cur_fg,
                 bg: cur_bg,
                 cols: cur_cols,
@@ -275,6 +413,31 @@ fn build_grid(screen: &Screen) -> Vec<Vec<Segment>> {
         out.push(segments);
     }
     out
+}
+
+/// D3 定宽格块 (task 2.1): 盒宽 = cols × cell_w, 字形只落自己盒内 →
+/// 绘制位置 = 格索引 × cell_w, 前导字形 advance 无法累积漂移。
+/// 测试构建额外用 `test_text` 记录逐格绘制原点 (2.1/2.3 断言);
+/// 生产构建原样返回 — 不为测试锚点付出每格开销 (卡顿修复)。
+#[cfg(not(test))]
+fn grid_cell(text: String, cols: u16, cell_w: Pixels) -> Div {
+    div()
+        .flex_shrink_0()
+        .w(px(cols as f32 * f32::from(cell_w)))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .child(text)
+}
+
+#[cfg(test)]
+fn grid_cell(text: String, cols: u16, cell_w: Pixels) -> impl IntoElement {
+    div()
+        .flex_shrink_0()
+        .w(px(cols as f32 * f32::from(cell_w)))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .child(text.clone())
+        .test_text(text)
 }
 
 /// 构建 vt100 网格 (design D6; cell-width 重构见 change
@@ -299,7 +462,7 @@ pub fn terminal_grid(screen: &Screen, window: &Window, selection: Option<CellRan
         // 行按内容收窄 (否则 align-items: stretch 会把行拉满容器,
         // 行宽就不再等于列数 × cell_width, 契约不可观测)
         .items_start()
-        .font_family(GRID_FONT_FAMILY)
+        .font_family(grid_font_family(window))
         .text_size(px(GRID_FONT_SIZE_PX))
         .children(rows.into_iter().enumerate().map(|(r, segments)| {
             div()
@@ -314,9 +477,15 @@ pub fn terminal_grid(screen: &Screen, window: &Window, selection: Option<CellRan
                         .w(px(seg.cols as f32 * f32::from(cell_w)))
                         .overflow_hidden()
                         .whitespace_nowrap()
+                        .flex()
+                        .flex_row()
                         .text_color(seg.fg)
                         .bg(seg.bg)
-                        .child(seg.text)
+                        .children(
+                            seg.cells
+                                .into_iter()
+                                .map(|(text, cols)| grid_cell(text, cols, cell_w)),
+                        )
                 }))
         }))
         // 选区 overlay (task 2.1): 行之后追加 = 画在文本上层;
@@ -366,7 +535,7 @@ mod tests {
     //! 显式导入、不用 glob — 避免 `gpui_kit::*` 把 `#[test]` 宏遮蔽掉。
 
     use super::{
-        GRID_FONT_FAMILY, GRID_FONT_SIZE_PX, build_grid, cell_width, grid_metrics, terminal_grid,
+        GRID_FONT_SIZE_PX, build_grid, cell_width, grid_font_family, grid_metrics, terminal_grid,
     };
     use crate::ui::{bg_to_gpui, fg_to_gpui};
     use gpui_kit::test::TestWindowExt;
@@ -394,6 +563,24 @@ mod tests {
 
     fn row_sum(segs: &[super::Segment]) -> u16 {
         segs.iter().map(|s| s.cols).sum()
+    }
+
+    /// 段的拼接全文 (测试断言用; 生产渲染直接走 `cells` 逐格定宽块)。
+    fn seg_text(seg: &super::Segment) -> String {
+        seg.cells.iter().map(|(t, _)| t.as_str()).collect()
+    }
+
+    /// row r 的逐格绘制快照 (paint 顺序 = 列序)。D3 格块的 `test_text`
+    /// 记录 bounds — 仅 test-support 构建可取 (生产无此开销)。
+    fn row_cell_texts(
+        window: &Window,
+        r: usize,
+    ) -> Vec<gpui_kit::base::test_support::TextSnapshot> {
+        let row_id: gpui_kit::ElementId = ("grid-row", r).into();
+        gpui_kit::base::test_support::texts(window)
+            .into_iter()
+            .filter(|t| t.path().last() == Some(&row_id))
+            .collect()
     }
 
     // ---------- 纯数据 (build_grid) ----------
@@ -608,7 +795,7 @@ mod tests {
             assert_eq!(row_sum(segs), COLS, "row {r}: 段列数之和必须等于网格列数");
         }
         // 行 0 文本包含混合内容 (CJK 不被丢弃)
-        let text: String = rows[0].iter().map(|s| s.text.as_str()).collect();
+        let text: String = rows[0].iter().map(seg_text).collect();
         assert!(text.contains('\u{5e2e}'), "row0 text: {text:?}");
     }
 
@@ -627,7 +814,7 @@ mod tests {
             .expect("cursor 应产生反色段");
         assert_eq!(inv.cols, 2, "宽字符上的光标反色块必须占 2 格");
         assert_eq!(inv.fg, bg_to_gpui(vt100::Color::Default));
-        assert!(inv.text.contains('\u{4f60}'));
+        assert!(seg_text(inv).contains('\u{4f60}'));
     }
 
     #[test]
@@ -639,7 +826,7 @@ mod tests {
         // 续格不贡献宽度、不产生反色段; F2 修复后宽字符独立成段 ->
         // [你][余下 nbsp] 两段, 且无任何反色段 (光标在续格上不可见, 原行为)
         assert_eq!(rows[0].len(), 2, "宽字符独立成段, 续格不产生额外段");
-        assert_eq!(rows[0][0].text, "\u{4f60}");
+        assert_eq!(seg_text(&rows[0][0]), "\u{4f60}");
         assert_eq!(rows[0][0].cols, 2);
         assert!(
             !rows[0].iter().any(|s| s.bg == fg_to_gpui(vt100::Color::Default)),
@@ -657,11 +844,11 @@ mod tests {
         assert_eq!(parser.screen().cursor_position(), (0, 7));
         let rows = build_grid(parser.screen());
         let segs = &rows[0];
-        assert_eq!(segs[0].text, "\u{4f60}");
+        assert_eq!(seg_text(&segs[0]), "\u{4f60}");
         assert_eq!(segs[0].cols, 2, "宽字符独立成段 (2 列)");
-        assert_eq!(segs[1].text, "\u{597d}");
+        assert_eq!(seg_text(&segs[1]), "\u{597d}");
         assert_eq!(segs[1].cols, 2);
-        assert_eq!(segs[2].text, "abc");
+        assert_eq!(seg_text(&segs[2]), "abc");
         assert_eq!(segs[2].cols, 3);
         let before_cursor: u16 = segs[..3].iter().map(|s| s.cols).sum();
         assert_eq!(
@@ -706,6 +893,13 @@ mod tests {
         })
     }
 
+    // ---------- mock 文本系统下的 cell-width 契约 (task 3.2) ----------
+    // 以下测试跑在 NoopTextSystem (无头测试默认: 全 BMP 字形均匀
+    // 0.6em = 7.8px) 上 — 锁定的是 div 宽度契约/同帧稳定性/行高等
+    // 行为, 不对真实字体正确性提供任何判定 (spec: Mock-based tests are
+    // not treated as font evidence)。真实字体判定归
+    // `real_text_system_resolved_font_is_monospace` (task 3.1)。
+
     #[gpui_kit::test]
     fn cell_width_is_sane_and_stable_within_a_frame(cx: &mut TestAppContext) {
         let handle = open_grid(cx, parser_with(FIXTURE));
@@ -713,11 +907,12 @@ mod tests {
             window.render_frame(cx);
             let a = f32::from(cell_width(window));
             let b = f32::from(cell_width(window));
-            println!("cell_width(Menlo 13px) = {a}px (second call: {b}px)");
+            let family = grid_font_family(window);
+            println!("cell_width({family} 13px) = {a}px (second call: {b}px)");
             assert_eq!(a, b, "同一帧内两次测量必须一致");
             assert!(
                 (7.0..8.5).contains(&a),
-                "Menlo 13px 等宽 advance 应约为 7-8px, 得到 {a}"
+                "{family} 13px 等宽 advance 应约为 7-8px (mock 度量), 得到 {a}"
             );
         });
     }
@@ -765,6 +960,87 @@ mod tests {
             assert!(
                 (row_h - lh).abs() <= 0.51,
                 "line_h {lh} 应≈ 实际行高 {row_h}"
+            );
+        });
+    }
+
+    // ---------- D3 逐格定宽块位置 (task 2.1/2.3) ----------
+
+    /// task 2.1 (spec: No horizontal drift — position(N) == N × cell_w):
+    /// 混排行 (box-drawing 边框 + ASCII + 空格) 的每个格块绘制原点 =
+    /// 列索引 × cell_w (±0.5px); 框线两端落在同一列 → 矩形。
+    #[gpui_kit::test]
+    fn cell_positions_equal_column_index_times_cell_width(cx: &mut TestAppContext) {
+        // 两行混排: ┌ab ──┐ / └  ──┘ xy (box-drawing + ASCII + 空格)
+        let input = "\u{250c}ab \u{2500}\u{2500}\u{2510}\r\n\u{2514}  \u{2500}\u{2518} xy";
+        let handle = open_grid(cx, parser_with(input));
+        let _ = cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let cell_w = f32::from(cell_width(window));
+            for r in 0..2 {
+                let cells = row_cell_texts(window, r);
+                let row_x =
+                    f32::from(window.find(("grid-row", r)).bounds().origin.x);
+                // 逐记录推列: 可见格文本 1 字符 (fixture 无宽字符);
+                // 空白盒文本 = k×nbsp → 覆盖 k 列 (空白已合并为单盒)
+                let mut col = 0usize;
+                for t in cells.iter() {
+                    let x = f32::from(t.bounds().origin.x) - row_x;
+                    assert!(
+                        (x - col as f32 * cell_w).abs() <= 0.5,
+                        "row {r} col {col}: 绘制原点 {x:.2}px != {col} × cell_w ({:.2}px)",
+                        col as f32 * cell_w
+                    );
+                    col += t.text().chars().count();
+                }
+                assert_eq!(col, usize::from(COLS), "row {r}: 记录覆盖全部列");
+            }
+            // 框线矩形: ┌/┐ 同行两端 — ┐ 在 col6, 位置由上循环锁定
+            let row0 = row_cell_texts(window, 0);
+            assert_eq!(row0[0].text(), "\u{250c}", "左框线在 col0");
+            assert_eq!(row0[6].text(), "\u{2510}", "右框线在 col6");
+        });
+    }
+
+    /// task 2.3 (spec scenario: Cursor stays glued to typed text): 输入
+    /// "abc" 后光标停在 col3 — 反色块 (光标格盒) 必须从 3 × cell_w
+    /// 开始, 恰在最后一个字符后一格, 无空隙。
+    #[gpui_kit::test]
+    fn cursor_block_starts_one_cell_after_typed_text(cx: &mut TestAppContext) {
+        let parser = parser_with("abc");
+        assert_eq!(
+            parser.screen().cursor_position(),
+            (0, 3),
+            "光标紧跟文字尾 (abc 后一格)"
+        );
+        let handle = open_grid(cx, parser);
+        let _ = cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let cells = row_cell_texts(window, 0);
+            let cell_w = f32::from(cell_width(window));
+            let row_x = f32::from(window.find(("grid-row", 0usize)).bounds().origin.x);
+            // 逐记录推列 (可见格 1 字符; 空白盒 = k×nbsp); 光标盒在 col3
+            let mut col = 0usize;
+            let mut cursor_x = None;
+            for t in cells.iter() {
+                let x = f32::from(t.bounds().origin.x) - row_x;
+                assert!(
+                    (x - col as f32 * cell_w).abs() <= 0.5,
+                    "col {col}: {x:.2}px != {col} × cell_w"
+                );
+                if col == 3 {
+                    // 光标格 (空 cell → nbsp, bg/fg 互换); 其盒即反色块本体
+                    assert_eq!(t.text(), "\u{00a0}", "col3 = 光标空格盒");
+                    cursor_x = Some(x);
+                }
+                col += t.text().chars().count();
+            }
+            assert_eq!(col, usize::from(COLS), "记录覆盖全部列");
+            let cursor_x = cursor_x.expect("光标盒记录在场");
+            assert!(
+                (cursor_x - 3.0 * cell_w).abs() <= 0.5,
+                "反色块必须从 3 × cell_w = {:.2}px 开始 (紧贴文字尾), 得 {cursor_x:.2}px",
+                3.0 * cell_w
             );
         });
     }
@@ -847,7 +1123,7 @@ mod tests {
                 "  x {x:6.1}..{:<6.1} cols={} text={:?} bg={:?}",
                 x + w,
                 seg.cols,
-                seg.text,
+                seg_text(seg),
                 seg.bg
             );
             x += w;
@@ -996,7 +1272,7 @@ mod tests {
                 for (len_label, run_len) in [("bytes", sample.len()), ("chars", sample.chars().count())] {
                     let runs = [TextRun {
                         len: run_len,
-                        font: font(GRID_FONT_FAMILY),
+                        font: font(grid_font_family(window)),
                         ..Default::default()
                     }];
                     let layout = window
@@ -1028,7 +1304,7 @@ mod tests {
     fn cjk_rendered_width_hug_div(cx: &mut TestAppContext) {
         struct Probe;
         impl Render for Probe {
-            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
                 div()
                     .size_full()
                     .flex()
@@ -1038,7 +1314,7 @@ mod tests {
                         div()
                             .id("probe-cjk")
                             .test_support()
-                            .font_family(GRID_FONT_FAMILY)
+                            .font_family(grid_font_family(window))
                             .text_size(px(GRID_FONT_SIZE_PX))
                             .child("你好你好你好"),
                     )
@@ -1073,6 +1349,201 @@ mod tests {
             6.0 * 7.8
         );
         let _ = cell;
+    }
+
+    /// task 1.1 (D1): 字体解析唯一入口 — 选择逻辑 + 源码形状锁定:
+    /// pane 内 font()/.font_family() 不得再接字体族字符串字面量,
+    /// 字体族只能来自 grid_font_family → pick_grid_font_family → 候选表。
+    #[test]
+    fn grid_font_resolution_is_the_only_font_source() {
+        // 选择逻辑: 空表/全缺 → 首候选; 表内按序取首个已安装者
+        assert_eq!(super::pick_grid_font_family(&[]), "Menlo");
+        assert_eq!(super::pick_grid_font_family(&["Arial".to_string()]), "Menlo");
+        assert_eq!(
+            super::pick_grid_font_family(&["Consolas".to_string(), "Arial".to_string()]),
+            "Consolas",
+            "排在 Menlo 之后的候选在 Menlo 缺席时应命中"
+        );
+        assert_eq!(
+            super::pick_grid_font_family(&["Menlo".to_string(), "Consolas".to_string()]),
+            "Menlo",
+            "按候选表顺序取首个已安装者"
+        );
+
+        // 源码形状: 调用点写死字面量 (历史 "Menlo" 回归) 时此测红
+        let c = '"';
+        let font_lit = format!("font({c}");
+        let family_lit = format!(".font_family({c}");
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/pane/mod.rs"))
+            .expect("读取 pane 源码");
+        assert!(
+            !src.contains(&font_lit),
+            "font() 不得接字体族字面量 (唯一来源应为 grid_font_family): {font_lit}"
+        );
+        assert!(
+            !src.contains(&family_lit),
+            ".font_family() 不得接字体族字面量: {family_lit}"
+        );
+    }
+
+    /// task 1.2 (D2): 等宽校验 — 四类字形 advance 极差超容差触发诊断
+    /// (点名字体与发散值); 等宽时静默通过 (spec 两个 scenario)。
+    #[test]
+    fn non_monospace_spread_triggers_startup_diagnostic() {
+        // 等宽 (mock Noop 文本系统实际行为: 全部 0.6em = 7.8px) → 静默
+        let mono = [('M', 7.8f32), ('a', 7.8), (' ', 7.8), ('—', 7.8)];
+        assert!(
+            super::monospace_diagnostic("StubMono", &mono, super::MONOSPACE_TOLERANCE_PX)
+                .is_none(),
+            "等宽时不得产出诊断"
+        );
+
+        // 极差 4.2px > 0.5px 容差 → 诊断, 且点名字体/发散值/极差
+        let bad = [('M', 7.8f32), ('a', 7.8), (' ', 7.8), ('—', 12.0)];
+        let msg = super::monospace_diagnostic("Menlo", &bad, super::MONOSPACE_TOLERANCE_PX)
+            .expect("非等宽必须触发诊断");
+        assert!(msg.contains("Menlo"), "诊断必须点名字体: {msg}");
+        assert!(msg.contains("12.00"), "诊断必须含发散字形 advance: {msg}");
+        assert!(msg.contains("4.20"), "诊断必须含 advance 极差: {msg}");
+    }
+
+    /// task 1.2: 非等宽 stub 文本系统 — 除 layout_line 外全部委托
+    /// NoopTextSystem; layout_line 模拟非等宽字体 (普通字形 0.6em、
+    /// — 0.923em → 13px 下 7.8px vs 12.0px, 极差 4.2px > 0.5px 容差)。
+    struct DriftingTextSystem(gpui_kit::NoopTextSystem);
+
+    impl gpui_kit::PlatformTextSystem for DriftingTextSystem {
+        fn add_fonts(&self, fonts: Vec<std::borrow::Cow<'static, [u8]>>) -> gpui_kit::Result<()> {
+            self.0.add_fonts(fonts)
+        }
+        fn all_font_names(&self) -> Vec<String> {
+            self.0.all_font_names()
+        }
+        fn font_id(&self, descriptor: &gpui_kit::Font) -> gpui_kit::Result<gpui_kit::FontId> {
+            self.0.font_id(descriptor)
+        }
+        fn font_metrics(&self, font_id: gpui_kit::FontId) -> gpui_kit::FontMetrics {
+            self.0.font_metrics(font_id)
+        }
+        fn typographic_bounds(
+            &self,
+            font_id: gpui_kit::FontId,
+            glyph_id: gpui_kit::GlyphId,
+        ) -> gpui_kit::Result<gpui_kit::Bounds<f32>> {
+            self.0.typographic_bounds(font_id, glyph_id)
+        }
+        fn advance(
+            &self,
+            font_id: gpui_kit::FontId,
+            glyph_id: gpui_kit::GlyphId,
+        ) -> gpui_kit::Result<gpui_kit::Size<f32>> {
+            self.0.advance(font_id, glyph_id)
+        }
+        fn glyph_for_char(&self, font_id: gpui_kit::FontId, ch: char) -> Option<gpui_kit::GlyphId> {
+            self.0.glyph_for_char(font_id, ch)
+        }
+        fn glyph_raster_bounds(
+            &self,
+            params: &gpui_kit::RenderGlyphParams,
+        ) -> gpui_kit::Result<gpui_kit::Bounds<gpui_kit::DevicePixels>> {
+            self.0.glyph_raster_bounds(params)
+        }
+        fn rasterize_glyph(
+            &self,
+            params: &gpui_kit::RenderGlyphParams,
+            raster_bounds: gpui_kit::Bounds<gpui_kit::DevicePixels>,
+        ) -> gpui_kit::Result<(gpui_kit::Size<gpui_kit::DevicePixels>, Vec<u8>)> {
+            self.0.rasterize_glyph(params, raster_bounds)
+        }
+        fn layout_line(
+            &self,
+            text: &str,
+            font_size: gpui_kit::Pixels,
+            _runs: &[gpui_kit::FontRun],
+        ) -> gpui_kit::LineLayout {
+            // 非等宽: 普通字形 0.6em, — 0.923em (13px → 7.8px vs 12.0px)
+            let mut width = px(0.);
+            for ch in text.chars() {
+                width += if ch == '—' {
+                    font_size * 0.923
+                } else {
+                    font_size * 0.6
+                };
+            }
+            let metrics = self.0.font_metrics(gpui_kit::FontId(0));
+            gpui_kit::LineLayout {
+                font_size,
+                width,
+                ascent: font_size * (metrics.ascent / metrics.units_per_em as f32),
+                descent: font_size * (metrics.descent / metrics.units_per_em as f32),
+                runs: Vec::new(),
+                len: text.len(),
+            }
+        }
+        fn recommended_rendering_mode(
+            &self,
+            font_id: gpui_kit::FontId,
+            font_size: gpui_kit::Pixels,
+        ) -> gpui_kit::TextRenderingMode {
+            self.0.recommended_rendering_mode(font_id, font_size)
+        }
+    }
+
+    /// task 1.2 (spec 两个 scenario): 完整测量路径 — 非等宽 stub →
+    /// 诊断触发且点名字体/发散值/极差; Noop (全 0.6em 等宽) → 静默。
+    #[test]
+    fn non_monospace_text_system_triggers_diagnostic_output() {
+        let drifting = gpui_kit::TextSystem::new(std::sync::Arc::new(DriftingTextSystem(
+            gpui_kit::NoopTextSystem::new(),
+        )));
+        let msg = super::grid_monospace_diagnostic(&drifting, "Menlo")
+            .expect("非等宽 stub 必须触发诊断");
+        assert!(msg.contains("Menlo"), "诊断必须点名字体: {msg}");
+        assert!(msg.contains("12.00"), "诊断必须含 — 的发散 advance: {msg}");
+        assert!(msg.contains("4.20"), "诊断必须含 advance 极差: {msg}");
+
+        let mono = gpui_kit::TextSystem::new(std::sync::Arc::new(gpui_kit::NoopTextSystem::new()));
+        assert!(
+            super::grid_monospace_diagnostic(&mono, "Menlo").is_none(),
+            "等宽 stub (Noop 全 0.6em) 必须静默通过"
+        );
+    }
+
+    /// task 3.1 (spec: Real-font metrics regression coverage): 宿主真实
+    /// 平台文本系统 (Windows = DirectWrite, 非 NoopTextSystem) 上的等宽
+    /// 回归 — 解析字体的 M/a/空格/— 四类 advance 极差 ≤ 容差, 超差则
+    /// 点名字体 panic, 使字体回退损坏无法通过 CI。macOS 平台创建需
+    /// 主线程、Linux headless 语义不同 (gpui-base 同款注释) — 仅
+    /// Windows 守卫; 打印 family/cell_w 亦为 task 1.3 提供宿主证据。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn real_text_system_resolved_font_is_monospace() {
+        // 非 headless: WindowsPlatform::new(false) 内建真实 DirectWrite
+        // 文本系统 (headless 在 Windows 上是 Noop — gpui-base 注释)
+        let platform = gpui_kit::platform::current_platform(false);
+        let mut cx = TestAppContext::build_with_text_system(
+            gpui_kit::TestDispatcher::new(0),
+            None,
+            platform.text_system(),
+        );
+        let handle = open_grid(&mut cx, parser_with(FIXTURE));
+        let _ = cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let family = grid_font_family(window);
+            let (cell_w, _) = grid_metrics(window); // 内含启动等宽校验
+            let cell_w = f32::from(cell_w);
+            let em = cell_w / GRID_FONT_SIZE_PX;
+            println!("real-font: family={family} cell_w={cell_w:.2}px ({em:.3}em)");
+            // 真实等宽字体 13px advance sanity (0.5-0.65em-class;
+            // Consolas 0.55em / Cascadia Mono 0.6em / Menlo 0.602em)
+            assert!(
+                (6.0..9.0).contains(&cell_w),
+                "真实等宽字体 13px advance 应约 6-9px (0.5-0.7em), 得 {cell_w:.2}px"
+            );
+            if let Some(msg) = super::grid_monospace_diagnostic(window.text_system(), &family) {
+                panic!("宿主真实文本系统非等宽 (task 3.1): {msg}");
+            }
+        });
     }
 }
 
@@ -1473,6 +1944,7 @@ impl Render for TerminalPanel {
                 grid: terminal_grid(s.0.screen(), window, selection),
             }
         });
+        let grid_font = grid_font_family(window);
         let focus = self.focus.clone();
         let app_weak = self.app.clone();
         div()
@@ -1584,7 +2056,7 @@ impl Render for TerminalPanel {
                 this.forward_click_coordinate(event, window, cx);
             }))
             .child(match pane_data {
-                None => render_empty(),
+                None => render_empty(&grid_font),
                 Some(data) => {
                     let starting = data.status == SessionStatus::Starting;
                     div()
@@ -1597,7 +2069,7 @@ impl Render for TerminalPanel {
                         .flex_col()
                         .child(status_bar(&data))
                         .child(separator())
-                        .children(starting.then(starting_placeholder))
+                        .children(starting.then(|| starting_placeholder(&grid_font)))
                         .child(
                             div()
                                 // 子元素 prepaint bounds → 窗口原点直存
