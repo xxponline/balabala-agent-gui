@@ -2,79 +2,110 @@
 
 记录当前 demo 阶段先简化、但未来需要重新评估的设计权衡。
 
+最近一次对齐: 2026-11-15, 对照 `openspec/specs/` 五份主 spec
+(agent-shell / center-tabs / dock-layout / file-tree / workspace-management)。
+
 ## 多 agent 的 IO 调度
 
-**当前选择**: 每 entity 一个 reader 线程 + 无界 std mpsc channel。
+**当前选择 (2026-11-15 更新, 随 `embed-pi-shell` 换代)**: PTY 路径已删除,
+改为每 session 一条 embed 事件循环线程 + RPC 泵/读写线程 (约 5 线程/session);
+输出帧写入共享 `AnsiBuffer` (无界 `Mutex<Vec<u8>>`), 宿主 50ms 轮询
+(`start_update_loop`) 统一 drain, 输入后追加 8ms×4 快速 burst
+(`kick_input_drain`); 键盘/滚轮/点击/文本经无界 std mpsc `UiEvent` 通道注入。
 
-**为什么这样选**: 简单, 与现有 demo 模式一致, N 个 agent 复制 N 份即可。
+**为什么这样选**: 与 embed 架构一致, 实现最简; 50ms 轮询对 TUI 帧粒度够用,
+burst 消除了输入后的相位抖动。
 
 **未来需要重新评估的信号**:
-- agent 数量到 30+ 时线程数是否成为问题
-- pty 输出狂喷 (例如 `cat bigfile`) 时无界 channel 是否内存爆炸
-- 是否值得引入 mio / epoll 统一 poll 所有 pty master fd
+- session 数到 30+ 时 ~5 线程/session (≈150 线程) 是否成为问题
+- 狂喷输出 (例如粘贴巨量文本) 时 `AnsiBuffer` 在两个 drain 之间无界堆积,
+  vt100 单次解析洪峰
+- 空闲帧显示延迟上限仍是 50ms (轮询相位)
+- mio / epoll 选项已作废 — 不再有 pty master fd
 
 **备选方案**:
-- B: 单 reader 线程用 mio / epoll 统一 poll 所有 pty (portable-pty 未直接暴露 raw fd, 复杂度高)
-- C: crossbeam 有界 channel + 背压 / 丢老策略
+- A: embed 帧就绪时事件驱动通知宿主 (condvar / 回调 → `cx.notify`), 替代
+  50ms 轮询 — 需要跨线程安全地打进 GPUI 调度
+- B: `AnsiBuffer` 改有界 + 背压 / 帧合并 (丢中间帧只留最新)
+- C: 线程池化 — 多 session 共享 I/O 线程, 降低每 session 线程数
 
 ## 终端尺寸 (resize) 同步
 
-**当前选择**: 写死 100 cols x 30 rows, 不响应窗口大小变化。
+**状态: 已解决** (2026-11-08, change `add-adaptive-terminal-grid`)。
 
-**为什么这样选**: MVP 阶段优先打通多 agent + 渲染 + 输入链路,
-resize 需要字体 metrics + SIGWINCH 通知, 是独立的工作块。
-
-**未来需要重新评估的信号**:
-- 用户想跑 `vim` / `htop` / `less` 这种全屏程序时, 屏幕会糊
-- 窗口被拖大拖小后, 终端内容不跟着变
-
-**要做的事**:
-- 用 `ctx.fonts()` 算出 monospace 字体的 char width / line height
-- 从 main pane 的 available_size 反推 rows / cols
-- 调 `parser.set_size(rows, cols)` + `pty.resize(PtySize{..})`
-- 注意: 只在尺寸变化时通知 pty, 别每帧都发 SIGWINCH
+- spec 新增两条 requirement: **Adaptive terminal grid sizing** (网格行列由
+  可用像素面积 + monospace 字体 metrics 下取整推导, 钳制到安全最小值
+  20×5 — `MIN_GRID_COLS` / `MIN_GRID_ROWS`) 与 **Grid resize propagation**
+  (尺寸变化同一步同时传播到 embed TUI 与 vt100 屏; 未变化不传播;
+  `exited` 会话不 resize 以保留最后画面)。
+- 原"要做的事"全部落地: 每帧从 grid 区域 bounds 算
+  `cols=floor(w/cell_w)`、`rows=floor(h/line_h)` (text system metrics,
+  与 cell-width 渲染共用同一真值); 变化时 `EmbeddedApp::resize()` +
+  `vt100::Parser::set_size()` 同步调用, 同尺寸去重。
+- 不再有 SIGWINCH (无 PTY): embed 侧写共享 size 槽 + `UiEvent::Resize`
+  触发 autoresize。
+- 原固定 100×30 (`COLS`/`ROWS` 常量) 已删除, 首帧量测前用 fallback。
 
 ## Agent 关闭的优雅退出
 
-**当前选择**: 直接 `child.kill()` (SIGKILL), 不做优雅退出。
+**当前选择 (2026-11-15 更新)**: 仍是硬杀, 但已序列化 — `shutdown()` 先发
+`UiEvent::Shutdown` 让 embed 事件循环正常退出并 join, 线程尾部
+`RpcClient::shutdown()` → `Transport::shutdown()` → `child.kill()` (SIGKILL)
+pi 子进程; GUI 不再直接持有 child 句柄。
 
-**为什么这样选**: MVP 阶段简化, SIGKILL 立刻释放资源。
+**为什么这样选**: MVP 阶段简化, 立刻释放资源; embed 线程自身干净退出,
+只有 pi 子进程被强杀。
+
+**spec 约束**: agent-shell "Manual session close" 现在写明 "Closing SHALL
+**immediately** shut down the embedded session (terminating its pi
+process)" — 立项优雅收尾须先开 spec delta。
 
 **未来需要重新评估的信号**:
 - pi agent 正在写文件 / 跑长任务时被强杀, 可能丢数据
 - 用户期望 Ctrl+D / exit 能让 agent 自己收尾
 
 **要做的事**:
-- 关闭时先向 pty 写 `\x04` (Ctrl+D) 或 `exit\r`
-- 等 N 秒看子进程是否自己退出
-- 没退出再 fallback 到 SIGKILL
+- 关闭时先经 embed 注入通道送 `\x04` (Ctrl+D) 或 `exit\r` (不再是 pty 写)
+- 等 N 秒看子进程是否自己退出 (监听 embed `is_running` / RPC 事件)
+- 没退出再 fallback 到现有 SIGKILL 序列
 
 ## 键盘输入范围 (Ctrl 组合键)
 
-**当前选择**: 只转发可打印字符 + Enter / Backspace / Tab / 方向键,
-不处理 Ctrl+C / Ctrl+D / Ctrl+R 等带修饰键的控制字符。
+**当前选择 (2026-11-15 更新: 已由 spec 定案)**: agent-shell 的 Keyboard
+input forwarding 现在逐键列出可交付集合 — 可打印字符 (含 IME commit)、
+Enter、Backspace、Tab、四个方向键、PageUp、PageDown; 并明确
+**"Ctrl-combination keys SHALL NOT be delivered"**。滚轮 / 点击坐标是另外
+的独立 requirement。面板侧 `handle_key_down` 对 control/platform/function
+修饰键直接早退 (不转发也不拦截传播), 平台快捷键与 IME 菜单照常工作。
 
-**为什么这样选**: MVP 阶段最小链路, 修饰键判断增加代码复杂度。
+**为什么仍是这个选择**: 不再是 demo 简化, 而是 spec 边界 — Ctrl+C 中断、
+Ctrl+R 翻历史等诉求被 spec 明确排除; 另外 Cmd+C 已被选区复制占用
+(Terminal context 的 `TerminalCopy` 绑定)。注意 pi-shell 侧其实已实现一批
+ctrl 快捷键 (ctrl+c 双击退出、ctrl+x/v 复制粘贴、ctrl+t/o 开关…), 但 GUI
+的 control 早退使它们在 embed 路径下全部不可达。
 
-**未来需要重新评估的信号**:
-- pi agent 生成长回复时, 用户想 Ctrl+C 中断
+**未来需要重新评估的信号 (立项时须开 spec delta)**:
+- pi 生成长回复时, 用户想 Ctrl+C 中断
 - 用户想 Ctrl+R 翻历史 / Ctrl+D 退出当前 session
 
-**要做的事**:
-- 在 `Event::Key` 分支里检查 `ui.input(|i| i.modifiers.ctrl)`
-- 把 Ctrl+字母 映射成对应的 ASCII 控制字符 (Ctrl+A=0x01 ... Ctrl+Z=0x1a)
-- 注意区分 Cmd+C (复制) 和 Ctrl+C (中断), 取决于平台
+**要做的事 (若立项)**:
+- spec: Keyboard input forwarding 的 "Ctrl-combination keys SHALL NOT be
+  delivered" 开明确例外 (列出允许的组合)
+- 面板: `handle_key_down` 的 control 早退改为按白名单把 Ctrl+字母 映射成
+  对应 ASCII 控制字符 (Ctrl+A=0x01 ... Ctrl+Z=0x1a) 并 stop_propagation
+- 注意区分 Cmd+C (复制, 已占用) 和 Ctrl+C (中断), 取决于平台
 
 ## 统一 sidebar 事件处理器
 
-**当前选择 (2026-11-06 更新, change `port-ui-to-gpui-kit`)**: 回调式分发 —
-gpui 版 sidebar 渲染时经 `cx.listener` 给每个控件挂闭包, 点击经 entity
-update 直接进入 `TerminalApp` 的方法 (design D7); `SidebarAction` struct
-已退役, egui 时代的 `if let` 链随之消失。不引入事件总线 / 命令模式的
-取舍不变 (理由同下)。
+**当前选择 (2026-11-15 更新, change `split-ui-modules-dockarea`)**: 事件漏斗 —
+sidebar 渲染时经 `cx.listener` 构造 `SidebarEvent` 枚举 (6 种:
+NewWorkspace / ToggleCollapse / CloseWorkspace / NewAgent / SelectAgent /
+CloseAgent), 统一投进 `TerminalApp::on_sidebar_event` 单一入口 match 分发
+(sidebar mod 头注释 design D3); 点击闭包本身不直接调业务方法。
+不引入事件总线 / 命令模式的取舍不变 (理由同下)。
 
 **未来需要重新评估的信号**:
-- action 种类继续膨胀 (现在已经 6 种), if 链可读性下降
+- 事件种类继续膨胀 (现在已经 6 种), 中央 match 分发可读性下降
 - 想给某些 action 加全局快捷键 / 撤销 / 重做
 - 想做命令面板 (Ctrl+Shift+P 那种)
 
@@ -97,7 +128,9 @@ update 直接进入 `TerminalApp` 的方法 (design D7); `SidebarAction` struct
 
 ## 持久化路径选择 (项目本地 vs 用户目录)
 
-**当前选择**: `.workspaces.json` 写在项目根目录下。
+**当前选择**: `.workspaces.json` 写在项目根目录下 — 且这已是 spec 措辞
+(workspace-management: "SHALL persist ... to `.workspaces.json` in the
+project root"), 迁移到用户目录须先开 spec delta。
 
 **为什么这样选**: 这是 demo / 开发期工具, 用户从哪启动 cargo run,
 workspaces.json 就在哪, 心智最简单。
@@ -112,12 +145,37 @@ workspaces.json 就在哪, 心智最简单。
 - 写一个一次性迁移: 如果项目根有旧的 `.workspaces.json`, 复制到新位置
 - 之后读新位置, 删项目根的旧文件
 
+## 会话与折叠态不持久化
+
+**状态**: 待立项 (workspace-management spec 明确排除项)。
+
+**当前选择**: `.workspaces.json` 只存 workspace 路径列表 (+ `file_tree`
+规则区段); agent 会话与展开/折叠态重启即丢 — spec: "Collapse state and
+agent sessions SHALL NOT be persisted"。
+
+**为什么这样选**: 会话恢复要么重开 `pi --mode rpc` 进程要么重放 RPC 状态,
+成本高; 折叠态是纯 UI 细节。
+
+**未来需要重新评估的信号**:
+- 用户重启后抱怨 "我的 agent 全没了"
+- 长任务会话被重启打断, 需要跨启动续接
+
+**要做的事 (若立项)**:
+- spec delta: persistence requirement 扩展存储内容 (每会话 = workspace +
+  pi-N 名 + 状态; 至少恢复时重新 spawn)
+- pi-shell-rs 侧: 新 spawn 即 `pi --mode rpc`, 历史能否接上取决于 pi 的
+  会话恢复能力 (`/resume`)
+- 写失败红条 / 保留非本区段条款 (workspace-management 已有) 对新字段同样
+  适用
+
 ## IME preedit 在终端里的预览
 
 **当前选择**: 只转发 `ImeEvent::Commit(s)` (上屏后的最终字符串),
-不转发 `Preedit` (候选词预览) 和 `DeleteSurrounding`。
+不转发 `Preedit` (候选词预览) 和 `DeleteSurrounding` — 且已是 spec 条款
+(Keyboard input forwarding: "Other IME events (preedit composition,
+surrounding-text deletion) SHALL NOT be delivered"), 立项须开 spec delta。
 
-**为什么这样选**: MVP 阶段先让中文能进 pty, 预览是体验优化。
+**为什么这样选**: MVP 阶段先让中文能进会话, 预览是体验优化。
 
 **未来需要重新评估的信号**:
 - 用户抱怨打字时终端里看不到候选词预览, 体验跟原生终端差太多
@@ -170,43 +228,34 @@ workspaces.json 就在哪, 心智最简单。
 
 ## pi-shell-rs 不处理 Tab 键 (原生 TUI 功能在 embed 路径缺失)
 
-**状态**: 待查 (2026-11-09, change `split-ui-modules-dockarea` 6.1 的 F3 诊断发现)。
+**状态: 已解决** (2026-11-15 复验; 上游修复 2026-11-10)。
 
-**现象**: Tab 键经完整链路送达后**零反应** — 光标不动、整屏内容不变;
-同一 `inject_key` 通道的 Left/Right/Backspace 均有反应。诊断复现:
-`cargo test diagnostic_per_commit -- --ignored --nocapture` (key Tab 段)。
+- 诊断 (2026-11-09, change `split-ui-modules-dockarea` 6.1 F3) 当时成立:
+  菜单关闭态的 Tab 在 pi-shell-rs 无 handler, 注入后零反应; 应用侧全链
+  已证实送达 (`TerminalTab` 动作 / CI `tab_forwards` 计数守卫 spec
+  "Tab SHALL be delivered"), 责任确在上游。
+- 上游修复: pi-shell-rs `add-path-tab-completion` (5ec2fee, 2026-11-10) —
+  `key_intent` 把无修饰 Tab 分类为 `KeyIntent::ForcePath` → 打开路径补全
+  菜单 (force 态); 菜单开着时 Tab 应用当前候选后关菜单。
+- 复验 (2026-11-15, embed 注入): 空输入 + Tab → 路径补全菜单出现
+  (候选列表 + `(1/16)` 计数), 整屏变化 ✓。
+- 旧诊断里"零反应"另有一层无害解释: 输入行为 `你好好吗hi` 时路径前缀零
+  候选 → 按 spec 静默 (零候选才静默关), 并非键未送达。
+- 应用侧交付边界与测试守卫不变 (同上)。
 
-**应用侧已全部证实无责**:
-- 真机: `[F3] TerminalTab action fired -> send_key(Tab)` ×3 (绑定截获路径通);
-- CI: `sidebar_select_grants_one_step_focus` 断言3 (`tab_forwards` 计数) 守卫
-  spec "Tab SHALL be delivered" 转发边界;
-- 通道: 同 `embed.inject_key` 的其他键全部正常送达并生效。
-
-**关键线索 (用户)**: **原生 TUI 的 Tab 是有对应功能的** → 问题大概率在
-pi-shell-rs 的 key 事件封装/注入层, 而非 pi 本身。
-
-**未来需要重新评估的信号**:
-- 修好后: embed 路径 Tab 行为应与原生 TUI 一致 (可跑 diagnostic 对比)
-
-**要做的事** (排查方向, 按嫌疑排序):
-- `event.rs` 的 `key_intent` 分类 (event.rs:200-206): `UiEvent::Key(Tab)` 是否
-  被分类成被丢弃/降级的 intent (已有 `KeyIntent::SendFollowUp` 等分类器)
-- embed 事件循环消费 `UiEvent::Key` 的路径 (embed.rs:140 入队后): 注入 TUI
-  时是否过滤了 Tab / 非文本键
-- 对照原生模式 (crossterm 直通) 与 embed 模式的按键处理差异
-
-**备选方案**:
-- A: pi-shell-rs 修复 Tab 注入 (首选, 保持与原生一致)
-- B: 若 embed 场景确不适用 Tab → 文档化已知限制, spec 交付边界不变
-  (应用侧已送达, 属 pi-shell 行为)
+**备选方案**: 原 A (pi-shell-rs 修复 Tab) 已完成; B (文档化已知限制) 作废。
 
 ## 文件树过滤的配置界面 (含 agent-shell 键盘条款修订)
 
-**状态**: 待立项 (2026-11-09, change `right-dock-file-tree`)。
+**状态**: 规则语义已入 spec (file-tree, 2026-11-09 change
+`right-dock-file-tree`; 2026-11-15 对齐复核); 可输入的配置界面仍待立项。
 
-**当前选择**: 过滤规则纯配置驱动 — `.workspaces.json` 新开 `file_tree`
-区段 (按 workspace 路径键控, gitignore 式模式行数组), v1 右 dock **无任何
-可聚焦文本输入**, ⟳ 刷新时重读生效。
+**当前选择 (已由 spec 固化)**: 过滤规则纯配置驱动 — file-tree spec
+Requirement "File-row filtering with gitignore-style rules": 规则来自
+`.workspaces.json` 的 `file_tree` 区段 (按 workspace 绝对路径键控, 模式行
+数组), gitignore 语义 (`* ? **` 通配、`!` 重包含、最后匹配胜出), 只作用于
+文件行 (目录行恒可见); dock-layout spec 规定右 dock 头部只有**只读**的
+过滤规则摘要。v1 右 dock **无任何可聚焦文本输入**, ⟳ 刷新时重读生效。
 
 **为什么这样选**: `agent-shell` 两条键盘契约是绝对条款 ("仅 macOS 应用失焦
 才不转发键盘/IME"), dock 内一旦有输入控件, 打字即违反 spec。配置文件绕开了
@@ -219,11 +268,16 @@ pi-shell-rs 的 key 事件封装/注入层, 而非 pi 本身。
 - spec: `agent-shell` 的 Session selection focus model 与 Keyboard input
   forwarding 两条 MUST 开一个明确例外 — "明确获得焦点的 dock 交互控件
   (当前即右 dock 过滤框) 可接收键盘/IME, 直到其失焦"; 补对应场景
+  (2026-11-15 复核: 现行 spec 仍无此例外 — "macOS 失焦是唯一不转发条件"
+  措辞未动)
 - 面板侧: 过滤输入框持焦期间, 树行点击仍即时交回终端 (纪律不变)
 
 ## 文件树的自动刷新 (焦点重扫 / FS 监听)
 
-**状态**: 待立项 (2026-11-09, change `right-dock-file-tree` 5.x)。
+**状态**: 当前选择已入 spec (file-tree "Refresh triggers and behavior":
+首次加载 / 根路径变化 / 点击 ⟳, 后台扫描不阻塞交互、重读规则、保留展开态;
+同 workspace 切 agent 不重扫是独立条款); 焦点重扫 / FS 监听仍待立项
+(2026-11-09, change `right-dock-file-tree` 5.x)。
 
 **当前选择**: 三个低频触发 — 首次加载 (根路径出现) / 切换活动 workspace
 (根路径变化) / 手动 ⟳ 按钮; 同 workspace 切 agent 不重扫。
@@ -239,7 +293,9 @@ pi-shell-rs 的 key 事件封装/注入层, 而非 pi 本身。
 
 ## 文件树的惰性扫描 (大仓)
 
-**状态**: 待立项 (2026-11-09, change `right-dock-file-tree` design D6)。
+**状态**: 排除表与后台扫描已入 spec (file-tree "Default scan exclusions" /
+"Refresh ... background"); 惰性扫描本身仍待立项 (2026-11-09, change
+`right-dock-file-tree` design D6)。
 
 **当前选择**: 全量递归 + 排除表 (`.git node_modules target build dist
 .DS_Store`) + 后台线程。
@@ -258,8 +314,9 @@ pi-shell-rs 的 key 事件封装/注入层, 而非 pi 本身。
 
 **状态**: 待立项 (2026-11-09, change `right-dock-file-tree` 4.2)。
 
-**当前选择**: macOS only — `open -R <path>` 子进程 (spec 场景即 Finder);
-`cfg(not(target_os = "macos"))` 分支为空操作。
+**当前选择**: macOS only — `open -R <path>` 子进程; `cfg(not(target_os =
+"macos"))` 分支为空操作。file-tree spec 场景措辞即 macOS ("Reveal opens
+Finder with that file selected"), 跨平台化需同步改 spec。
 
 **未来需要重新评估的信号**:
 - app 要发到 Windows / Linux 用户手里
@@ -268,4 +325,45 @@ pi-shell-rs 的 key 事件封装/注入层, 而非 pi 本身。
 - Windows: `explorer /select,"<path>"`
 - Linux: 桌面环境差异大 (nautilus -select 等), 需定义降级 (如打开父目录)
 - 落地点: `reveal_in_finder` 的 cfg 分支 (src/tree/mod.rs)
+
+## 右 dock 关闭后本会话无法恢复
+
+**状态**: 待立项 (spec 已把它写成明确禁令, 立项须开 delta)。
+
+**当前选择 (dock-layout spec "Right dock close")**: 关闭按钮把右 dock 收成
+零宽, 中槽吸收空间; **本会话不提供任何重开控件**, 只有重启应用才恢复
+(默认宽度 + 文件树面板)。
+
+**为什么这样选**: demo 阶段少一个 toggle 状态面 (开关态不持久化)。
+
+**未来需要重新评估的信号**:
+- 用户误关后想找回文件树, 只能重启
+- 未来做"显示偏好持久化" (dock 开关 / 宽度跨启动记住)
+
+**要做的事 (若立项)**:
+- spec delta: "Right dock close" 的 "SHALL NOT provide any control to
+  reopen" 与 "Restart restores" 两条都要改
+- 面板侧: header 或窗口边缘加 toggle; 开关态进 `.workspaces.json`
+  (注意 workspace-management 的写失败 / 保区段条款)
+
+## 中槽 viewer 的覆盖范围 (仅 rs / md)
+
+**状态**: 待立项 (center-slot-multi-tab / md-viewer-toggle 定的 v1 边界)。
+
+**当前选择**: 静态 handler 注册表只挂两个 — `.rs` → 只读代码查看器
+(语法高亮, 不可改不可存), `.md` → 双模式查看器 (渲染态默认, 顶栏 toggle
+切源码态; 模式不持久化, 重开回渲染态)。其他扩展名 (`.toml` / `.txt` /
+图片…) 左键只有选中高亮, 无可见效果 (file-tree: no handler → no-op)。
+
+**未来需要重新评估的信号**:
+- 用户点 `.toml` / `.json` / `.txt` 期待预览
+- 想看图片 / PDF / diff
+
+**要做的事 (若立项)**:
+- 在 `property_detail_manager::HANDLERS` 追加 handler (claims 按扩展名,
+  按注册顺序第一个认领者胜出)
+- 图片 / PDF 需要新面板类型 + dedup 表登记 (绝对路径为键, center-tabs
+  dedup 条款)
+- 同步 file-tree spec 的左键场景 (其 "v1: rs" 措辞与 "README.md 无 handler"
+  例已落后于 md handler — md 查看器上线后 `.md` 即被认领, 2026-11-15 发现)
 
