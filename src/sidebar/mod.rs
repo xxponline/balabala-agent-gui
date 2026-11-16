@@ -12,6 +12,7 @@
 //! 生命周期, 返回的元素会一直借住 cx, 循环里无法复用。listener 在
 //! 调用点预构建后以值传入。
 
+use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::dock::{BasePanel, Panel, PanelEvent};
 use gpui_kit::{InteractiveElement, *};
 use std::path::PathBuf;
@@ -143,6 +144,10 @@ impl Render for SidebarPanel {
             let app_ref = app.read(cx);
             snapshot(app_ref, cx)
         };
+        // 语义 token 快照 (Hsla: Copy) — 闭包捕获值而非 &cx (design D3)
+        let theme_border = cx.theme().border;
+        let theme_hover = cx.theme().list_hover;
+        let theme_danger = cx.theme().danger;
 
         // 所有 listener 经 SidebarEvent 漏斗进 TerminalApp (D3)
         let on_new_workspace = cx.listener(|this, _event: &ClickEvent, window, cx| {
@@ -185,15 +190,15 @@ impl Render for SidebarPanel {
                     .py_1()
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(0xcccccc))
-                    .hover(|style| style.bg(rgb(0xe9e9e9)))
+                    .border_color(theme_border)
+                    .hover(|style| style.bg(theme_hover))
                     .on_click(on_new_workspace)
                     .child("+ new workspace"),
             )
             .children(save_error.map(|err| {
                 div()
                     .text_xs()
-                    .text_color(rgb(0xcd3131)) // 原版同款红 (205,49,49)
+                    .text_color(theme_danger)
                     .child(format!("save error: {err}"))
             }))
             .children(rows)
@@ -221,6 +226,10 @@ fn build_workspace_row(
             .ok();
         },
     ));
+    // 语义 token 快照 (Hsla: Copy) — 闭包捕获值 (design D3)
+    let theme_muted = cx.theme().muted_foreground;
+    let theme_danger = cx.theme().danger;
+    let theme_hover = cx.theme().list_hover;
     let disabled = ws.agent_count > 0;
     let on_close: Option<ClickListener> = if disabled {
         None // spec: 非空 workspace 的 × 禁用且不响应点击
@@ -249,13 +258,13 @@ fn build_workspace_row(
         .child(if disabled {
             div()
                 .id(format!("ws-close-grey-{}", ws.full_path))
-                .text_color(rgb(0x666666))
+                .text_color(theme_muted)
                 .child("×")
         } else {
             div()
                 .id(format!("ws-close-btn-{}", ws.full_path))
                 .cursor_pointer()
-                .hover(|style| style.text_color(rgb(0xcd3131)))
+                .hover(|style| style.text_color(theme_danger))
                 .on_click(on_close.expect("present when enabled"))
                 .child("×")
         });
@@ -270,7 +279,7 @@ fn build_workspace_row(
         .py_1()
         .rounded_md()
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(0xe9e9e9)))
+        .hover(|style| style.bg(theme_hover))
         .tooltip(move |_window, cx: &mut App| {
             let text = full_path.clone();
             cx.new(move |_| TextTooltip { text }).into()
@@ -321,11 +330,17 @@ fn build_agent_row(agent: &AgentRow, cx: &mut Context<SidebarPanel>) -> Stateful
         },
     ));
 
-    // 状态点颜色与原版一致
+    // 语义 token 快照 (Hsla: Copy) — 闭包捕获值 (design D3)
+    let theme_danger = cx.theme().danger;
+    let theme_warning = cx.theme().warning;
+    let theme_success = cx.theme().success;
+    let theme_hover = cx.theme().list_hover;
+    let theme_active = cx.theme().list_active;
+    // 状态点颜色 (warning/success/danger 语义)
     let dot_color = match agent.status {
-        SessionStatus::Starting => rgb(0xe5c110), // (229,193,16) 黄
-        SessionStatus::Running => rgb(0x4bd76c),  // (75,215,108) 绿
-        SessionStatus::Exited => rgb(0xcd3131),   // (205,49,49) 红
+        SessionStatus::Starting => theme_warning,
+        SessionStatus::Running => theme_success,
+        SessionStatus::Exited => theme_danger,
     };
     let name = agent.name.clone();
     let is_active = agent.is_active;
@@ -339,7 +354,7 @@ fn build_agent_row(agent: &AgentRow, cx: &mut Context<SidebarPanel>) -> Stateful
             div()
                 .id(format!("agent-close-btn-{id}"))
                 .cursor_pointer()
-                .hover(|style| style.text_color(rgb(0xcd3131)))
+                .hover(|style| style.text_color(theme_danger))
                 .on_click(on_close)
                 .child("×"),
         );
@@ -355,11 +370,11 @@ fn build_agent_row(agent: &AgentRow, cx: &mut Context<SidebarPanel>) -> Stateful
         .py_1()
         .rounded_md()
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(0xe9e9e9)))
+        .hover(|style| style.bg(theme_hover))
         .on_click(on_select);
     // active 高亮: 底色 + 粗体 (原版用 strong)
     let row = if is_active {
-        row.bg(rgb(0xd3e6f7)).font_weight(FontWeight::BOLD)
+        row.bg(theme_active).font_weight(FontWeight::BOLD)
     } else {
         row
     };
@@ -378,6 +393,9 @@ fn build_agent_row(agent: &AgentRow, cx: &mut Context<SidebarPanel>) -> Stateful
 
 /// 展开的 workspace 底部的 "[+ agent]" 按钮。
 fn build_new_agent_button(full_path: String, cx: &mut Context<SidebarPanel>) -> Stateful<Div> {
+    // 语义 token 快照 (Hsla: Copy) — 闭包捕获值 (design D3)
+    let theme_hover = cx.theme().list_hover;
+    let theme_muted = cx.theme().muted_foreground;
     let path = PathBuf::from(&full_path);
     let on_new: ClickListener = Box::new(cx.listener(
         move |this, _event: &ClickEvent, _window, cx| {
@@ -396,9 +414,9 @@ fn build_new_agent_button(full_path: String, cx: &mut Context<SidebarPanel>) -> 
         .py_1()
         .rounded_md()
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(0xe9e9e9)))
+        .hover(|style| style.bg(theme_hover))
         .text_xs()
-        .text_color(rgb(0x888888))
+        .text_color(theme_muted)
         .on_click(on_new)
         .child(
             div()

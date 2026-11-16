@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use gpui_kit::base::dock::{PanelEvent, PanelId, PanelView};
+use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::dock::panel_handle;
 use gpui_kit::{
@@ -148,7 +149,7 @@ impl Focusable for EditorPanel {
 }
 
 impl Render for EditorPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = Editor::new(&self.state)
             .readonly(true)
             .bordered(false)
@@ -159,7 +160,7 @@ impl Render for EditorPanel {
             .id("viewer-pane")
             .test_support() // 观测锚点: press/input 的 scope focus 断言
             .size_full()
-            .bg(gpui_kit::rgb(0xffffff))
+            .bg(cx.theme().background)
             .child(editor)
             .into_any_element()
     }

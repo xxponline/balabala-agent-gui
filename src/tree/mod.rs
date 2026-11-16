@@ -19,6 +19,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use gpui_kit::base::TestTextExt;
+use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::dock::{BasePanel, DockPlacement, Panel, PanelEvent};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::PopupMenuItem;
@@ -251,6 +252,11 @@ impl Render for TreePanel {
         self.sync_if_generation_changed(cx);
         let app_refocus = self.app.clone();
         let title = self.source.name().to_string();
+        // 语义 token 快照 (Hsla: Copy) — 闭包捕获值 (design D3)
+        let theme_muted = cx.theme().muted_foreground;
+        let theme_danger = cx.theme().danger;
+        let theme_border = cx.theme().border;
+        let theme_accent = cx.theme().accent;
         // 只读规则摘要 (spec: header chrome; 数据来自源当前生效规则)
         let rules_summary = match &self.last_synced {
             Some(SourceView::Tree { rules, .. }) if !rules.is_empty() => {
@@ -272,7 +278,7 @@ impl Render for TreePanel {
                 .justify_center()
                 .gap_1()
                 .text_sm()
-                .text_color(rgb(0x969696))
+                .text_color(theme_muted)
                 .child("no active session")
                 .child("选择会话后此处显示其文件树")
                 .into_any_element(),
@@ -287,7 +293,7 @@ impl Render for TreePanel {
                 .justify_center()
                 .gap_1()
                 .text_sm()
-                .text_color(rgb(0xcd3131))
+                .text_color(theme_danger)
                 .child(format!("无法读取 {}", root.display()))
                 .child(message.clone())
                 .into_any_element(),
@@ -404,7 +410,7 @@ impl Render for TreePanel {
                     .px_3()
                     .py_1()
                     .border_b_1()
-                    .border_color(rgb(0xd9d9d9))
+                    .border_color(theme_border)
                     .child(div().id("tree-title").test_support().text_sm().child(title))
                     .child(
                         div()
@@ -417,7 +423,7 @@ impl Render for TreePanel {
                                 div()
                                     .id("tree-rules")
                                     .text_xs()
-                                    .text_color(rgb(0x969696))
+                                    .text_color(theme_muted)
                                     // texts() 只收录 test_text/ObservedText
                                     // (pane 同款; 观测子文本拿不到)
                                     .child(rules_summary.clone())
@@ -430,7 +436,7 @@ impl Render for TreePanel {
                                     .cursor_pointer()
                                     .px_1()
                                     .text_sm()
-                                    .hover(|style| style.text_color(rgb(0x005fb8)))
+                                    .hover(|style| style.text_color(theme_accent))
                                     .child("⟳")
                                     .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                                         this.source.refresh(cx);
@@ -444,7 +450,7 @@ impl Render for TreePanel {
                                     .cursor_pointer()
                                     .px_1()
                                     .text_sm()
-                                    .hover(|style| style.text_color(rgb(0xcd3131)))
+                                    .hover(|style| style.text_color(theme_danger))
                                     .child("×")
                                     .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                                         let app = this.app.clone();
@@ -681,6 +687,7 @@ mod tests {
         fn resize(&mut self, _cols: u16, _rows: u16) -> bool {
             false
         }
+        fn set_theme(&mut self, _theme: pi_shell_rs::app::theme::TuiTheme) {}
     }
 
     /// hermetic 临时 workspace 目录（进程 id 隔离，先清后建）。

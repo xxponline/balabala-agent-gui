@@ -22,6 +22,7 @@ use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 
 use pi_shell_rs::app::embed::{EmbedConfig, EmbeddedApp};
+use pi_shell_rs::app::theme::TuiTheme;
 use vt100::Parser;
 
 use crate::agent_entities::{AgentEntity, SessionStatus};
@@ -54,18 +55,36 @@ impl PiAgentShell {
     /// 创建嵌入会话并在 `cwd` (workspace 路径) 下启动 pi。
     ///
     /// `name` 是 sidebar 显示的名字 (由 app 层负责分配)。
+    /// `theme` 是宿主按当前主题构造的注入配色 (add-light-dark-theme D4:
+    /// 颜色真相在宿主)。
     /// 失败 (pi 缺失/探活超时) 返回 Err, 不会留下半开的会话。
-    pub fn new(name: String, cwd: PathBuf) -> Result<Self, String> {
-        Self::spawn(name, cwd, None)
+    pub fn new(name: String, cwd: PathBuf, theme: TuiTheme) -> Result<Self, String> {
+        Self::spawn(name, cwd, None, theme)
+    }
+
+    /// 测试专用: 以指定 pi 二进制 (stub) 构造会话 (配色用默认值)。
+    #[cfg(test)]
+    pub(crate) fn new_with_pi_bin(
+        name: String,
+        cwd: PathBuf,
+        pi_bin: Option<String>,
+    ) -> Result<Self, String> {
+        Self::spawn(name, cwd, pi_bin, TuiTheme::default())
     }
 
     /// 以指定 pi 二进制启动会话 (生产走 `None` = PATH 解析; 测试注入 stub)。
     ///
     /// 输入: name — sidebar 显示名; cwd — 工作目录; pi_bin — pi 可执行文件
-    ///       (None = Windows PATHEXT 解析, 解析不到再回退 resolve_binary())
+    ///       (None = Windows PATHEXT 解析, 解析不到再回退 resolve_binary());
+    ///       theme — 宿主注入配色 (add-light-dark-theme D4)
     /// 输出: 成功返回就绪会话 (Starting 状态, 网格为回退尺寸);
     ///       失败 (pi 缺失/探活超时) 返回 Err, 不留下半开会话
-    fn spawn(name: String, cwd: PathBuf, pi_bin: Option<String>) -> Result<Self, String> {
+    fn spawn(
+        name: String,
+        cwd: PathBuf,
+        pi_bin: Option<String>,
+        theme: TuiTheme,
+    ) -> Result<Self, String> {
         let config = EmbedConfig {
             // 测试注入的 pi_bin 优先; 否则 Windows 上做 PATHEXT 语义解析
             // (见 resolve_pi_bin), 解析不到再回退 None = resolve_binary()
@@ -78,6 +97,8 @@ impl PiAgentShell {
             // 避免缺省 sink 把 SetTitle/OSC52 转义序列写进 GUI 进程的 stdout。
             set_title: Some(Box::new(|_t: String| {})),
             copy_text: Some(Box::new(|_t: String| {})),
+            // 宿主配色注入 (add-light-dark-theme D4)
+            theme: Some(theme),
         };
         let embed = EmbeddedApp::spawn(config)?;
 
@@ -95,16 +116,6 @@ impl PiAgentShell {
             grid_size: (COLS, ROWS),
             status: SessionStatus::Starting,
         })
-    }
-
-    /// 测试专用: 以指定 pi 二进制 (stub) 构造会话。
-    #[cfg(test)]
-    pub(crate) fn new_with_pi_bin(
-        name: String,
-        cwd: PathBuf,
-        pi_bin: Option<String>,
-    ) -> Result<Self, String> {
-        Self::spawn(name, cwd, pi_bin)
     }
 }
 
@@ -228,6 +239,11 @@ impl AgentEntity for PiAgentShell {
     fn status(&self) -> SessionStatus {
         self.status
     }
+
+    fn set_theme(&mut self, theme: TuiTheme) {
+        // 转发给 embed: UiEvent::Theme → 事件循环应用 + 重绘 (D4)
+        self.embed.set_theme(theme);
+    }
 }
 
 #[cfg(test)]
@@ -313,7 +329,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         // 真实生产入口 (None -> resolve_pi_bin -> pi --mode rpc 探活)
-        let shell = PiAgentShell::new("pi-real".into(), dir.clone())
+        let shell = PiAgentShell::new("pi-real".into(), dir.clone(), TuiTheme::default())
             .expect("生产路径必须能启动 pi (Windows: 不得报 program not found)");
         assert_eq!(shell.status(), SessionStatus::Starting);
         shell_embed_running(&shell);

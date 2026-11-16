@@ -7,6 +7,7 @@
 
 use std::path::Path;
 
+use pi_shell_rs::app::theme::TuiTheme;
 use vt100::Screen;
 
 pub mod pi_agent_shell;
@@ -70,4 +71,8 @@ pub trait AgentEntity {
     /// 输出: true 表示实际传播了 resize (尺寸与当前不同且会话未 Exited);
     ///       false 表示去重跳过或会话已 Exited (保留最后画面, 不 reflow)
     fn resize(&mut self, cols: u16, rows: u16) -> bool;
+
+    /// 注入宿主配色 (add-light-dark-theme D4): 外观切换时宿主推给活会话;
+    /// 会话内容色 (工具卡/滚动条/语法高亮) 由宿主决定, 会话只消费。
+    fn set_theme(&mut self, theme: TuiTheme);
 }

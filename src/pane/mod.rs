@@ -11,6 +11,7 @@
 //! (change: port-ui-to-gpui-kit 起源; 旧实现在 git history)
 
 use gpui_kit::base::TestTextExt;
+use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::dock::{BasePanel, Panel, PanelEvent};
 use gpui_kit::*;
 use std::cell::Cell;
@@ -20,7 +21,7 @@ use vt100::Screen;
 
 use crate::agent_entities::SessionStatus;
 use crate::app::{TerminalApp, TerminalCopy, TerminalTab};
-use crate::ui::{bg_to_gpui, fg_to_gpui};
+use crate::ui::{TerminalTheme, bg_to_gpui, fg_to_gpui, terminal_theme};
 
 /// 网格最小尺寸 (spec: Tiny pane clamps to minimum size; design D2)
 pub const MIN_GRID_COLS: u16 = 20;
@@ -132,8 +133,8 @@ pub struct PaneData {
     pub grid: Div,
 }
 
-/// 没有 active session 时的居中占位 (`font` = 解析后的网格字体)。
-pub fn render_empty(font: &str) -> Div {
+/// 没有 active session 时的居中占位 (`font` = 解析后的网格字体; 颜色随主题)。
+pub fn render_empty(cx: &App, font: &str) -> Div {
     div()
         .size_full()
         .flex()
@@ -143,14 +144,14 @@ pub fn render_empty(font: &str) -> Div {
         .gap_1()
         .font_family(font)
         .text_sm()
-        .text_color(rgb(0x969696)) // 原版同款灰 (150,150,150)
+        .text_color(cx.theme().muted_foreground)
         .child("no agent selected")
         .child("press + to create one")
 }
 
 /// 顶部状态条: `● <abs path> — <name>   [Status]`
 /// (agent-shell spec: 状态条显示完整路径 + 前缀名 + 状态)
-pub fn status_bar(data: &PaneData) -> Div {
+pub fn status_bar(data: &PaneData, cx: &App) -> Div {
     div()
         .w_full()
         .flex()
@@ -160,7 +161,7 @@ pub fn status_bar(data: &PaneData) -> Div {
         .py_1()
         .child(
             div()
-                .text_color(rgb(0x4ba3d7)) // 原版同款蓝 (75,161,215)
+                .text_color(cx.theme().accent)
                 .child(format!("● {} — {}", data.path, data.name)),
         )
         .child({
@@ -169,26 +170,26 @@ pub fn status_bar(data: &PaneData) -> Div {
                 // F4 回归锚点: plain string 子节点不走 styled-text 记录路径,
                 // texts() 只收录 test_text/ObservedText — 附件同文本文本
                 .id("pane-status")
-                .text_color(rgb(0x969696)) // 原版同款灰 (150,150,150)
+                .text_color(cx.theme().muted_foreground)
                 .child(status_text.clone())
                 .test_text(status_text)
         })
 }
 
 /// `Starting` 状态的占位文本 (首个字节到达后消失)。
-pub fn starting_placeholder(font: &str) -> Div {
+pub fn starting_placeholder(cx: &App, font: &str) -> Div {
     div()
         .px_3()
         .py_2()
         .font_family(font)
-        // 浅色主题: 比原版的 (229,193,16) 更深的琥珀色才可读 (D9)
-        .text_color(rgb(0x8f6f00))
+        // D9 的深琥珀字面量 → warning token (双主题可读, design D3)
+        .text_color(cx.theme().warning)
         .child("waiting for pi to start...")
 }
 
-/// 1px 水平分隔线 (浅色主题)。
-pub fn separator() -> Div {
-    div().w_full().h(px(1.)).bg(rgb(0xd9d9d9))
+/// 1px 水平分隔线 (随主题)。
+pub fn separator(cx: &App) -> Div {
+    div().w_full().h(px(1.)).bg(cx.theme().border)
 }
 
 /// 单元格宽度 (等宽字体 advance): 渲染分段定宽与后续自适应换算共用的
@@ -316,13 +317,13 @@ struct Segment {
 ///   强制宽, 光标紧贴文字尾 (仅剩字形侧边距)。
 ///   (D3 逐格定宽块落地后, 空隙累积已在块边界阻断 — 本捷径保留,由
 ///    现有 CJK 场景测试锁定, task 2.2: keep/simplify。)
-fn build_grid(screen: &Screen) -> Vec<Vec<Segment>> {
+fn build_grid(screen: &Screen, theme: &TerminalTheme) -> Vec<Vec<Segment>> {
     let (rows_nz, cols_nz) = screen.size();
     let (rows, cols) = (rows_nz.get(), cols_nz.get());
     let cursor = screen.cursor_position();
 
-    let default_fg = fg_to_gpui(vt100::Color::Default);
-    let default_bg = bg_to_gpui(vt100::Color::Default);
+    let default_fg = fg_to_gpui(vt100::Color::Default, theme);
+    let default_bg = bg_to_gpui(vt100::Color::Default, theme);
 
     let mut out = Vec::with_capacity(usize::from(rows));
     for r in 0..rows {
@@ -343,7 +344,7 @@ fn build_grid(screen: &Screen) -> Vec<Vec<Segment>> {
             }
             let cols_here = if cell.is_some_and(vt100::Cell::is_wide) { 2 } else { 1 };
             let (mut fg, mut bg) = match cell {
-                Some(cell) => (fg_to_gpui(cell.fgcolor()), bg_to_gpui(cell.bgcolor())),
+                Some(cell) => (fg_to_gpui(cell.fgcolor(), theme), bg_to_gpui(cell.bgcolor(), theme)),
                 None => (default_fg, default_bg),
             };
             // 未写入的 cell (ratatui 增量绘制下常见) 按真实终端的空格对待:
@@ -452,9 +453,14 @@ fn grid_cell(text: String, cols: u16, cell_w: Pixels) -> impl IntoElement {
 /// 数据经 [`build_grid`] 从 screen 快照成拥有值 (元素树要求 'static);
 /// 段盒 `overflow_hidden` + `whitespace_nowrap` — 字形墨迹溢出时裁剪
 /// 而不换行/撑宽 (与真实终端一致)。
-pub fn terminal_grid(screen: &Screen, window: &Window, selection: Option<CellRange>) -> Div {
+pub fn terminal_grid(
+    screen: &Screen,
+    window: &Window,
+    selection: Option<CellRange>,
+    theme: &TerminalTheme,
+) -> Div {
     let cell_w = cell_width(window);
-    let rows = build_grid(screen);
+    let rows = build_grid(screen, theme);
 
     div()
         .flex()
@@ -537,7 +543,7 @@ mod tests {
     use super::{
         GRID_FONT_SIZE_PX, build_grid, cell_width, grid_font_family, grid_metrics, terminal_grid,
     };
-    use crate::ui::{bg_to_gpui, fg_to_gpui};
+    use crate::ui::{THEME_DARK, THEME_LIGHT, bg_to_gpui, fg_to_gpui, terminal_theme};
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
         AnyWindowHandle, AppContext, Bounds, Context, InteractiveElement, IntoElement,
@@ -789,7 +795,7 @@ mod tests {
         let parser = parser_with(FIXTURE);
         // 宽字符必须走 is_wide 分支: 若续格被漏计/重计, 总和会偏离 COLS
         assert!(parser.screen().cell(0, 2).is_some_and(vt100::Cell::is_wide));
-        let rows = build_grid(parser.screen());
+        let rows = build_grid(parser.screen(), &THEME_LIGHT);
         assert_eq!(rows.len(), usize::from(ROWS));
         for (r, segs) in rows.iter().enumerate() {
             assert_eq!(row_sum(segs), COLS, "row {r}: 段列数之和必须等于网格列数");
@@ -804,16 +810,16 @@ mod tests {
         let mut parser = parser_with("\u{4f60}");
         parser.process(b"\x1b[1;1H"); // 光标移到 (0,0) = 宽字符首格
         assert_eq!(parser.screen().cursor_position(), (0, 0));
-        let rows = build_grid(parser.screen());
+        let rows = build_grid(parser.screen(), &THEME_LIGHT);
         let segs = &rows[0];
         assert_eq!(row_sum(segs), COLS);
         // 反色段: bg 被换成默认前景色 (独立成段)
         let inv = segs
             .iter()
-            .find(|s| s.bg == fg_to_gpui(vt100::Color::Default))
+            .find(|s| s.bg == fg_to_gpui(vt100::Color::Default, &THEME_LIGHT))
             .expect("cursor 应产生反色段");
         assert_eq!(inv.cols, 2, "宽字符上的光标反色块必须占 2 格");
-        assert_eq!(inv.fg, bg_to_gpui(vt100::Color::Default));
+        assert_eq!(inv.fg, bg_to_gpui(vt100::Color::Default, &THEME_LIGHT));
         assert!(seg_text(inv).contains('\u{4f60}'));
     }
 
@@ -822,14 +828,14 @@ mod tests {
         let mut parser = parser_with("\u{4f60}");
         parser.process(b"\x1b[1;2H"); // 光标移到 (0,1) = 续格
         assert_eq!(parser.screen().cursor_position(), (0, 1));
-        let rows = build_grid(parser.screen());
+        let rows = build_grid(parser.screen(), &THEME_LIGHT);
         // 续格不贡献宽度、不产生反色段; F2 修复后宽字符独立成段 ->
         // [你][余下 nbsp] 两段, 且无任何反色段 (光标在续格上不可见, 原行为)
         assert_eq!(rows[0].len(), 2, "宽字符独立成段, 续格不产生额外段");
         assert_eq!(seg_text(&rows[0][0]), "\u{4f60}");
         assert_eq!(rows[0][0].cols, 2);
         assert!(
-            !rows[0].iter().any(|s| s.bg == fg_to_gpui(vt100::Color::Default)),
+            !rows[0].iter().any(|s| s.bg == fg_to_gpui(vt100::Color::Default, &THEME_LIGHT)),
             "续格上的光标不应产生反色段"
         );
         assert_eq!(row_sum(&rows[0]), COLS);
@@ -842,7 +848,7 @@ mod tests {
         let mut parser = parser_with("\u{4f60}\u{597d}abc");
         parser.process(b"\x1b[1;8H"); // 光标移到文本后 (你0-1 好2-3 abc4-6 -> col7)
         assert_eq!(parser.screen().cursor_position(), (0, 7));
-        let rows = build_grid(parser.screen());
+        let rows = build_grid(parser.screen(), &THEME_LIGHT);
         let segs = &rows[0];
         assert_eq!(seg_text(&segs[0]), "\u{4f60}");
         assert_eq!(segs[0].cols, 2, "宽字符独立成段 (2 列)");
@@ -867,10 +873,15 @@ mod tests {
     }
 
     impl Render for GridFixture {
-        fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             div()
                 .size_full()
-                .child(terminal_grid(self.parser.screen(), window, None))
+                .child(terminal_grid(
+                    self.parser.screen(),
+                    window,
+                    None,
+                    terminal_theme(cx),
+                ))
         }
     }
 
@@ -935,6 +946,75 @@ mod tests {
                 // 空行由 nbsp 撑住, 行盒不得坍缩成 0 高 (历史验收缺陷)
                 assert!(h > 0., "row {r}: 高度坍缩为 {h}");
             }
+        });
+    }
+
+    /// add-light-dark-theme task 2.3: 双主题无头渲染验证 —
+    /// (1) 默认格底 == 主题 `background` token (spec: no visible seam);
+    /// (2) 索引色格随主题换调色板 (spec: Theme switch re-maps existing screen
+    ///     的映射层);
+    /// (3) render 路径两主题均出帧且 terminal_theme 随全局主题翻转。
+    #[gpui_kit::test]
+    fn grid_renders_under_both_themes_without_seam(cx: &mut TestAppContext) {
+        use gpui_kit::component::theme::{Theme, ThemeMode};
+        use gpui_kit::Rgba;
+
+        // Rgba → u32 (round 到 8bit) — token 是 Hsla float 转换而来,
+        // 直接 float 相等会因舍入误报, 统一到色值空间比较。
+        let to_u32 = |c: Rgba| -> u32 {
+            (((c.r * 255.).round() as u32) << 16)
+                | (((c.g * 255.).round() as u32) << 8)
+                | (c.b * 255.).round() as u32
+        };
+
+        // init 必须先于 Theme::change (ThemeRegistry 全局由它注册)
+        cx.update(gpui_kit::init);
+
+        // (1) 默认格底 == background token, 两主题各验一次 (无接缝)
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            cx.update(|cx| {
+                Theme::change(mode, None, cx);
+                let theme = terminal_theme(cx);
+                let token_bg = to_u32(Theme::global(cx).background.into());
+                let cell_bg = to_u32(bg_to_gpui(vt100::Color::Default, theme));
+                assert_eq!(
+                    cell_bg, token_bg,
+                    "{mode:?}: 终端默认格底 {cell_bg:#08x} 必须等于 background token {token_bg:#08x}"
+                );
+            });
+        }
+
+        // (2) 索引色格两主题不同 (同一 screen, 仅换调色板)
+        let mut parser = parser_with("");
+        parser.process(b"\x1b[32mgreen\x1b[0m"); // 绿 = ANSI idx 2
+        let seg_under = |theme: &crate::ui::TerminalTheme| -> u32 {
+            let rows = build_grid(parser.screen(), theme);
+            let seg = rows[0]
+                .iter()
+                .find(|s| seg_text(s).contains("green"))
+                .expect("绿色文本段应存在");
+            to_u32(seg.fg)
+        };
+        let light_green = seg_under(&THEME_LIGHT);
+        let dark_green = seg_under(&THEME_DARK);
+        assert_ne!(light_green, dark_green, "索引色必须随主题换调色板");
+        assert_eq!(light_green, 0x1a7f2e);
+        assert_eq!(dark_green, 0x0dbc79);
+
+        // (3) render 路径两主题均出帧, terminal_theme 随全局主题翻转
+        let handle = open_grid(cx, parser_with(FIXTURE));
+        let _ = cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(terminal_theme(cx), &THEME_LIGHT);
+            let h = f32::from(window.find(("grid-row", 0usize)).bounds().size.height);
+            assert!(h > 0., "浅色主题下网格行应有高度");
+        });
+        cx.update(|cx| Theme::change(ThemeMode::Dark, None, cx));
+        let _ = cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(terminal_theme(cx), &THEME_DARK);
+            let h = f32::from(window.find(("grid-row", 0usize)).bounds().size.height);
+            assert!(h > 0., "深色主题下网格行应有高度");
         });
     }
 
@@ -1064,6 +1144,8 @@ mod tests {
             rows: ROWS,
             set_title: Some(Box::new(|_t: String| {})),
             copy_text: Some(Box::new(|_t: String| {})),
+            // theme: None = 未注入默认路径 (add-light-dark-theme 4.3 验证)
+            theme: None,
         })
         .expect("spawn real pi embed");
 
@@ -1114,7 +1196,7 @@ mod tests {
         }
         println!("cursor_position = {:?}", screen.cursor_position());
 
-        let grid_rows = build_grid(screen);
+        let grid_rows = build_grid(screen, &THEME_LIGHT);
         println!("== build_grid segments (predicted box x, cell_w=7.8) ==");
         let mut x = 0f32;
         for seg in &grid_rows[usize::from(row)] {
@@ -1155,6 +1237,8 @@ mod tests {
             rows: 30,
             set_title: Some(Box::new(|_t: String| {})),
             copy_text: Some(Box::new(|_t: String| {})),
+            // theme: None = 未注入默认路径 (add-light-dark-theme 4.3 验证)
+            theme: None,
         })
         .expect("spawn real pi embed");
 
@@ -1934,6 +2018,7 @@ impl Render for TerminalPanel {
         }
         // 快照先行 (每帧现读 active session — design §7.2; 拥有值进元素树)
         let selection = self.selection;
+        let theme = terminal_theme(cx);
         let pane_data = app.read(cx).active_session().map(|session| {
             let s = session.read(cx);
             PaneData {
@@ -1941,7 +2026,7 @@ impl Render for TerminalPanel {
                 path: s.0.ws_path().to_string_lossy().to_string(),
                 name: s.0.name().to_string(),
                 status: s.0.status(),
-                grid: terminal_grid(s.0.screen(), window, selection),
+                grid: terminal_grid(s.0.screen(), window, selection, theme),
             }
         });
         let grid_font = grid_font_family(window);
@@ -2056,20 +2141,20 @@ impl Render for TerminalPanel {
                 this.forward_click_coordinate(event, window, cx);
             }))
             .child(match pane_data {
-                None => render_empty(&grid_font),
+                None => render_empty(cx, &grid_font),
                 Some(data) => {
                     let starting = data.status == SessionStatus::Starting;
                     div()
                         .size_full()
                         .p_2()
-                        .bg(rgb(0xffffff))
+                        .bg(cx.theme().background)
                         .border_1()
-                        .border_color(rgb(0x4ba3d7)) // 原版同款蓝 (75,161,215)
+                        .border_color(cx.theme().accent)
                         .flex()
                         .flex_col()
-                        .child(status_bar(&data))
-                        .child(separator())
-                        .children(starting.then(|| starting_placeholder(&grid_font)))
+                        .child(status_bar(&data, cx))
+                        .child(separator(cx))
+                        .children(starting.then(|| starting_placeholder(cx, &grid_font)))
                         .child(
                             div()
                                 // 子元素 prepaint bounds → 窗口原点直存

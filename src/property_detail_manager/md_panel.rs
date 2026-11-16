@@ -13,6 +13,7 @@ use gpui_kit::base::dock::{PanelEvent, PanelId, PanelView};
 use gpui_kit::component::dock::panel_handle;
 use gpui_kit::component::dock::BasePanel;
 use gpui_kit::component::dock::Panel as ComponentPanel;
+use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::{
@@ -208,7 +209,7 @@ impl Render for MdPanel {
                 .size_full()
                 // 左右边距 (headed 验收 1: 渲染模式完全无边距)。
                 .px_4()
-                .bg(gpui_kit::rgb(0xffffff))
+                .bg(cx.theme().background)
                 // action 入口（tasks 3.1）: 与 title_suffix 按钮同 body。
                 .on_action(cx.listener(|this, _: &ToggleMdView, _window, cx| {
                     this.toggle(cx)
@@ -228,7 +229,7 @@ impl Render for MdPanel {
                     .id("md-source-pane")
                     .test_support()
                     .size_full()
-                    .bg(gpui_kit::rgb(0xffffff))
+                    .bg(cx.theme().background)
                     .on_action(cx.listener(|this, _: &ToggleMdView, _window, cx| {
                         this.toggle(cx)
                     }))

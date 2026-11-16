@@ -285,6 +285,7 @@ mod tests {
         fn resize(&mut self, _cols: u16, _rows: u16) -> bool {
             false
         }
+        fn set_theme(&mut self, _theme: pi_shell_rs::app::theme::TuiTheme) {}
     }
 
     use std::path::Path;
