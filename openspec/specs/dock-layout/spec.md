@@ -11,6 +11,7 @@ module will fill.
 ## Requirements
 
 
+
 ### Requirement: Left dock draggable resize
 
 The left dock SHALL be resizable by dragging its right edge, clamped to a safe
@@ -42,9 +43,9 @@ remain reachable at all times.
 On startup the right dock SHALL be visible and render the file tree panel: a
 header carrying the panel title, a refresh control, a read-only summary of
 the active filter rules, and a close button, plus a body area that shows the
-workspace file tree or its empty state. The panel SHALL register through the
-dock's standard panel path so resize and close mechanics apply to it
-unchanged.
+asset tree of registered projects or its empty state. The panel SHALL
+register through the dock's standard panel path so resize and close mechanics
+apply to it unchanged.
 
 #### Scenario: Right dock visible on startup
 

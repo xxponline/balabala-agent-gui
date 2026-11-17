@@ -9,6 +9,7 @@ projects and modules must satisfy.
 
 ## Requirements
 
+
 ### Requirement: Solution configuration file
 
 A workspace SHALL carry its solution configuration in `balabala.solutions.json`
@@ -26,7 +27,6 @@ with zero projects.
 
 - **WHEN** a workspace loads and `balabala.solutions.json` does not exist
 - **THEN** the workspace opens with no project rows and no error
-
 ### Requirement: Solution type registry resolves items to projects
 
 Each solution item's `SolutionType` SHALL resolve through a registry of
@@ -45,14 +45,15 @@ that path with a single root module named after the project.
 
 - **WHEN** the solutions file contains two `simple` items with distinct paths
 - **THEN** the model contains exactly two projects, one per item
-
 ### Requirement: Project and module structure shape
 
 A project SHALL have a stable name and a root directory path. Each project
-SHALL have exactly one root module whose name equals the project's name, and
-MAY gain child modules as solutions emit them. Project dependencies and module
-references SHALL form a DAG (no cycles); validation SHALL reject cyclic
-output once a solution type can emit multiple projects or module references.
+SHALL have exactly one root module named after the project and rooted at the
+project's root directory. Every module SHALL carry the filesystem root that
+defines the assets it enumerates, and MAY gain child modules as solutions
+emit them. Project dependencies and module references SHALL form a DAG;
+cyclic output SHALL be rejected once solutions can emit multiple projects or
+module references.
 
 #### Scenario: Root module shares the project name
 
@@ -66,6 +67,11 @@ output once a solution type can emit multiple projects or module references.
 - **THEN** loading that workspace fails validation and the failure surfaces
   through the solution load-error contract
 
+#### Scenario: Module root mirrors the project root
+
+- **WHEN** a project rooted at `/a/bar` is loaded with its single root module
+- **THEN** the root module's filesystem root is `/a/bar`, defining its
+  enumeration scope
 ### Requirement: Solution load failure blocks the workspace
 
 If `balabala.solutions.json` cannot be parsed, declares an unknown
@@ -95,7 +101,6 @@ an empty project list.
   the registry
 - **THEN** an error dialog describes the unknown type and the workspace is
   not opened
-
 ### Requirement: Solution creation via path picker
 
 A workspace with zero projects SHALL offer an add-solution action in the left
