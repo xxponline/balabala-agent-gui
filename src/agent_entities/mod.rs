@@ -33,8 +33,9 @@ pub trait AgentEntity {
     /// sidebar 上显示的名字, 例如 "pi-1"
     fn name(&self) -> &str;
 
-    /// agent 启动时的工作目录 (workspace 路径)
-    fn ws_path(&self) -> &Path;
+    /// agent 会话挂载的 Project 根 (= 启动工作目录 cwd; spec: Session
+    /// working directory — sidebar 分组与状态栏路径都读它)
+    fn project_root(&self) -> &Path;
 
     /// 当前 vt100 屏幕 (UI 直接读 cell(r, c))
     fn screen(&self) -> &Screen;

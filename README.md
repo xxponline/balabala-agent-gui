@@ -8,23 +8,38 @@
 
 ## 简介 / Overview
 
-这是一个个人 Agent 工作台：左侧管理 workspace 与 agent 会话，中央是网格化
-渲染的终端控制台（多页签，console 恒为首签），右侧是可过滤的文件树。会话
-通过进程内嵌的 pi-shell-rs 引擎驱动，输出以 vt100 帧解析、逐格绘制到 GPUI
-上——键盘、IME、翻页、滚轮、点击坐标与文本选区都在宿主与会话之间原样转发。
+这是一个个人 Agent 工作台：单实例一次打开一个工作区（启动恢复最近目录，
+否则窗内选择），左槽是 Project/Agent 树与工作区切换入口，中央是网格化
+渲染的终端控制台（多页签，console 恒为首签），右侧是可过滤的文件树。
+工作区由 `balabala.solutions.json` 配置 Solution → Project/Module 结构，
+agent 会话挂在其 Project 下（cwd = project root）。会话通过进程内嵌的
+pi-shell-rs 引擎驱动，输出以 vt100 帧解析、逐格绘制到 GPUI 上——键盘、
+IME、翻页、滚轮、点击坐标与文本选区都在宿主与会话之间原样转发。
 
-This is a personal agent workbench: workspaces and agent sessions live in the
-left sidebar, a grid-rendered terminal console occupies the center tabs
-(the console is always the first, non-closable tab), and a filterable file
-tree sits on the right. Sessions are powered by an in-process pi-shell-rs
+This is a personal agent workbench: one workspace is open at a time (the
+latest directory is restored at startup, otherwise an in-window picker
+offers one); the left slot is a Project/Agent tree with a workspace switch
+entry, a grid-rendered terminal console occupies the center tabs (the
+console is always the first, non-closable tab), and a filterable file tree
+sits on the right. Solutions in `balabala.solutions.json` expand to a
+Project/Module structure, and agent sessions mount under their project with
+the project root as cwd. Sessions are powered by an in-process pi-shell-rs
 engine; their output is parsed as vt100 frames and painted cell-by-cell onto
 GPUI — keyboard, IME, paging, wheel scrolling, click coordinates and text
 selection are all forwarded faithfully between host and session.
 
 ## 功能 / Features
 
-- **三槽停靠布局 / Three-pane dock layout** — 会话侧栏 · 中央终端 · 文件树 /
-  sidebar · center terminal · file tree
+- **单工作区生命周期 / Single-workspace lifecycle** — 启动恢复最近目录、
+  窗内选择/确认创建、切换三支门控（活动会话拦截/仅 exited 确认/直通）/
+  restore the latest directory at startup, in-window picker + create
+  confirmation, gated switching (active blocked / exited confirmed / direct)
+- **Solution → Project 模型 / Solution-driven projects** —
+  `balabala.solutions.json` 展开 Project/Module 树，agent 挂 Project 下
+  (cwd = project root) / solutions expand to projects; agents mount per
+  project with the project root as cwd
+- **三槽停靠布局 / Three-pane dock layout** — 切换/项目侧栏 · 中央终端 · 文件树 /
+  sidebar with project tree · center terminal · file tree
 - **多页签中槽 / Center tabs** — console 恒为首签不可关，文件按需开签去重 /
   console pinned as the first non-closable tab; files open into deduplicated tabs
 - **只读代码查看器 / Read-only code viewer** — `.rs` 文件内建 Editor 打开，
@@ -42,12 +57,14 @@ selection are all forwarded faithfully between host and session.
 
 ```
 src/
-├── app.rs              主状态与事件漏斗 / main state & event funnel
+├── app.rs              主状态与事件漏斗 (启动/切换/门控) / main state & event funnel
 ├── shell/              DockArea 三槽装配 / three-pane dock assembly
 ├── pane/               中央终端面板: 网格渲染 + 输入转发 / center terminal
 ├── property_detail_manager/  默认打开系统 (页签分发/dedup) / default-open dispatch
-├── sidebar/            会话侧栏 / sessions sidebar
+├── sidebar/            左槽: 切换入口 + Project/Agent 树 / project tree sidebar
 ├── tree/               文件树面板 / file tree panel
+├── project_model/      领域模型: solutions → Project/Module (纯数据层) / domain model
+├── workspace/          工作区实体 + 全局历史 + legacy 迁移 / workspace, history, migration
 ├── workspace_property_source/  文件树数据源 (插件化) / pluggable tree data source
 └── agent_entities/     会话实体 (pi-shell-rs 嵌入) / session entities
 
@@ -80,11 +97,13 @@ Development follows OpenSpec; durable behavior contracts live in `openspec/specs
 
 | Capability | 说明 / Description |
 | --- | --- |
-| `agent-shell` | 会话外壳：焦点、键盘/滚轮/点击转发、选区复制 (20 reqs) |
-| `center-tabs` | 中槽页签与默认打开系统 (4 reqs) |
+| `agent-shell` | 会话外壳：Project 树、焦点、键盘/滚轮/点击转发、选区复制 (27 reqs) |
+| `center-tabs` | 中槽页签与默认打开系统 (6 reqs) |
 | `dock-layout` | 三槽停靠布局 (5 reqs) |
-| `file-tree` | 文件树数据源与交互 (7 reqs) |
-| `workspace-management` | workspace 持久化管理 (8 reqs) |
+| `file-tree` | 文件树数据源与交互 (11 reqs) |
+| `project-model` | Solution → Project/Module 结构与加载契约 (5 reqs) |
+| `theming` | 浅色/深色主题与终端配色映射 (5 reqs) |
+| `workspace-management` | 单工作区生命周期：恢复/选择/创建/切换 (8 reqs) |
 
 已完成的变更归档于 `openspec/changes/archive/`；
 工作流：`openspec new change` → propose → apply → sync → archive。

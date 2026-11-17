@@ -9,6 +9,7 @@ described by the data source.
 
 ## Requirements
 
+
 ### Requirement: Tree scope follows active workspace
 
 The tree SHALL be rooted at the absolute path of the workspace containing the
@@ -30,7 +31,6 @@ switching to a different workspace SHALL rescan and replace the tree.
 
 - **WHEN** no agent session is active
 - **THEN** the right dock body shows an empty-state hint instead of a tree
-
 ### Requirement: Default scan exclusions
 
 The scan SHALL exclude `.git`, `node_modules`, `target`, `build`, `dist`, and
@@ -46,25 +46,26 @@ SHALL render directory rows distinguishably from file rows.
 
 - **WHEN** the workspace root contains a `.gitignore` file
 - **THEN** `.gitignore` appears as a file row in the tree
-
 ### Requirement: File-row filtering with gitignore-style rules
 
-Filter rules SHALL come from the `file_tree` section of `.workspaces.json`,
-keyed by the workspace's absolute path, as an array of pattern strings. With
-no entry every file row shows. Patterns support wildcards (`*`, `?`, `**`)
-and path components relative to the workspace root; the last matching rule
-wins and a `!` prefix re-includes (gitignore semantics). Rules SHALL apply
-to file rows only: directory rows always remain visible.
+Filter rules SHALL come from the `file_tree` section of the active workspace's
+`.balabala.workspace.json`, as an array of pattern strings. With no section or
+an empty array every file row shows. Patterns support wildcards (`*`, `?`,
+`**`) and path components relative to the workspace root; the last matching
+rule wins and a `!` prefix re-includes (gitignore semantics). Rules SHALL
+apply to file rows only: directory rows always remain visible.
 
 #### Scenario: Empty rules show everything
 
-- **WHEN** the workspace has no `file_tree` entry or an empty array
+- **WHEN** the workspace's `.balabala.workspace.json` has no `file_tree`
+  section or an empty array
 - **THEN** all non-excluded file rows are visible
 
 #### Scenario: Hide matching files
 
 - **WHEN** the rules are `["*.log"]` and `docs/` contains only `.log` files
-- **THEN** all `.log` file rows are hidden while other files remain, and the `docs/` directory row is still visible
+- **THEN** all `.log` file rows are hidden while other file rows are visible,
+  and the `docs/` directory row is still visible
 
 #### Scenario: Deny-all with re-include
 
@@ -76,6 +77,11 @@ to file rows only: directory rows always remain visible.
 - **WHEN** the rules are `["*", "!*.rs", "*_test.rs"]`
 - **THEN** `foo.rs` is shown while `foo_test.rs` is hidden
 
+#### Scenario: Rules re-read from workspace config on refresh
+
+- **WHEN** the user edits the `file_tree` section in the workspace's
+  `.balabala.workspace.json` and clicks the refresh control
+- **THEN** the tree applies the newly read rules
 ### Requirement: Left-click open hook
 
 Left-clicking a file row SHALL select it and trigger the default open action
@@ -111,7 +117,6 @@ delivered to the panel of the active center tab.
 - **WHEN** the user clicks any tree row and then types
 - **THEN** the keystrokes are delivered to the active center tab's panel
   (the active session when the console tab is active), not to the tree panel
-
 ### Requirement: Right-click context menu
 
 Right-clicking any file or directory row SHALL open a context menu whose
@@ -133,7 +138,6 @@ dispatch back to the data source for execution.
 
 - **WHEN** the user activates reveal in Finder on a file row
 - **THEN** Finder opens with that file selected
-
 ### Requirement: Refresh triggers and behavior
 
 The tree SHALL rescan on first load, when the active workspace root path
@@ -156,7 +160,6 @@ previously expanded directories.
 
 - **WHEN** `src/` was expanded before the user clicks refresh
 - **THEN** `src/` is still expanded after the refresh completes
-
 ### Requirement: Empty and degraded states
 
 When no agent is active the panel SHALL show an empty-state hint. When the
@@ -167,7 +170,6 @@ degraded-state hint and SHALL NOT crash or present stale content as current.
 
 - **WHEN** the workspace directory no longer exists and the user clicks refresh
 - **THEN** the panel shows a degraded-state hint and the application keeps running
-
 ### Requirement: Frame-driven notifications do not rebuild the tree
 
 Consuming a terminal frame (or any other data-change notification) SHALL NOT
@@ -195,7 +197,6 @@ explicit refresh.
 - **WHEN** a background scan lands or the filter rules change
 - **THEN** the view is recomputed once and subsequent frames use the new
   cached view
-
 ### Requirement: Data-change notification is O(1) when nothing changed
 
 A data-change notification whose inputs are unchanged SHALL perform work
@@ -207,7 +208,6 @@ the tree, no deep equality comparison, and no disk reads.
 - **WHEN** a data-change notification fires for a workspace with 500,000
   files and none of the view's inputs have changed
 - **THEN** the notification completes without traversing the scanned tree
-
 ### Requirement: In-flight scan is not restarted by notifications
 
 While a background scan for the current root is still running, subsequent
@@ -226,7 +226,6 @@ explicit refresh action.
 
 - **WHEN** the user clicks the refresh control while a scan is in flight
 - **THEN** a new scan is started per the refresh requirement
-
 ### Requirement: Tree panel skips work while not rendered
 
 When the right-dock tree panel is not rendered, data-change notifications

@@ -85,6 +85,7 @@ mod tests {
     use crate::agent_entities::{AgentEntity, AgentSession, SessionStatus};
     use crate::app::TerminalApp;
     use crate::sidebar::SidebarEvent;
+    use crate::project_model::WorkspaceModel;
     use crate::workspace::Workspace;
     use gpui_kit::component::dock::BasePanel;
     use gpui_kit::component::dock::PanelHandle;
@@ -97,7 +98,7 @@ mod tests {
     use std::path::PathBuf;
     use std::rc::Rc;
 
-    /// 起完整 app（隔离 `.workspaces.json`, 模式同 tree tests）。
+    /// 起完整 app（隔离全局历史/外部配置, 模式同 tree tests）。
     fn open_app(
         cx: &mut TestAppContext,
     ) -> (AnyWindowHandle, gpui_kit::Entity<TerminalApp>) {
@@ -112,11 +113,14 @@ mod tests {
                     ..Default::default()
                 },
                 cx,
-                |window, cx| cx.new(|cx| TerminalApp::new(window, cx).expect(".workspaces.json")),
+                |window, cx| cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动")),
             )
             .expect("open test window")
         });
-        app.update(cx, |app, _| app.workspaces.clear());
+        app.update(cx, |app, _| {
+            app.workspace = None;
+            app.active = None;
+        });
         (handle, app)
     }
 
@@ -256,7 +260,7 @@ mod tests {
         fn name(&self) -> &str {
             &self.name
         }
-        fn ws_path(&self) -> &Path {
+        fn project_root(&self) -> &Path {
             &self.ws
         }
         fn screen(&self) -> &vt100::Screen {
@@ -310,7 +314,7 @@ mod tests {
         let clicks = Rc::new(Cell::new(None));
         cx.update(|cx| {
             app.update(cx, |app, cx| {
-                app.workspaces.push(Workspace::new(ws.clone()));
+                app.workspace = Some(Workspace::new(ws.clone(), WorkspaceModel::default()));
                 let agent = cx.new(|_| {
                     AgentSession(Box::new(CountingAgent::new(
                         "pi-1",
@@ -322,7 +326,11 @@ mod tests {
                     )))
                 });
                 let id = agent.entity_id();
-                app.workspaces[0].agents.push(agent);
+                app.workspace
+                    .as_mut()
+                    .expect("注入的 workspace")
+                    .agents
+                    .push(agent);
                 app.active = Some(id);
                 app.notify_panels(cx);
             });

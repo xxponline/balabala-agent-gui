@@ -159,11 +159,12 @@ pub fn status_bar(data: &PaneData, cx: &App) -> Div {
         .gap_2()
         .px_3()
         .py_1()
-        .child(
-            div()
-                .text_color(cx.theme().accent)
-                .child(format!("● {} — {}", data.path, data.name)),
-        )
+        .child({
+            // spec: Console status bar content — project root 路径 + 前缀名;
+            // texts() 只收录 test_text (5.4 断言口)
+            let head = format!("● {} — {}", data.path, data.name);
+            div().text_color(cx.theme().accent).child(head.clone()).test_text(head)
+        })
         .child({
             let status_text = format!("[{:?}]", data.status);
             div()
@@ -2022,8 +2023,9 @@ impl Render for TerminalPanel {
         let pane_data = app.read(cx).active_session().map(|session| {
             let s = session.read(cx);
             PaneData {
-                // 用 session 自己的 ws_path (AgentEntity 契约)
-                path: s.0.ws_path().to_string_lossy().to_string(),
+                // 用 session 自己的 project_root (AgentEntity 契约 = cwd;
+                // spec: Console status bar content 显示 project root 路径)
+                path: s.0.project_root().to_string_lossy().to_string(),
                 name: s.0.name().to_string(),
                 status: s.0.status(),
                 grid: terminal_grid(s.0.screen(), window, selection, theme),

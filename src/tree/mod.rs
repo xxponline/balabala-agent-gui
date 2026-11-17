@@ -27,7 +27,6 @@ use gpui_kit::component::tree::{TreeEvent, TreeItem, TreeState, tree};
 use gpui_kit::*;
 
 use crate::app::TerminalApp;
-use crate::workspace::store;
 use crate::workspace_property_source::{
     create_source, SourceEffect, SourceNode, SourceNodeKind, SourceView, WorkspacePropertySource,
     DEFAULT_SOURCE_ID,
@@ -58,7 +57,7 @@ pub struct TreePanel {
 
 impl TreePanel {
     pub fn new(app: WeakEntity<TerminalApp>, cx: &mut Context<Self>) -> Self {
-        let source = create_source(DEFAULT_SOURCE_ID, app.clone(), store::filepath())
+        let source = create_source(DEFAULT_SOURCE_ID, app.clone())
             .expect("默认数据源必须在注册表中注册");
         let tree_state = cx.new(|cx| TreeState::new(cx));
         let tree_events = cx.subscribe(&tree_state, |this, _state, event: &TreeEvent, cx| {
@@ -480,6 +479,7 @@ mod tests {
         size,
     };
     use crate::agent_entities::{AgentEntity, AgentSession, SessionStatus};
+    use crate::project_model::WorkspaceModel;
     use crate::workspace::Workspace;
     use std::cell::Cell;
     use std::path::{Path, PathBuf};
@@ -610,14 +610,16 @@ mod tests {
                     ..Default::default()
                 },
                 cx,
-                |window, cx| cx.new(|cx| TerminalApp::new(window, cx).expect(".workspaces.json 加载")),
+                |window, cx| cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动")),
             )
             .expect("open test window")
         });
-        // 隔离外部配置: TerminalApp::new 会加载 CWD 的 `.workspaces.json`
-        // (gitignored, 跑过一次 app 就可能出现), 按位置索引的测试会被
-        // 多出来的条目错位 — 起完先清空, 各测试只注入自己的内存 workspace。
-        app.update(cx, |app, _| app.workspaces.clear());
+        // 隔离外部状态: 起完置空 (历史为空 → 无恢复), 各测试只注入
+        // 自己的内存 workspace (hermetic — 2026-11-09 外部状态错位教训)。
+        app.update(cx, |app, _| {
+            app.workspace = None;
+            app.active = None;
+        });
         (handle, app)
     }
 
@@ -667,7 +669,7 @@ mod tests {
         fn name(&self) -> &str {
             &self.name
         }
-        fn ws_path(&self) -> &Path {
+        fn project_root(&self) -> &Path {
             &self.ws
         }
         fn screen(&self) -> &vt100::Screen {
@@ -706,42 +708,36 @@ mod tests {
         cx.run_until_parked();
     }
 
-    /// 写 hermetic 规则文件 (tag 隔离并行测试)。
-    fn write_rules_file(tag: &str, ws: &Path, rules: &[&str]) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("tree-rules-{tag}-{}.json", std::process::id()));
-        // 形状必须完整: Persisted.workspaces 无 serde default (spec: 缺键 =
-        // 损坏文件), 所以测试配置也要带 workspaces 键
-        let json = serde_json::json!({
-            "workspaces": [],
-            "file_tree": { ws.to_string_lossy().as_ref(): rules }
-        });
-        std::fs::write(&path, json.to_string()).unwrap();
-        path
+    /// 写 hermetic 规则 (进工作区自己的配置文件 — file-tree delta:
+    /// 规则来源 = `.balabala.workspace.json` 的 `file_tree` 区段,
+    /// 不再按 workspace 路径键控)。
+    fn write_rules(ws: &Path, rules: &[&str]) {
+        let owned: Vec<String> = rules.iter().map(|s| (*s).to_string()).collect();
+        crate::project_model::set_file_tree_rules(ws, owned).unwrap();
     }
 
-    /// 注入真实 `FileTreeSource`（`rules_path` 测试缝）+ 活动 workspace +
-    /// 首次激活通知（根变化 → 触发 part1 扫描，spec: first load）。
+    /// 注入真实 `FileTreeSource`（规则经工作区自己的配置文件）+ 活动
+    /// workspace + 首次激活通知（根变化 → 触发 part1 扫描，spec: first load）。
     fn setup_filetree(
         cx: &mut TestAppContext,
         app: &gpui_kit::Entity<TerminalApp>,
         ws: &Path,
-        rules_file: Option<&Path>,
+        rules: Option<&[&str]>,
     ) {
         let weak = cx.update(|_| app.downgrade());
-        let rules_path = rules_file
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("/nonexistent-filetree-rules"));
-        let source =
-            crate::workspace_property_source::filetree::FileTreeSource::new(weak, rules_path);
+        let source = crate::workspace_property_source::filetree::FileTreeSource::new(weak);
         let tree = cx.update(|cx| app.read(cx).tree.clone());
         tree.update(cx, |panel, cx| panel.set_source(Box::new(source), cx));
+        if let Some(r) = rules {
+            write_rules(ws, r);
+        }
 
         app.update(cx, |app, cx| {
-            app.workspaces.push(Workspace::new(ws.to_path_buf()));
+            app.workspace = Some(Workspace::new(ws.to_path_buf(), WorkspaceModel::default()));
             let agent = cx.new(|_| AgentSession(Box::new(FakeAgent::new("pi-1", ws))));
             let id = agent.entity_id();
-            app.workspaces
-                .last_mut()
+            app.workspace
+                .as_mut()
                 .expect("注入的 workspace")
                 .agents
                 .push(agent);
@@ -861,20 +857,29 @@ mod tests {
         std::fs::write(ws1.join("scope-a.txt"), "a").unwrap();
         std::fs::write(ws2.join("scope-c.txt"), "c").unwrap();
 
-        // 注入两 ws；ws1 两个 agent（同 ws 切换用），ws2 一个
-        let (i2, i3) = app.update(cx, |app, cx| {
-            app.workspaces.push(Workspace::new(ws1.clone()));
-            app.workspaces.push(Workspace::new(ws2.clone()));
+        // 注入 ws1 (双 agent, 同 ws 切换用); ws2 的会话实体先建好,
+        // “切 workspace”步整体替换 workspace — 单实例模型下切换 = 旧
+        // workspace 整体换下 (UI 路径经 commit_open, 这里直换状态测
+        // “根变化 → 重扫”机制本身)
+        let (i2, a3) = app.update(cx, |app, cx| {
+            app.workspace = Some(Workspace::new(ws1.clone(), WorkspaceModel::default()));
             let a1 = cx.new(|_| AgentSession(Box::new(FakeAgent::new("pi-1", &ws1))));
             let a2 = cx.new(|_| AgentSession(Box::new(FakeAgent::new("pi-2", &ws1))));
             let a3 = cx.new(|_| AgentSession(Box::new(FakeAgent::new("pi-1", &ws2))));
-            let (i1, i2, i3) = (a1.entity_id(), a2.entity_id(), a3.entity_id());
-            app.workspaces[0].agents.push(a1);
-            app.workspaces[0].agents.push(a2);
-            app.workspaces[1].agents.push(a3);
+            let (i1, i2) = (a1.entity_id(), a2.entity_id());
+            app.workspace
+                .as_mut()
+                .expect("注入的 ws1")
+                .agents
+                .push(a1);
+            app.workspace
+                .as_mut()
+                .expect("注入的 ws1")
+                .agents
+                .push(a2);
             app.active = Some(i1);
             app.notify_panels(cx); // 首次激活 → 根变化 → 扫描
-            (i2, i3)
+            (i2, a3)
         });
         cx.run_until_parked();
         render(handle, cx);
@@ -907,7 +912,14 @@ mod tests {
         .expect("update window");
 
         // 切到另一 workspace → 换树（根变化 → 重扫）
+        let i3 = a3.entity_id();
         app.update(cx, |app, cx| {
+            app.workspace = Some(Workspace::new(ws2.clone(), WorkspaceModel::default()));
+            app.workspace
+                .as_mut()
+                .expect("注入的 ws2")
+                .agents
+                .push(a3);
             app.active = Some(i3);
             app.notify_panels(cx);
         });
@@ -944,10 +956,10 @@ mod tests {
         let ws = temp_ws("empty");
         std::fs::write(ws.join("empty-scope.txt"), "x").unwrap();
         app.update(cx, |app, cx| {
-            app.workspaces.push(Workspace::new(ws.clone()));
+            app.workspace = Some(Workspace::new(ws.clone(), WorkspaceModel::default()));
             let agent = cx.new(|_| AgentSession(Box::new(FakeAgent::new("pi-1", &ws))));
             let id = agent.entity_id();
-            app.workspaces[0].agents.push(agent);
+            app.workspace.as_mut().expect("注入的 workspace").agents.push(agent);
             app.active = Some(id);
             app.notify_panels(cx);
         });
@@ -1196,7 +1208,7 @@ mod tests {
             FUNC_COPY_PATH, FUNC_REVEAL, FileTreeSource,
         };
         let weak = cx.update(|_| app.downgrade());
-        let mut source = FileTreeSource::new(weak, PathBuf::from("/nonexistent-rules"));
+        let mut source = FileTreeSource::new(weak);
         assert_eq!(
             source.execute("/a/proj/main.rs", FUNC_REVEAL),
             vec![SourceEffect::RevealPath(PathBuf::from("/a/proj/main.rs"))],
@@ -1270,7 +1282,7 @@ mod tests {
         std::fs::write(ws.join("slow-a.txt"), "x").unwrap();
 
         let weak = cx.update(|_| app.downgrade());
-        let source = FileTreeSource::new(weak, PathBuf::from("/nonexistent-filetree-rules"));
+        let source = FileTreeSource::new(weak);
         let scans = source.scan_starts_handle();
         let tree = cx.update(|cx| app.read(cx).tree.clone());
         tree.update(cx, |panel, cx| panel.set_source(Box::new(source), cx));
@@ -1278,11 +1290,11 @@ mod tests {
         // 激活 → 首次通知 (defer 于 update finish flush) → refresh 启动
         // 扫描; 不 pump → 后台扫描保持在途 (TestDispatcher 显式 tick)
         app.update(cx, |app, cx| {
-            app.workspaces.push(Workspace::new(ws.clone()));
+            app.workspace = Some(Workspace::new(ws.clone(), WorkspaceModel::default()));
             let agent = cx.new(|_| AgentSession(Box::new(FakeAgent::new("pi-1", &ws))));
             let id = agent.entity_id();
-            app.workspaces
-                .last_mut()
+            app.workspace
+                .as_mut()
                 .expect("注入的 workspace")
                 .agents
                 .push(agent);
@@ -1331,16 +1343,16 @@ mod tests {
         std::fs::write(ws.join("restart-a.txt"), "x").unwrap();
 
         let weak = cx.update(|_| app.downgrade());
-        let source = FileTreeSource::new(weak, PathBuf::from("/nonexistent-filetree-rules"));
+        let source = FileTreeSource::new(weak);
         let scans = source.scan_starts_handle();
         let tree = cx.update(|cx| app.read(cx).tree.clone());
         tree.update(cx, |panel, cx| panel.set_source(Box::new(source), cx));
         app.update(cx, |app, cx| {
-            app.workspaces.push(Workspace::new(ws.clone()));
+            app.workspace = Some(Workspace::new(ws.clone(), WorkspaceModel::default()));
             let agent = cx.new(|_| AgentSession(Box::new(FakeAgent::new("pi-1", &ws))));
             let id = agent.entity_id();
-            app.workspaces
-                .last_mut()
+            app.workspace
+                .as_mut()
                 .expect("注入的 workspace")
                 .agents
                 .push(agent);
@@ -1439,16 +1451,16 @@ mod tests {
 
         // 注入 + 激活, 不 pump → 首扫在途 (TestDispatcher 显式 tick)
         let weak = cx.update(|_| app.downgrade());
-        let source = FileTreeSource::new(weak, PathBuf::from("/nonexistent-filetree-rules"));
+        let source = FileTreeSource::new(weak);
         let scans = source.scan_starts_handle();
         let tree = cx.update(|cx| app.read(cx).tree.clone());
         tree.update(cx, |panel, cx| panel.set_source(Box::new(source), cx));
         app.update(cx, |app, cx| {
-            app.workspaces.push(Workspace::new(ws.clone()));
+            app.workspace = Some(Workspace::new(ws.clone(), WorkspaceModel::default()));
             let agent = cx.new(|_| AgentSession(Box::new(FakeAgent::new("pi-1", &ws))));
             let id = agent.entity_id();
-            app.workspaces
-                .last_mut()
+            app.workspace
+                .as_mut()
                 .expect("注入的 workspace")
                 .agents
                 .push(agent);
@@ -1532,8 +1544,7 @@ mod tests {
         let ws = temp_ws("reread");
         std::fs::write(ws.join("reread-a.txt"), "x").unwrap();
         std::fs::write(ws.join("reread-b.rs"), "x").unwrap();
-        let rules = write_rules_file("reread", &ws, &["*.txt"]);
-        setup_filetree(cx, &app, &ws, Some(&rules));
+        setup_filetree(cx, &app, &ws, Some(&["*.txt"]));
         render(handle, cx);
         cx.update_window(handle, |_, window, _cx| {
             assert!(
@@ -1548,7 +1559,7 @@ mod tests {
         .expect("update window");
 
         // 改配置文件 → ⟳ 重读规则 (spec: refresh re-reads filter rules)
-        write_rules_file("reread", &ws, &["*.rs"]);
+        write_rules(&ws, &["*.rs"]);
         click_id(handle, "tree-refresh", cx);
         render(handle, cx);
         cx.update_window(handle, |_, window, _cx| {
@@ -1644,8 +1655,7 @@ mod tests {
         let (handle, app) = open_app(cx);
         let ws = temp_ws("summary");
         std::fs::write(ws.join("summary-a.txt"), "x").unwrap();
-        let rules = write_rules_file("summary", &ws, &["*.txt"]);
-        setup_filetree(cx, &app, &ws, Some(&rules));
+        setup_filetree(cx, &app, &ws, Some(&["*.txt"]));
         render(handle, cx);
 
         let read_summary = |cx: &mut TestAppContext| -> Vec<String> {
@@ -1664,7 +1674,7 @@ mod tests {
         );
 
         // 改规则 → ⟳ → 摘要随规则更新 (spec: header chrome)
-        write_rules_file("summary", &ws, &["*.log"]);
+        write_rules(&ws, &["*.log"]);
         click_id(handle, "tree-refresh", cx);
         render(handle, cx);
         let texts = read_summary(cx);

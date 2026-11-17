@@ -38,8 +38,8 @@ const SCROLLBACK: usize = 1000;
 pub struct PiAgentShell {
     /// sidebar 上显示的名字, 例如 "pi-1"
     name: String,
-    /// agent 启动时的工作目录 (workspace 路径)
-    ws_path: PathBuf,
+    /// 挂载的 Project 根 = 启动 cwd (spec: Session working directory)
+    project_root: PathBuf,
     /// 嵌入会话句柄 (输入注入 / 取帧 / 状态 / 关闭)
     embed: EmbeddedApp,
     /// vt100 解析器: embed ANSI 帧 -> 屏幕 (UI 直接读 cell)
@@ -110,7 +110,7 @@ impl PiAgentShell {
 
         Ok(Self {
             name,
-            ws_path: cwd,
+            project_root: cwd,
             embed,
             parser,
             grid_size: (COLS, ROWS),
@@ -167,8 +167,8 @@ impl AgentEntity for PiAgentShell {
         &self.name
     }
 
-    fn ws_path(&self) -> &Path {
-        &self.ws_path
+    fn project_root(&self) -> &Path {
+        &self.project_root
     }
 
     fn screen(&self) -> &vt100::Screen {

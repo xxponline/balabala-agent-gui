@@ -1,7 +1,8 @@
-//! 主 App 状态: 持有 workspaces 列表, 以 gpui entity 形式渲染 shell。
+//! 主 App 状态: 单工作区 (workspace: Option), 以 gpui entity 形式渲染 shell。
 //!
-//! 行为规格见 openspec/specs/{agent-shell,workspace-management}。
-//! sidebar 3.x 接入, 终端面板 4.x 接入。
+//! 行为规格见 openspec/specs/{agent-shell,workspace-management,project-model}。
+//! 打开流程 (启动恢复/选择/切换门控) 见 design D5/D6; 加载失败经
+//! `open_failure` 记录 + 正式构建对话框退出。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,8 +17,10 @@ use crate::agent_entities::{AgentSession, PiAgentShell};
 use crate::pane::TerminalPanel;
 use crate::property_detail_manager::{OpenObject, active_center_panel_id, handler_for};
 use crate::shell;
+use crate::project_model::{self, MarkerStatus, WorkspaceModel};
 use crate::sidebar::{SidebarEvent, SidebarPanel};
 use crate::tree::TreePanel;
+use crate::workspace::history::History;
 use crate::workspace::{Workspace, store};
 
 // Tab 在 Terminal context 下的转发动作: gpui-base 的 Root 全局绑定
@@ -27,12 +30,24 @@ use crate::property_detail_manager::md_panel::ToggleMdView;
 actions!(terminal, [TerminalTab, TerminalCopy]);
 
 pub struct TerminalApp {
-    /// 所有 workspace (每个持有一个路径 + 该路径下的 agents)
-    pub workspaces: Vec<Workspace>,
+    /// 当前打开的工作区 (单实例, spec: Startup workspace restore;
+    /// None = 空态, 等待目录选择器)
+    pub workspace: Option<Workspace>,
+    /// 打开代号: `begin_open` 自增, `commit_open` 校验 — 旧 load 的结果
+    /// 直接丢弃 (design D5: 切换与在途加载的竞态)
+    pub load_epoch: u64,
+    /// 最近一次工作区打开失败 (错误框+退出路径的测试观测面;
+    /// 正式构建在记录后 dialog + exit)
+    pub open_failure: Option<String>,
+    /// 切换门控提示 (spec: notice naming the count of active sessions)
+    pub notice: Option<String>,
     /// 当前 active session 的稳定身份 (D4: gpui EntityId, 索引删除不错位)
     pub active: Option<EntityId>,
-    /// 最近一次持久化失败的错误信息 (在 sidebar 顶部显示)
+    /// 最近一次持久化失败的错误信息 (在 sidebar 顶部显示; spec:
+    /// Persistence write failure surfacing — 配置写失败红条)
     pub save_error: Option<String>,
+    /// 历史文件路径 (测试缝: `new_inner` 注入; 正式 = 全局应用数据目录)
+    pub history_path: PathBuf,
     /// DockArea 布局引擎 (design D1): 左|中|右三槽由它编排,
     /// 是 R3 外壳容器 (`render` 的根 div) 的子节点
     pub dock_area: Entity<DockArea>,
@@ -47,8 +62,11 @@ pub struct TerminalApp {
     /// 输入触发的快速 drain burst (design D7): 8ms×4 拍取到帧即停,
     /// 新输入 drop 旧 task 重置; 消除 50ms 主循环的相位抖动卡顿
     _input_drain_task: Option<Task<()>>,
-    /// 进行中的异步文件夹选择任务 (design D8; 换新对话框时旧任务被取消)
+    /// 进行中的异步文件夹/确认对话任务 (design D8; 换新对话框时旧任务被取消)
     _dialog_task: Option<Task<()>>,
+    /// 在途工作区打开任务 (begin_open 独立存根 — 不能与对话任务互顶,
+    /// 否则 picker 回调里触发的 begin_open 会取消自己)
+    _open_task: Option<Task<()>>,
     /// 系统外观订阅 (add-light-dark-theme D1): 启动同步 + 热切换时重新
     /// sync 主题; 存实体上保活 (drop 即退订)
     _appearance_subscription: Subscription,
@@ -70,8 +88,23 @@ pub struct TerminalApp {
 }
 
 impl TerminalApp {
-    /// 启动时从 `.workspaces.json` 读取, 失败时返回 Err 让 main 退出。
+    /// 启动入口: 默认读全局历史文件 (design D4)。
+    ///
+    /// 打开失败不从这里返回 — 经后台探测回主线程记录 `open_failure`
+    /// 并 (正式构建) 对话框+退出; 返回 Err 的旧路径保留给 main 的防御分支。
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Result<Self, String> {
+        Self::new_inner(window, cx, crate::workspace::history::default_path())
+    }
+
+    /// 启动接线 (design D5): 主窗先行 → 有历史则异步 load 最近工作区
+    /// (带 epoch 防竞态), 无历史/目标失效 → 空态选择器 (spec: Startup
+    /// workspace restore)。`history_path` 是测试缝 (hermetic: 测试不碰
+    /// 真实应用数据目录)。
+    pub fn new_inner(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        history_path: PathBuf,
+    ) -> Result<Self, String> {
         // Terminal context 下的 tab 终端转发绑定 (Root 的焦点遍历
         // 绑定在更浅的 context, 被这条压过 — design D5)
         cx.bind_keys([
@@ -85,8 +118,17 @@ impl TerminalApp {
             KeyBinding::new("cmd-shift-m", ToggleMdView, None),
         ]);
 
-        let paths = store::load()?;
-        let workspaces = paths.into_iter().map(Workspace::new).collect();
+        let mut history = History::load_at(&history_path);
+        // legacy 播种: 正式构建一次性 (legacy_seeded 落盘后不再读);
+        // cfg(test) 关闭 — 仓库根可能残留 legacy 文件, 测试不得读外部状态
+        // (hermetic 教训, 2026-11-09)。播种逻辑本体见 store::seed_legacy。
+        #[cfg(not(test))]
+        if store::seed_legacy(&mut history, &store::legacy_path()) {
+            if let Err(e) = history.save_at(&history_path) {
+                eprintln!("workspace history save failed: {e}");
+            }
+        }
+        let restore = history.most_recent().map(Path::to_path_buf);
         // 装配 DockArea 三槽 (shell::build; panel_handle 包装见其文档)
         let weak_app = cx.weak_entity();
         let shell::ShellParts {
@@ -109,13 +151,18 @@ impl TerminalApp {
                 app.update(cx, |app, cx| app.push_tui_theme(cx));
             }
         });
-        Ok(Self {
-            workspaces,
+        let mut app = Self {
+            workspace: None,
+            load_epoch: 0,
+            open_failure: None,
+            notice: None,
             active: None,
             save_error: None,
+            history_path,
             _update_task: None,
             _input_drain_task: None,
             _dialog_task: None,
+            _open_task: None,
             _appearance_subscription: appearance_subscription,
             grid_resizes: 0,
             tab_forwards: 0,
@@ -126,50 +173,44 @@ impl TerminalApp {
             sidebar,
             terminal,
             tree,
-        })
+        };
+        // 有历史 → 异步恢复最近工作区; 无历史/失效 → 留空态 (不报错)
+        if let Some(path) = restore {
+            app.begin_open(path, cx);
+        }
+        Ok(app)
     }
 
-    /// 点 workspace 行: 只切折叠状态。
-    /// (spec: 不切 active, 不抢键盘焦点; 载荷 = PathBuf 稳定身份, D3)
-    pub fn toggle_collapse(&mut self, path: &Path) {
-        if let Some(ws) = self.workspaces.iter_mut().find(|w| w.path == path) {
-            ws.collapsed = !ws.collapsed;
+    /// 点 project 行: 只切该行折叠状态 (spec: Project row collapse
+    /// toggle — 不切 active/tab, 不抢焦点; 载荷 = root PathBuf 稳定身份)。
+    pub fn toggle_project_collapse(&mut self, root: &Path) {
+        if let Some(ws) = self.workspace.as_mut() {
+            if !ws.collapsed_projects.remove(root) {
+                ws.collapsed_projects.insert(root.to_path_buf());
+            }
         }
     }
 
-    /// 点 workspace 的 "×": 只在 workspace 为空时删除 + 立即持久化。
-    pub fn close_workspace(&mut self, path: &Path) {
-        let Some(ws_idx) = self.workspaces.iter().position(|w| w.path == path) else {
-            return;
+    /// 用户点了某 Project 行下的 "[+ agent]": 创建嵌入式会话
+    /// (cwd = project root, spec: Session working directory),
+    /// 命名 <project>/pi-N (per-project 计数), 并设为 active。
+    pub fn create_agent(&mut self, root: &Path, cx: &mut Context<Self>) {
+        // 先领名字 (计数在 model 的 Project 上; 借用分两段)
+        let Some(name) = self.workspace.as_mut().and_then(|ws| {
+            ws.model
+                .project_by_root_mut(root)
+                .map(|p| p.next_agent_name())
+        }) else {
+            return; // 无此 project (按钮本不该渲染)
         };
-        if !self.workspaces[ws_idx].agents.is_empty() {
-            return; // 还有 agent, 禁止删除
-        }
-        self.workspaces.remove(ws_idx);
-
-        // 无需调整 active (对比原版索引位移逻辑): EntityId 不随移位改变;
-        // 且只有空 workspace 才能删 — active 不可能指向其中的会话。
-
-        self.persist();
-    }
-
-    /// 用户点了某个 workspace 下的 "[+ agent]": 创建嵌入式 agent 会话
-    /// (进程内 pi-shell-rs + pi --mode rpc),
-    /// 命名 <dirname>/pi-N (每 workspace 独立计数), 并设为 active。
-    pub fn create_agent(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let Some(ws_idx) = self.workspaces.iter().position(|w| w.path == path) else {
-            return;
-        };
-        let (name, cwd) = {
-            let ws = &mut self.workspaces[ws_idx];
-            (ws.new_agent_name(), ws.path.clone())
-        };
-
+        let cwd = root.to_path_buf();
         match PiAgentShell::new(name, cwd, crate::ui::tui_theme(cx.theme().mode)) {
             Ok(shell) => {
                 let entity = cx.new(|_| AgentSession(Box::new(shell)));
                 self.active = Some(entity.entity_id());
-                self.workspaces[ws_idx].agents.push(entity);
+                if let Some(ws) = self.workspace.as_mut() {
+                    ws.agents.push(entity);
+                }
             }
             Err(e) => {
                 eprintln!("failed to spawn agent: {e}");
@@ -180,14 +221,9 @@ impl TerminalApp {
     /// 用户点了某个 agent 的 "×": hard kill 子进程 + 移除 + 调整 active。
     /// (载荷 = EntityId 稳定身份, D3: 不因兄弟删除错位)
     pub fn close_agent(&mut self, id: EntityId, cx: &mut Context<Self>) {
-        let Some(ws_idx) = self
-            .workspaces
-            .iter()
-            .position(|w| w.agents.iter().any(|e| e.entity_id() == id))
-        else {
+        let Some(ws) = self.workspace.as_mut() else {
             return;
         };
-        let ws = &mut self.workspaces[ws_idx];
         let Some(agent_idx) = ws.agents.iter().position(|e| e.entity_id() == id) else {
             return;
         };
@@ -197,19 +233,23 @@ impl TerminalApp {
         let removed_id = session.entity_id();
         session.update(cx, |s, _| s.0.shutdown());
 
-        // 关掉的是 active -> 切到同 workspace 内最后一个 / 无则 None
-        // (对比原版: EntityId 不因兄弟移除而错位, 其余情况 active 无需调整)
+        // 关掉的是 active -> 切到剩余最后一个 / 无则 None
+        // (单工作区: "同 workspace 内" == "剩余" — spec: the next remaining session)
         if self.active == Some(removed_id) {
-            self.active = self.workspaces[ws_idx].agents.last().map(|e| e.entity_id());
+            self.active = self
+                .workspace
+                .as_ref()
+                .and_then(|ws| ws.agents.last().map(|e| e.entity_id()));
         }
     }
 
     /// 按稳定 id 找 active session 实体 (D4: 遍历即可, 规模小)。
     pub(crate) fn active_session(&self) -> Option<&Entity<AgentSession>> {
         let active = self.active?;
-        self.workspaces
+        self.workspace
+            .as_ref()?
+            .agents
             .iter()
-            .flat_map(|w| w.agents.iter())
             .find(|e| e.entity_id() == active)
     }
 
@@ -217,7 +257,7 @@ impl TerminalApp {
     /// 外观变化时会话内容色跟随; spawn 时已注入, 此处只管热切换)。
     fn push_tui_theme(&self, cx: &mut Context<Self>) {
         let theme = crate::ui::tui_theme(cx.theme().mode);
-        for agent in self.workspaces.iter().flat_map(|w| w.agents.iter()) {
+        for agent in self.workspace.iter().flat_map(|w| w.agents.iter()) {
             let theme = theme.clone();
             agent.update(cx, |s, _| s.0.set_theme(theme));
         }
@@ -287,8 +327,8 @@ impl TerminalApp {
         cx: &mut Context<Self>,
     ) {
         let mut resized = 0usize;
-        for ws in &self.workspaces {
-            for session in &ws.agents {
+        for session in self.workspace.iter().flat_map(|w| w.agents.iter()) {
+            {
                 if session.update(cx, |s, cx| {
                     if s.0.resize(cols, rows) {
                         cx.notify();
@@ -313,48 +353,276 @@ impl TerminalApp {
         }
     }
 
-    /// 把当前 workspaces 的路径列表刷到 `.workspaces.json`,
-    /// 失败时把错误存到 self.save_error (而不是 panic)。
-    fn persist(&mut self) {
-        let paths: Vec<PathBuf> = self.workspaces.iter().map(|w| w.path.clone()).collect();
-        match store::save(&paths) {
-            Ok(_) => self.save_error = None,
-            Err(e) => self.save_error = Some(e),
+    /// 空态选择器 / 顶栏切换入口共用的打开流程 (spec: Workspace opening
+    /// via directory picker); `gated` = 切换语义, 先过三支门控 (design D6):
+    /// 活动会话拦截出 notice, 仅 exited 需确认, 无会话直通 picker。
+    pub fn request_workspace_open(&mut self, gated: bool, cx: &mut Context<Self>) {
+        self.notice = None;
+        let gate = if gated {
+            let (active, exited) = self.count_sessions(cx);
+            switch_gate(active, exited)
+        } else {
+            GateDecision::Direct
+        };
+        if let GateDecision::Block(n) = gate {
+            self.notice = Some(format!(
+                "{n} session(s) still active — close them before switching"
+            ));
+            cx.notify();
+            self.notify_panels(cx);
+            return;
+        }
+        let needs_confirm = matches!(gate, GateDecision::Confirm);
+
+        // 不能用同步 rfd 对话框: 监听器/回调期间阻塞会撞上 50ms drain 的
+        // `weak.update` 重入 (design D8 实测崩溃) — 全异步。
+        let task = cx.spawn(async move |this, cx: &mut AsyncApp| {
+            if needs_confirm {
+                let ok = rfd::AsyncMessageDialog::new()
+                    .set_title("Switch workspace?")
+                    .set_description(
+                        "Exited sessions and their preserved terminal screens will be discarded.",
+                    )
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show()
+                    .await;
+                if !matches!(ok, rfd::MessageDialogResult::Yes) {
+                    return; // 取消: 工作区不变
+                }
+            }
+            let Some(handle) = rfd::AsyncFileDialog::new().pick_folder().await else {
+                return; // 取消 picker: 不变 (spec: Cancelling … unchanged)
+            };
+            let picked = handle.path().to_path_buf();
+            let path = std::fs::canonicalize(&picked).unwrap_or(picked);
+            match project_model::marker_status(&path) {
+                MarkerStatus::Corrupt(msg) => {
+                    // spec: 坏 marker → 错误框 + 退出 (无 update lease 时弹框,
+                    // D8: 阻塞调用不进事件监听器)
+                    this.update(cx, |app, _| {
+                        app.open_failure = Some(msg.clone());
+                    })
+                    .ok();
+                    surface_fatal(&msg);
+                }
+                MarkerStatus::Missing => {
+                    // spec: 非工作区目录 → 确认后创建
+                    let confirm = rfd::AsyncMessageDialog::new()
+                        .set_title("Not a workspace")
+                        .set_description(&format!(
+                            "{} has no workspace marker. Create a new workspace here?",
+                            path.display()
+                        ))
+                        .set_level(rfd::MessageLevel::Info)
+                        .set_buttons(rfd::MessageButtons::YesNo)
+                        .show()
+                        .await;
+                    if !matches!(confirm, rfd::MessageDialogResult::Yes) {
+                        return; // 拒绝: 无工作区被打开 (spec)
+                    }
+                    // fs 写在 update 外; 失败 → 红条 + 不打开 (spec:
+                    // Workspace creation … write failure … no workspace opened)
+                    let created = project_model::create_workspace_files(&path);
+                    let err = created.err();
+                    this.update(cx, |app, cx| {
+                        if let Some(e) = err {
+                            app.save_error = Some(e);
+                        } else {
+                            app.begin_open(path.clone(), cx);
+                        }
+                        cx.notify();
+                        app.notify_panels(cx);
+                    })
+                    .ok();
+                }
+                MarkerStatus::Valid(_) => {
+                    // 合法 → 异步加载 (epoch 由 begin_open 管)
+                    this.update(cx, |app, cx| {
+                        app.begin_open(path.clone(), cx);
+                    })
+                    .ok();
+                }
+            }
+        });
+        self._dialog_task = Some(task);
+    }
+
+    /// 发起一次工作区打开 (启动恢复 / picker 确认后): epoch++ 后台探测
+    /// +加载, 回主线程按 epoch 提交 (design D5: 旧结果丢弃)。返回本次
+    /// epoch (测试观测)。
+    pub fn begin_open(&mut self, path: PathBuf, cx: &mut Context<Self>) -> u64 {
+        self.load_epoch += 1;
+        let epoch = self.load_epoch;
+        let task = cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let probe = {
+                let p = path.clone();
+                cx.background_executor()
+                    .spawn(async move { probe_open(&p) })
+                    .await
+            };
+            match probe {
+                OpenProbe::Failure(msg) => {
+                    // epoch 检查与记录合一次 update; 对话框在 lease 外 (D8)
+                    let fresh = this
+                        .update(cx, |app, _| {
+                            if app.load_epoch == epoch {
+                                app.open_failure = Some(msg.clone());
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
+                    if fresh {
+                        surface_fatal(&msg); // 正式: 错误框 + 退出; 测试: no-op
+                    }
+                }
+                probe => {
+                    this.update(cx, |app, cx| {
+                        app.commit_open(epoch, path, probe, cx);
+                    })
+                    .ok();
+                }
+            }
+        });
+        self._open_task = Some(task);
+        epoch
+    }
+
+    /// 提交一次打开结果。epoch 不匹配 → 丢弃并返回 false (spec/设计 D5:
+    /// 竞态下的旧 load 不得覆盖新状态)。
+    pub fn commit_open(
+        &mut self,
+        epoch: u64,
+        path: PathBuf,
+        probe: OpenProbe,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if epoch != self.load_epoch {
+            return false; // 过期结果 (4.2 竞态守卫)
+        }
+        match probe {
+            // 启动恢复目标失效 (目录没了/marker 没了) → 回空态, 不报错
+            OpenProbe::Empty => {
+                self.workspace = None;
+                self.active = None;
+            }
+            OpenProbe::Failure(msg) => {
+                // 正式路径已在 begin_open 里 dialog+exit; 测试观测面
+                self.open_failure = Some(msg);
+            }
+            OpenProbe::Ready(model) => {
+                // 清场: 旧会话全部关停 (切换语义: exited 屏幕随切走丢弃,
+                // spec: confirmation … discarded; 活动会话已被门控拦下)
+                if let Some(old) = self.workspace.take() {
+                    for session in old.agents {
+                        session.update(cx, |s, _| s.0.shutdown());
+                    }
+                }
+                self.active = None;
+                self.notice = None;
+                // legacy 规则补拷 (配置缺区段时; 失败落红条)
+                self.migrate_legacy_rules(&path);
+                // 历史置顶 (便利数据: 失败仅日志, 不红条 — 非 workspace 配置)
+                let mut history = History::load_at(&self.history_path);
+                history.push(path.clone());
+                if let Err(e) = history.save_at(&self.history_path) {
+                    eprintln!("workspace history save failed: {e}");
+                }
+                self.workspace = Some(Workspace::new(path, model));
+            }
+        }
+        cx.notify();
+        self.notify_panels(cx);
+        true
+    }
+
+    /// legacy `.workspaces.json` 规则补拷 (spec: Legacy migration — 打开时
+    /// 配置缺 `file_tree` 区段才拷; legacy 永不改写)。
+    fn migrate_legacy_rules(&mut self, ws_path: &Path) {
+        if project_model::load_file_tree_rules(ws_path).is_empty() {
+            if let Some(rules) = store::legacy_rules_for(&store::legacy_path(), ws_path) {
+                if let Err(e) = project_model::set_file_tree_rules(ws_path, rules) {
+                    self.save_error = Some(e);
+                }
+            }
         }
     }
 
-    /// 用户点了 "[+ new workspace]": 弹 rfd **异步**文件夹选择器。
-    /// (workspace-management spec: 取消不变 / canonicalize 去重 /
-    ///  选中即追加并立即持久化)
-    ///
-    /// 不能用同步 `rfd::FileDialog`: 监听器执行期间 App 的可变借用
-    /// 被 dispatch 持有, 模态循环阻塞期间 50ms drain 循环的
-    /// `weak.update` 会重入借用 → RefCell panic (实测崩溃)。
-    pub fn create_workspace(&mut self, cx: &mut Context<Self>) {
+    /// 空工作区的 "+ add solution" (spec: Solution creation via path picker):
+    /// 选择目录 → 追加 simple item → project 行不重启出现。
+    /// 写失败: 红条 + **内存变更保留** (spec: in-memory state keeps the change)。
+    pub fn add_solution(&mut self, cx: &mut Context<Self>) {
+        let Some(ws_dir) = self.workspace.as_ref().map(|w| w.path.clone()) else {
+            return;
+        };
         let task = cx.spawn(async move |this, cx: &mut AsyncApp| {
-            let picked = rfd::AsyncFileDialog::new().pick_folder().await;
-            let Some(handle) = picked else {
-                return; // 用户取消: sidebar 不变, 不重写持久化文件
+            let Some(handle) = rfd::AsyncFileDialog::new().pick_folder().await else {
+                return; // 取消: 文件与视图均不变 (spec)
             };
-
-            let path = handle.path().to_path_buf();
-            // canonicalize 方便去重
-            let path = std::fs::canonicalize(&path).unwrap_or(path);
-
-            this.update(cx, |app, cx| {
-                if app.workspaces.iter().any(|w| w.path == path) {
-                    eprintln!("workspace already exists: {}", path.display());
-                    return; // 重复: log + 状态不变
-                }
-                app.workspaces.push(Workspace::new(path));
-                app.persist();
-                cx.notify();
-                app.notify_panels(cx); // 面板自读不重建 (spike §10.5), 显式转发
-            })
-            .ok();
+            let picked = handle.path().to_path_buf();
+            let path = std::fs::canonicalize(&picked).unwrap_or(picked);
+            // 先写盘; 内存变更不受写结果影响
+            let outcome = project_model::append_simple_solution(&ws_dir, path.clone());
+            this.update(cx, |app, cx| app.apply_add_solution(path.clone(), outcome, cx))
+                .ok();
         });
-        // 存住任务 (drop 会取消 future); 再次点击时旧任务被替换
         self._dialog_task = Some(task);
+    }
+
+    /// add-solution 完成后的同步合并 (从回调抽出的测试缝 — 5.3):
+    /// 写成功 → solutions 用落盘结果; 写失败 → 红条 + **内存变更保留**
+    /// (spec: in-memory state keeps the change)。两条路径都进 model。
+    pub(crate) fn apply_add_solution(
+        &mut self,
+        path: PathBuf,
+        outcome: Result<Vec<project_model::SolutionItem>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let write_err = match &outcome {
+            Ok(items) => {
+                if let Some(ws) = self.workspace.as_mut() {
+                    ws.model.solutions = items.clone();
+                }
+                None
+            }
+            Err(e) => {
+                if let Some(ws) = self.workspace.as_mut() {
+                    ws.model
+                        .solutions
+                        .push(project_model::SolutionItem::Simple { path: path.clone() });
+                }
+                Some(e.clone())
+            }
+        };
+        // 两条路径都进内存 model (项目行立即可见)
+        if let Some(ws) = self.workspace.as_mut() {
+            if !ws.model.projects.iter().any(|p| p.root == path) {
+                ws.model
+                    .projects
+                    .push(project_model::Project::from_root(path));
+            }
+        }
+        if let Some(e) = write_err {
+            self.save_error = Some(e);
+        }
+        cx.notify();
+        self.notify_panels(cx);
+    }
+
+    /// 会话计数 (活动, exited) — 切换门控的输入 (design D6)。
+    fn count_sessions(&self, cx: &App) -> (usize, usize) {
+        let mut active = 0usize;
+        let mut exited = 0usize;
+        for session in self.workspace.iter().flat_map(|w| w.agents.iter()) {
+            match session.read(cx).0.status() {
+                crate::agent_entities::SessionStatus::Starting
+                | crate::agent_entities::SessionStatus::Running => active += 1,
+                crate::agent_entities::SessionStatus::Exited => exited += 1,
+            }
+        }
+        (active, exited)
     }
 
     /// 关闭右 dock（dock-layout spec: 关闭 + 焦点交回）：`toggle_dock`
@@ -451,14 +719,22 @@ impl TerminalApp {
         }
         self.focus_active_center_panel(window, cx);
         match ev {
-            SidebarEvent::NewWorkspace => {
-                // 异步对话框: 变更在完成回调里, 面板转发也在那里 (见 create_workspace)
-                self.create_workspace(cx);
+            SidebarEvent::OpenWorkspace => {
+                // 空态选择器: 无门控; 变更在异步回调里 (见 request_workspace_open)
+                self.request_workspace_open(false, cx);
                 return;
             }
-            SidebarEvent::ToggleCollapse(path) => self.toggle_collapse(&path),
-            SidebarEvent::CloseWorkspace(path) => self.close_workspace(&path),
-            SidebarEvent::NewAgent(path) => self.create_agent(&path, cx),
+            SidebarEvent::SwitchWorkspace => {
+                // 顶栏切换: 先过三支门控 (design D6); 通过后异步确认/picker
+                self.request_workspace_open(true, cx);
+                return;
+            }
+            SidebarEvent::AddSolution => {
+                self.add_solution(cx);
+                return;
+            }
+            SidebarEvent::ToggleProjectCollapse(root) => self.toggle_project_collapse(&root),
+            SidebarEvent::NewAgent(root) => self.create_agent(&root, cx),
             SidebarEvent::SelectAgent(id) => {
                 self.active = Some(id);
             }
@@ -541,15 +817,13 @@ impl TerminalApp {
     /// 主循环忽略返回值)。
     fn poll_sessions(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
-        for ws in &self.workspaces {
-            for session in &ws.agents {
-                session.update(cx, |s, cx| {
-                    if s.0.poll() {
-                        cx.notify();
-                        changed = true;
-                    }
-                });
-            }
+        for session in self.workspace.iter().flat_map(|w| w.agents.iter()) {
+            session.update(cx, |s, cx| {
+                if s.0.poll() {
+                    cx.notify();
+                    changed = true;
+                }
+            });
         }
         if changed {
             self.notify_panels(cx);
@@ -557,6 +831,72 @@ impl TerminalApp {
         changed
     }
 }
+
+/// 打开探测结果 (纯 fs, 跑在后台执行器 — 不占 app 借用, design D5)。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum OpenProbe {
+    /// 目录不存在 / marker 缺失 → 启动恢复回空态 (不报错; picker 流程
+    /// 在此之前已走确认创建分支, 不会进这里)。
+    Empty,
+    /// marker 合法且 model 加载成功。
+    Ready(WorkspaceModel),
+    /// marker 坏 / model 校验失败 → 错误框 + 退出 (spec)。
+    Failure(String),
+}
+
+/// 后台探测: 目录 → marker → model 加载 (每步对应 spec 判定链)。
+pub(crate) fn probe_open(path: &Path) -> OpenProbe {
+    if !path.is_dir() {
+        return OpenProbe::Empty;
+    }
+    match project_model::marker_status(path) {
+        MarkerStatus::Missing => OpenProbe::Empty,
+        MarkerStatus::Corrupt(msg) => OpenProbe::Failure(msg),
+        MarkerStatus::Valid(_) => match project_model::load(path) {
+            Ok(model) => OpenProbe::Ready(model),
+            Err(e) => OpenProbe::Failure(e.to_string()),
+        },
+    }
+}
+
+/// 切换门控决策 (design D6; spec: Gated workspace switching)。
+/// 纯函数 — 三支可独立无头测试。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateDecision {
+    /// 有 Starting/Running 会话 → 拦截 (载荷 = 活动会话数, notice 文案用)
+    Block(usize),
+    /// 仅剩 Exited → 需确认 (屏幕将丢弃)
+    Confirm,
+    /// 无会话 → 直接进 picker
+    Direct,
+}
+
+pub(crate) fn switch_gate(active: usize, exited: usize) -> GateDecision {
+    if active > 0 {
+        GateDecision::Block(active)
+    } else if exited > 0 {
+        GateDecision::Confirm
+    } else {
+        GateDecision::Direct
+    }
+}
+
+/// 致命打开失败: 错误框 + 退出 (spec: … error dialog … and exit)。
+/// **只能在无 update lease 时调用** (design D8: 阻塞对话框不得位于
+/// gpui 事件监听器/update 内 — 50ms drain 的 `weak.update` 会重入 panic)。
+/// 测试构建: no-op (headless 弹框会挂死测试), 观测面走 `open_failure`。
+#[cfg(not(test))]
+fn surface_fatal(msg: &str) {
+    rfd::MessageDialog::new()
+        .set_title("Failed to open workspace")
+        .set_description(msg)
+        .set_level(rfd::MessageLevel::Error)
+        .show();
+    std::process::exit(1);
+}
+
+#[cfg(test)]
+fn surface_fatal(_msg: &str) {}
 
 /// IME 桥 (design D5): 平台 NSTextInputClient → 这些方法。
 /// 只有 `replace_text_in_range` (最终提交/粘贴) 产生字节;
@@ -703,13 +1043,18 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// hermetic: 注入测试专用 workspace (仅内存, 不写盘) — 让测试不依赖
-    /// 本地 `.workspaces.json` 的内容 (2026-11-09 冒烟清空该文件后 4 个
-    /// 测试齐挂的教训; 原 adaptive 测试本就依赖本地状态)。返回 full_path
-    /// 字符串供行 id 拼装/定位; 注入的 workspace 恒为列表末位。
+    /// 全局历史/仓库根遗留配置 (2026-11-09 冒烟清空该文件后 4 个
+    /// 测试齐挂的教训)。返回 full_path 字符串供行 id 拼装/定位;
+    /// 同时注入一个同路径 root project — 项目行/`[+ agent]`/分组都锚
+    /// 在它上 (project root == workspace dir 是测试约定)。
     fn inject_test_workspace(app: &mut TerminalApp, tag: &str) -> String {
         let path = std::env::temp_dir().join(format!("bw-test-{tag}-{}", std::process::id()));
         let full = path.to_string_lossy().to_string();
-        app.workspaces.push(Workspace::new(path));
+        let mut model = crate::project_model::WorkspaceModel::default();
+        model
+            .projects
+            .push(crate::project_model::Project::from_root(path.clone()));
+        app.workspace = Some(Workspace::new(path, model));
         full
     }
 
@@ -724,7 +1069,7 @@ mod tests {
         fn name(&self) -> &str {
             "recorder"
         }
-        fn ws_path(&self) -> &Path {
+        fn project_root(&self) -> &Path {
             &self.ws
         }
         fn screen(&self) -> &vt100::Screen {
@@ -767,7 +1112,7 @@ mod tests {
                 },
                 cx,
                 |window, cx| {
-                    cx.new(|cx| TerminalApp::new(window, cx).expect(".workspaces.json 加载"))
+                    cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动"))
                 },
             )
             .expect("open test window")
@@ -777,7 +1122,7 @@ mod tests {
         let received = Rc::new(RefCell::new(Vec::new()));
         app_entity.update(cx, |app, cx| {
             inject_test_workspace(app, "theme-push");
-            let ws_path = app.workspaces.last().expect("测试 workspace").path.clone();
+            let ws_path = app.workspace.as_ref().expect("测试 workspace").path.clone();
             let recorder = ThemeRecorder {
                 ws: ws_path,
                 parser: vt100::Parser::new(
@@ -787,8 +1132,8 @@ mod tests {
                 ),
                 received: received.clone(),
             };
-            app.workspaces
-                .last_mut()
+            app.workspace
+                .as_mut()
                 .expect("测试 workspace")
                 .agents
                 .push(cx.new(|_| AgentSession(Box::new(recorder))));
@@ -880,7 +1225,7 @@ mod tests {
                 },
                 cx,
                 |window, cx| {
-                    cx.new(|cx| TerminalApp::new(window, cx).expect(".workspaces.json 加载"))
+                    cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动"))
                 },
             )
             .expect("open test window")
@@ -916,7 +1261,7 @@ mod tests {
                 },
                 cx,
                 |window, cx| {
-                    cx.new(|cx| TerminalApp::new(window, cx).expect(".workspaces.json 加载"))
+                    cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动"))
                 },
             )
             .expect("open test window")
@@ -940,7 +1285,7 @@ mod tests {
             .expect("stub embed spawn");
             let e = cx.new(|_| AgentSession(Box::new(shell)));
             let id = e.entity_id();
-            app.workspaces.last_mut().expect("测试 workspace").agents.push(e);
+            app.workspace.as_mut().expect("测试 workspace").agents.push(e);
             app.active = Some(id);
             assert!(
                 app._input_drain_task.is_none(),
@@ -1026,7 +1371,7 @@ mod tests {
                 },
                 cx,
                 |window, cx| {
-                    cx.new(|cx| TerminalApp::new(window, cx).expect(".workspaces.json 加载"))
+                    cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动"))
                 },
             )
             .expect("open test window")
@@ -1050,7 +1395,7 @@ mod tests {
             .expect("stub embed spawn");
             let e = cx.new(|_| AgentSession(Box::new(shell)));
             let id = e.entity_id(); // 先取 id 再 move (D4)
-            app.workspaces.last_mut().expect("测试 workspace").agents.push(e);
+            app.workspace.as_mut().expect("测试 workspace").agents.push(e);
             app.active = Some(id);
         });
 
@@ -1062,7 +1407,7 @@ mod tests {
 
         // 读取分发结果 + 网格区域 bounds + 度量
         let (resizes1, screen) = app_entity.read_with(cx, |app, cx| {
-            let s = app.workspaces.last().expect("测试 workspace").agents[0].read(cx);
+            let s = app.workspace.as_ref().expect("测试 workspace").agents[0].read(cx);
             (app.grid_resizes, s.0.screen().size())
         });
         let (win_bounds, bounds, (cell_w, line_h)) = cx
@@ -1118,7 +1463,7 @@ mod tests {
         });
         cx.run_until_parked();
         let (resizes3, screen3) = app_entity.read_with(cx, |app, cx| {
-            let s = app.workspaces.last().expect("测试 workspace").agents[0].read(cx);
+            let s = app.workspace.as_ref().expect("测试 workspace").agents[0].read(cx);
             (app.grid_resizes, s.0.screen().size())
         });
         let bounds3 = cx
@@ -1141,7 +1486,7 @@ mod tests {
 
         // 收尾: 关会话、清 stub
         app_entity.update(cx, |app, cx| {
-            if let Some(e) = app.workspaces.get_mut(0).and_then(|w| w.agents.pop()) {
+            if let Some(e) = app.workspace.as_mut().and_then(|w| w.agents.pop()) {
                 e.update(cx, |s, _| s.0.shutdown());
             }
         });
@@ -1166,24 +1511,25 @@ mod tests {
                 },
                 cx,
                 |window, cx| {
-                    cx.new(|cx| TerminalApp::new(window, cx).expect(".workspaces.json 加载"))
+                    cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动"))
                 },
             )
             .expect("open test window")
         });
 
-        // hermetic: 注入测试专用 workspace, 不依赖本地 .workspaces.json
+        // hermetic: 注入测试专用 workspace, 不依赖全局历史与外部配置
         let _ws_path = cx.update(|cx| {
             app_entity.update(cx, |app, _cx| inject_test_workspace(app, "row-click"))
         });
         let (path, before) = cx.update(|cx| {
             let app = app_entity.read(cx);
-            let ws = app.workspaces.last().expect("注入的测试 workspace");
-            (ws.full_path_str(), ws.collapsed)
+            let ws = app.workspace.as_ref().expect("注入的测试 workspace");
+            // project root == workspace path (inject 约定); 初始未折叠
+            (ws.full_path_str(), ws.collapsed_projects.contains(&ws.path))
         });
 
         let new_agent_id = format!("new-agent-label-{path}");
-        let row_id = format!("ws-name-{path}");
+        let row_id = format!("project-name-{path}");
 
         // 首帧: 行/按钮进入观测注册表 (初始未折叠 -> 按钮可见)
         let id = new_agent_id.clone();
@@ -1201,8 +1547,12 @@ mod tests {
             window.click(row_id.clone(), cx);
         });
         cx.run_until_parked();
-        let after = cx.update(|cx| app_entity.read(cx).workspaces.last().expect("测试 workspace").collapsed);
-        assert_ne!(before, after, "点击 workspace 行应切换折叠 (且不得重入 panic)");
+        let after = cx.update(|cx| {
+            let app = app_entity.read(cx);
+            let ws = app.workspace.as_ref().expect("测试 workspace");
+            ws.collapsed_projects.contains(&ws.path)
+        });
+        assert_ne!(before, after, "点击 project 行应切换折叠 (且不得重入 panic)");
         // defer 生效: 面板已重渲, 折叠后 [+ agent] 消失 (旧观测不能残留)
         let id = new_agent_id.clone();
         let _ = cx.update_window(handle.into(), move |_, window, _cx| {
@@ -1217,7 +1567,11 @@ mod tests {
             window.click(row_id, cx);
         });
         cx.run_until_parked();
-        let back = cx.update(|cx| app_entity.read(cx).workspaces.last().expect("测试 workspace").collapsed);
+        let back = cx.update(|cx| {
+            let app = app_entity.read(cx);
+            let ws = app.workspace.as_ref().expect("测试 workspace");
+            ws.collapsed_projects.contains(&ws.path)
+        });
         assert_eq!(before, back, "再次点击应恢复原状态");
         let id = new_agent_id.clone();
         let _ = cx.update_window(handle.into(), move |_, window, _cx| {
@@ -1247,7 +1601,7 @@ mod tests {
                 },
                 cx,
                 |window, cx| {
-                    cx.new(|cx| TerminalApp::new(window, cx).expect(".workspaces.json 加载"))
+                    cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动"))
                 },
             )
             .expect("open test window")
@@ -1261,9 +1615,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("one-step-focus-{unique}"));
         fs::create_dir_all(&dir).unwrap();
         let stub = write_stub(&dir);
+        // 先注入 workspace 拿 root: 会话 cwd 必须 == project root
+        // (spec: Session working directory), 否则 sidebar 分组键
+        // (project_root == root) 不命中, agent 行不渲染
+        let ws_path = cx.update(|cx| {
+            app_entity.update(cx, |app, _cx| inject_test_workspace(app, "one-step-focus"))
+        });
+        // 注入目录是纯内存的 — spawn 需要 cwd 真实存在 (否则 ENOENT)
+        fs::create_dir_all(&ws_path).unwrap();
         let shell = PiAgentShell::new_with_pi_bin(
             "pi-t".into(),
-            std::env::temp_dir(),
+            PathBuf::from(&ws_path),
             Some(stub.to_str().unwrap().to_string()),
         )
         .expect("stub embed spawn");
@@ -1271,8 +1633,7 @@ mod tests {
         let agent_id = e.entity_id();
         cx.update(|cx| {
             let app = app_entity.update(cx, |app, cx| {
-                inject_test_workspace(app, "one-step-focus"); // hermetic
-                app.workspaces.last_mut().expect("测试 workspace").agents.push(e);
+                app.workspace.as_mut().expect("测试 workspace").agents.push(e);
                 app.active = Some(agent_id);
                 // 直接注入绕过 funnel, 面板需显式 notify 才会重渲 (§10.5)
                 app.sidebar.update(cx, |_, cx| cx.notify());
@@ -1323,6 +1684,7 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&ws_path);
     }
     /// 回归 (6.1 手动发现 F4): agent 输出到达 -> drain 循环 (50ms 测试时钟)
     /// -> notify 转发 -> 面板重渲, 状态 starting -> running 实时刷新
@@ -1343,7 +1705,7 @@ mod tests {
                 },
                 cx,
                 |window, cx| {
-                    cx.new(|cx| TerminalApp::new(window, cx).expect(".workspaces.json 加载"))
+                    cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动"))
                 },
             )
             .expect("open test window")
@@ -1366,7 +1728,7 @@ mod tests {
         let agent_id = e.entity_id();
         app_entity.update(cx, |app, cx| {
             inject_test_workspace(app, "badge"); // hermetic
-            app.workspaces.last_mut().expect("测试 workspace").agents.push(e);
+            app.workspace.as_mut().expect("测试 workspace").agents.push(e);
             app.active = Some(agent_id);
             // 直接注入绕过 funnel: 两个面板都需显式 notify (§10.5)
             app.sidebar.update(cx, |_, cx| cx.notify());
@@ -1408,10 +1770,586 @@ mod tests {
 
         // 收尾: 关会话、清 stub
         app_entity.update(cx, |app, cx| {
-            if let Some(e) = app.workspaces.get_mut(0).and_then(|w| w.agents.pop()) {
+            if let Some(e) = app.workspace.as_mut().and_then(|w| w.agents.pop()) {
                 e.update(cx, |s, _| s.0.shutdown());
             }
         });
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ===== single-workspace-project-model 新增测试 =====
+    // (组 3: 启动恢复/空态/创建; 组 4: 门控/epoch; 组 5: 树/分组/状态栏;
+    //  组 7: 全链路)。对话框 (rfd) 接线是正式构建胶水, 无头不触碰 —
+    //  其决策点已拆成纯函数/同步方法被下面测试覆盖。
+
+    use super::{GateDecision, OpenProbe, switch_gate};
+    use crate::project_model::{self, Project, SolutionItem, WorkspaceModel};
+    use crate::workspace::history::History;
+
+    /// hermetic 临时目录 (进程 + 纳秒隔离)。
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sw-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// hermetic 空历史文件路径 (不存在 → load_at 得默认空历史)。
+    fn fresh_history_path() -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "sw-hist-{}-{}.json",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = fs::remove_file(&p);
+        p
+    }
+
+    /// 起带指定历史文件的 app (design D5: 主窗先行, 恢复异步)。
+    fn open_app_with_history(
+        cx: &mut TestAppContext,
+        history: PathBuf,
+    ) -> (
+        gpui_kit::AnyWindowHandle,
+        gpui_kit::Entity<TerminalApp>,
+    ) {
+        cx.update(gpui_kit::init);
+        let (handle, app) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1000.), px(600.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| {
+                        TerminalApp::new_inner(window, cx, history.clone())
+                            .expect("new_inner 启动 (打开失败走 open_failure, 非 Err)")
+                    })
+                },
+            )
+            .expect("open test window")
+        });
+        (handle, app)
+    }
+
+    /// 渲染一帧并收集全部文本 (空态/行存在性断言用)。
+    fn render_texts(
+        handle: gpui_kit::AnyWindowHandle,
+        cx: &mut TestAppContext,
+    ) -> Vec<String> {
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            gpui_kit::base::test_support::texts(window)
+                .iter()
+                .map(|t| t.text().to_string())
+                .collect()
+        })
+        .expect("update window")
+    }
+
+    /// 4.1: 切换门控三支 — 纯函数逐支可测 (spec: Gated workspace switching)。
+    #[test]
+    fn switch_gate_three_branches() {
+        assert_eq!(switch_gate(2, 1), GateDecision::Block(2), "活动优先拦截");
+        assert_eq!(switch_gate(1, 0), GateDecision::Block(1));
+        assert_eq!(switch_gate(0, 3), GateDecision::Confirm);
+        assert_eq!(switch_gate(0, 0), GateDecision::Direct);
+    }
+
+    /// 4.1 wiring: 活动会话存在时请求切换 → notice 落地且不进 picker。
+    #[gpui_kit::test]
+    fn gated_switch_with_active_session_shows_notice(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app_with_history(cx, history);
+        let received = Rc::new(RefCell::new(Vec::new()));
+        app_entity.update(cx, |app, cx| {
+            inject_test_workspace(app, "gate-notice"); // 含同路径 root project
+            let ws_path = app.workspace.as_ref().unwrap().path.clone();
+            let recorder = ThemeRecorder {
+                ws: ws_path,
+                parser: vt100::Parser::new(
+                    std::num::NonZeroU16::new(24).unwrap(),
+                    std::num::NonZeroU16::new(80).unwrap(),
+                    0,
+                ),
+                received: received.clone(),
+            };
+            let e = cx.new(|_| AgentSession(Box::new(recorder)));
+            app.workspace.as_mut().unwrap().agents.push(e);
+            // Running 状态 → 活动支: 同步拦截, 不 spawn picker 对话框
+            app.request_workspace_open(true, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            let notice = app.notice.clone().expect("活动会话应落 notice");
+            assert!(notice.contains("1 session(s) still active"), "文案点名计数: {notice}");
+            assert!(app.workspace.is_some(), "拦截时工作区不变");
+        });
+        let _ = handle;
+    }
+
+    /// 4.2: 过期 epoch 的提交必须被丢弃 (design D5 竞态守卫)。
+    #[gpui_kit::test]
+    fn stale_epoch_commit_is_discarded(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let (_handle, app_entity) = open_app_with_history(cx, history);
+        app_entity.update(cx, |app, cx| {
+            app.load_epoch = 7;
+            let discarded = app.commit_open(
+                6,
+                "/old".into(),
+                OpenProbe::Ready(WorkspaceModel::default()),
+                cx,
+            );
+            assert!(!discarded, "过期 epoch 必须返回 false 且不落状态");
+            assert!(app.workspace.is_none(), "过期结果不得覆盖");
+            let landed = app.commit_open(
+                7,
+                "/new".into(),
+                OpenProbe::Ready(WorkspaceModel::default()),
+                cx,
+            );
+            assert!(landed, "当前 epoch 提交成功");
+            assert_eq!(
+                app.workspace.as_ref().unwrap().path,
+                PathBuf::from("/new")
+            );
+        });
+    }
+
+    /// 4.2: 连续两次 begin_open → 最终状态 = 最后一次的目标 (旧 probe 被丢)。
+    #[gpui_kit::test]
+    fn two_begin_opens_settle_on_latest_workspace(cx: &mut TestAppContext) {
+        let ws_old = temp_dir("begin-old");
+        let ws_new = temp_dir("begin-new");
+        let history = fresh_history_path();
+        let (_handle, app_entity) = open_app_with_history(cx, history);
+        app_entity.update(cx, |app, cx| {
+            project_model::create_workspace_files(&ws_old).unwrap();
+            project_model::create_workspace_files(&ws_new).unwrap();
+            app.begin_open(ws_old.clone(), cx); // epoch 1
+            app.begin_open(ws_new.clone(), cx); // epoch 2 — 立即覆盖
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            assert_eq!(
+                app.workspace.as_ref().unwrap().path,
+                ws_new,
+                "只允许最后一次打开生效"
+            );
+            assert_eq!(app.load_epoch, 2);
+            assert!(app.open_failure.is_none());
+        });
+    }
+
+    /// 3.1: 启动恢复 — 历史最常打开且 marker+model 合法 → 异步载入落定。
+    #[gpui_kit::test]
+    fn startup_restores_most_recent_workspace(cx: &mut TestAppContext) {
+        let ws = temp_dir("restore");
+        let project_dir = ws.join("foo");
+        fs::create_dir_all(&project_dir).unwrap();
+        project_model::create_workspace_files(&ws).unwrap();
+        project_model::append_simple_solution(&ws, project_dir.clone()).unwrap();
+        let history = fresh_history_path();
+        let mut h = History::default();
+        h.push(ws.clone());
+        h.save_at(&history).unwrap();
+
+        let (_handle, app_entity) = open_app_with_history(cx, history);
+        cx.run_until_parked(); // 后台 probe → commit
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            assert!(app.open_failure.is_none(), "合法工作区不报错");
+            let ws_view = app.workspace.as_ref().expect("应恢复最近工作区");
+            assert_eq!(ws_view.path, ws);
+            assert_eq!(ws_view.model.projects.len(), 1);
+            assert_eq!(ws_view.model.projects[0].name, "foo");
+            assert_eq!(ws_view.model.projects[0].root, project_dir);
+        });
+    }
+
+    /// 3.1: 坏 marker → open_failure 记录 (正式构建: 同点 dialog+exit)。
+    #[gpui_kit::test]
+    fn startup_corrupt_marker_records_open_failure(cx: &mut TestAppContext) {
+        let ws = temp_dir("corrupt-marker");
+        fs::write(ws.join(project_model::files::MARKER_FILE), "{ nope").unwrap();
+        let history = fresh_history_path();
+        let mut h = History::default();
+        h.push(ws);
+        h.save_at(&history).unwrap();
+
+        let (_handle, app_entity) = open_app_with_history(cx, history);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            let msg = app.open_failure.clone().expect("坏 marker 必须记录失败");
+            assert!(msg.contains("parse"), "错误点名解析失败: {msg}");
+            assert!(app.workspace.is_none(), "失败不得打开工作区");
+        });
+    }
+
+    /// 3.2: 恢复目标失效 (目录/ marker 不见了) → 回空态且不报错。
+    #[gpui_kit::test]
+    fn startup_missing_target_falls_back_to_empty_state(cx: &mut TestAppContext) {
+        let ghost = std::env::temp_dir().join(format!("sw-ghost-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ghost);
+        let history = fresh_history_path();
+        let mut h = History::default();
+        h.push(ghost);
+        h.save_at(&history).unwrap();
+
+        let (_handle, app_entity) = open_app_with_history(cx, history);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            assert!(app.workspace.is_none(), "失效目标回空态");
+            assert!(app.open_failure.is_none(), "失效目标不是错误 (spec)");
+        });
+    }
+
+    /// 3.2: 空历史启动 → 窗内空态 + 目录选择器入口 (render 级)。
+    #[gpui_kit::test]
+    fn empty_state_renders_picker_affordance(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let (handle, _app) = open_app_with_history(cx, history);
+        cx.run_until_parked();
+        let texts = render_texts(handle, cx);
+        assert!(
+            texts.iter().any(|t| t.contains("no workspace open")),
+            "空态提示应渲染, 实际: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("open workspace…")),
+            "选择器入口应渲染, 实际: {texts:?}"
+        );
+    }
+
+    /// 3.3 core: 确认创建后 (两文件落盘) → 打开为空工作区。
+    /// (确认对话框本身是 rfd 胶水, 无头不触碰; 创建文件契约见
+    ///  project_model::files 测试)
+    #[gpui_kit::test]
+    fn confirmed_creation_then_open_lands_workspace(cx: &mut TestAppContext) {
+        let ws = temp_dir("create-open");
+        project_model::create_workspace_files(&ws).unwrap();
+        assert!(ws.join(project_model::files::MARKER_FILE).exists());
+        assert!(ws.join(project_model::files::SOLUTIONS_FILE).exists());
+
+        let history = fresh_history_path();
+        let (_handle, app_entity) = open_app_with_history(cx, history);
+        app_entity.update(cx, |app, cx| {
+            app.begin_open(ws.clone(), cx);
+        });
+        cx.run_until_parked();
+        let back = cx.update(|cx| {
+            let app = app_entity.read(cx);
+            assert!(app.open_failure.is_none());
+            let ws_view = app.workspace.as_ref().expect("创建后应打开");
+            assert_eq!(ws_view.path, ws);
+            assert!(ws_view.model.projects.is_empty(), "空 solutions = 零 project");
+            // 打开即写历史 (下次启动直开)
+            History::load_at(&app.history_path)
+        });
+        assert_eq!(back.most_recent(), Some(ws.as_path()));
+    }
+
+    /// 5.3: add-solution 合并 — Ok/Err 两支都进内存 model, Err 另落红条
+    /// (spec: in-memory state keeps the change)。
+    #[gpui_kit::test]
+    fn add_solution_merges_and_surfaces_write_failure(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let (_handle, app_entity) = open_app_with_history(cx, history);
+        let p1 = temp_dir("sol-one");
+        let p2 = temp_dir("sol-two");
+        app_entity.update(cx, |app, cx| {
+            inject_test_workspace(app, "add-sol"); // 零 project 起点会更贴 spec,
+            // 但合并逻辑对有无 project 同构 — 先清空模拟零 project
+            app.workspace.as_mut().unwrap().model.projects.clear();
+            let items = vec![SolutionItem::Simple { path: p1.clone() }];
+            app.apply_add_solution(p1.clone(), Ok(items.clone()), cx);
+            {
+                let ws = app.workspace.as_ref().unwrap();
+                assert_eq!(ws.model.projects.len(), 1);
+                assert_eq!(ws.model.projects[0].root, p1);
+                assert_eq!(ws.model.solutions, items);
+            }
+            assert!(app.save_error.is_none(), "成功写入无红条");
+
+            // 写失败: 红条 + 内存保留 (project 与 solution item 都在)
+            app.apply_add_solution(p2.clone(), Err("disk full".into()), cx);
+            {
+                let ws = app.workspace.as_ref().unwrap();
+                assert_eq!(ws.model.projects.len(), 2, "写失败仍进内存 (spec)");
+                assert!(ws.model.solutions.iter().any(|s| matches!(s, SolutionItem::Simple { path } if *path == p2)));
+            }
+            assert!(
+                app.save_error.as_deref().is_some_and(|e| e.contains("disk full")),
+                "写失败应落红条"
+            );
+        });
+    }
+
+    /// 5.1+5.4: agent 按 project root 分组 (含工作区外项目) + 状态栏显示
+    /// project root 路径 (spec: Console status bar content)。
+    #[gpui_kit::test]
+    fn agents_group_under_project_roots_and_status_bar_shows_root(
+        cx: &mut TestAppContext,
+    ) {
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app_with_history(cx, history);
+        let external = temp_dir("external-project"); // 工作区外的 project
+        let (a_ws, a_ext) = app_entity.update(cx, |app, cx| {
+            inject_test_workspace(app, "grouping"); // project root1 = ws 目录
+            let ws_path = app.workspace.as_ref().unwrap().path.clone();
+            app.workspace
+                .as_mut()
+                .unwrap()
+                .model
+                .projects
+                .push(Project::from_root(external.clone()));
+            let mk = |ws: PathBuf, cx: &mut gpui_kit::Context<TerminalApp>| {
+                let recorder = ThemeRecorder {
+                    ws,
+                    parser: vt100::Parser::new(
+                        std::num::NonZeroU16::new(24).unwrap(),
+                        std::num::NonZeroU16::new(80).unwrap(),
+                        0,
+                    ),
+                    received: Rc::new(RefCell::new(Vec::new())),
+                };
+                cx.new(|_| AgentSession(Box::new(recorder)))
+            };
+            let a1 = mk(ws_path, cx);
+            let a2 = mk(external.clone(), cx);
+            let (i1, i2) = (a1.entity_id(), a2.entity_id());
+            app.workspace.as_mut().unwrap().agents.push(a1);
+            app.workspace.as_mut().unwrap().agents.push(a2);
+            app.active = Some(i2); // 状态栏显示外部 project 的 root
+            app.sidebar.update(cx, |_, cx| cx.notify());
+            app.terminal.update(cx, |_, cx| cx.notify());
+            (i1, i2)
+        });
+        cx.run_until_parked();
+
+        // id 类锚点走 try_find (texts() 只收录 test_text 文本)
+        let (has_ws_agent, has_ext_agent) = cx
+            .update_window(handle, |_, window, _cx| {
+                (
+                    window
+                        .try_find(format!("agent-name-{a_ws}"))
+                        .is_some(),
+                    window
+                        .try_find(format!("agent-name-{a_ext}"))
+                        .is_some(),
+                )
+            })
+            .expect("update window");
+        assert!(has_ws_agent, "ws 根下的 agent 行应渲染");
+        assert!(
+            has_ext_agent,
+            "工作区外 project 的 agent 行也应渲染 (cwd 分组)"
+        );
+        let texts = render_texts(handle, cx);
+        let external_str = external.to_string_lossy().into_owned();
+        assert!(
+            texts.iter()
+                .any(|t| t.contains(&external_str) && t.contains("recorder")),
+            "状态栏应显示 project root 绝对路径, 实际: {texts:?}"
+        );
+    }
+
+    /// 5.2: 点 project 行只切折叠 — active 会话与 active tab 均不变
+    /// (spec: Click project row does not switch main pane / collapse toggle)。
+    #[gpui_kit::test]
+    fn project_row_click_keeps_active_session_and_tab(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app_with_history(cx, history);
+        let agent_id = app_entity.update(cx, |app, cx| {
+            inject_test_workspace(app, "row-keep");
+            let ws_path = app.workspace.as_ref().unwrap().path.clone();
+            let recorder = ThemeRecorder {
+                ws: ws_path.clone(),
+                parser: vt100::Parser::new(
+                    std::num::NonZeroU16::new(24).unwrap(),
+                    std::num::NonZeroU16::new(80).unwrap(),
+                    0,
+                ),
+                received: Rc::new(RefCell::new(Vec::new())),
+            };
+            let e = cx.new(|_| AgentSession(Box::new(recorder)));
+            let id = e.entity_id();
+            app.workspace.as_mut().unwrap().agents.push(e);
+            app.active = Some(id);
+            app.sidebar.update(cx, |_, cx| cx.notify());
+            id
+        });
+        cx.run_until_parked();
+        render_texts(handle, cx); // 首帧让行进观测注册表
+
+        let (active_before, tab_before) = app_entity.update(cx, |app, _cx| {
+            let area = app.dock_area.read(_cx);
+            (
+                app.active,
+                crate::property_detail_manager::active_center_panel_id(area),
+            )
+        });
+        let row_id = cx.update(|cx| {
+            let app = app_entity.read(cx);
+            format!("project-name-{}", app.workspace.as_ref().unwrap().path.display())
+        });
+        cx.update_window(handle, |_, window, cx| window.click(row_id, cx))
+            .expect("update window");
+        cx.run_until_parked();
+
+        let (active_after, tab_after) = app_entity.update(cx, |app, _cx| {
+            let area = app.dock_area.read(_cx);
+            (
+                app.active,
+                crate::property_detail_manager::active_center_panel_id(area),
+            )
+        });
+        assert_eq!(active_after, Some(agent_id), "active 会话不变");
+        assert_eq!(active_after, active_before);
+        assert_eq!(tab_after, tab_before, "active tab 不变");
+        let collapsed = app_entity.update(cx, |app, _| {
+            let ws = app.workspace.as_ref().unwrap();
+            ws.collapsed_projects.contains(&ws.path)
+        });
+        assert!(collapsed, "折叠态应被切换");
+    }
+
+    /// 5.2: 零 project 工作区 → 只给 add-solution 动作, 不渲染 [+ agent]
+    /// (spec: If no project exists yet, no [+ agent] button)。
+    #[gpui_kit::test]
+    fn no_project_workspace_renders_add_solution_not_agent_button(
+        cx: &mut TestAppContext,
+    ) {
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app_with_history(cx, history);
+        app_entity.update(cx, |app, _| {
+            let path = std::env::temp_dir().join(format!(
+                "sw-noproj-{}-{}",
+                std::process::id(),
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            ));
+            app.workspace = Some(Workspace::new(path, WorkspaceModel::default()));
+        });
+        let texts = render_texts(handle, cx);
+        assert!(
+            texts.iter().any(|t| t.contains("+ add solution")),
+            "零 project 应给 add-solution 动作, 实际: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("+ agent")),
+            "零 project 不得渲染 [+ agent], 实际: {texts:?}"
+        );
+    }
+
+    /// 7.1 全链路: 空态 → 创建打开 → add-solution 出项目 → 建会话
+    /// (cwd=project root, 行入树, 状态栏正确) → 门控切换拦截。
+    #[gpui_kit::test]
+    fn full_chain_create_add_agent_and_gate(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app_with_history(cx, history);
+        cx.run_until_parked();
+        let texts = render_texts(handle, cx);
+        assert!(
+            texts.iter().any(|t| t.contains("no workspace open")),
+            "链路起点: 空态"
+        );
+
+        // 模拟确认创建 + 打开
+        let ws = temp_dir("chain");
+        project_model::create_workspace_files(&ws).unwrap();
+        app_entity.update(cx, |app, cx| app.begin_open(ws.clone(), cx));
+        cx.run_until_parked();
+        cx.update(|cx| assert!(
+            app_entity.read(cx).workspace.is_some(),
+            "工作区已打开"
+        ));
+
+        // add-solution (同步合并缝)
+        let project_dir = ws.join("bar");
+        fs::create_dir_all(&project_dir).unwrap();
+        app_entity.update(cx, |app, cx| {
+            let items = project_model::append_simple_solution(&ws, project_dir.clone()).unwrap();
+            app.apply_add_solution(project_dir.clone(), Ok(items), cx);
+        });
+        let texts = render_texts(handle, cx);
+        assert!(
+            texts.iter().any(|t| t.contains("bar")),
+            "项目行名已渲染, 实际: {texts:?}"
+        );
+        let project_row_found = cx
+            .update_window(handle, |_, window, _cx| {
+                window
+                    .try_find(format!("project-name-{}", project_dir.display()))
+                    .is_some()
+            })
+            .expect("update window");
+        assert!(project_row_found, "项目行 id 进观测注册表");
+
+        // 建会话 (stub shell, cwd = project root — spec: working directory)
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stub_dir = std::env::temp_dir().join(format!("chain-stub-{unique}"));
+        fs::create_dir_all(&stub_dir).unwrap();
+        let stub = write_stub(&stub_dir);
+        let shell = PiAgentShell::new_with_pi_bin(
+            "pi-chain".into(),
+            project_dir.clone(),
+            Some(stub.to_str().unwrap().to_string()),
+        )
+        .expect("stub embed spawn");
+        let e = cx.new(|_| AgentSession(Box::new(shell)));
+        let agent_id = e.entity_id();
+        app_entity.update(cx, |app, cx| {
+            app.workspace.as_mut().unwrap().agents.push(e);
+            app.active = Some(agent_id);
+            app.sidebar.update(cx, |_, cx| cx.notify());
+            app.terminal.update(cx, |_, cx| cx.notify());
+        });
+        cx.run_until_parked();
+        let texts = render_texts(handle, cx);
+        let agent_row_found = cx
+            .update_window(handle, |_, window, _cx| {
+                window
+                    .try_find(format!("agent-name-{agent_id}"))
+                    .is_some()
+            })
+            .expect("update window");
+        assert!(
+            agent_row_found,
+            "会话行已渲染 (cwd == project root 分组命中)"
+        );
+        let project_str = project_dir.to_string_lossy().into_owned();
+        assert!(
+            texts.iter().any(|t| t.contains(&project_str)),
+            "状态栏显示 project root (cwd), 实际: {texts:?}"
+        );
+
+        // 门控: Starting/Running 的会话挡住切换
+        app_entity.update(cx, |app, cx| app.request_workspace_open(true, cx));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            assert!(
+                app.notice.as_deref().is_some_and(|n| n.contains("still active")),
+                "活动会话拦截切换 (spec)"
+            );
+            assert_eq!(app.workspace.as_ref().unwrap().path, ws, "工作区不变");
+        });
+
+        let _ = fs::remove_dir_all(&stub_dir);
     }
 }

@@ -10,6 +10,7 @@ module will fill.
 
 ## Requirements
 
+
 ### Requirement: Left dock draggable resize
 
 The left dock SHALL be resizable by dragging its right edge, clamped to a safe
@@ -26,18 +27,16 @@ its columns and rows from the changed available area in the same step.
 
 - **WHEN** the user drags the left dock's right edge inward past the minimum width
 - **THEN** the dock stops at the minimum width and the center pane remains visible
-
 ### Requirement: Left dock is not closable
 
 The system SHALL NOT offer any control that closes or hides the left dock, so
-the sidebar's controls (`+ new workspace`, `[+ agent]`, close buttons) remain
-reachable at all times.
+the sidebar's controls (workspace switch entry, `[+ agent]`, close buttons)
+remain reachable at all times.
 
 #### Scenario: No close affordance on left dock
 
 - **WHEN** the user inspects the left dock's edges and header
 - **THEN** no close or hide control is present for the left dock
-
 ### Requirement: Right dock renders by default
 
 On startup the right dock SHALL be visible and render the file tree panel: a
@@ -56,7 +55,6 @@ unchanged.
 
 - **WHEN** the user inspects the right dock header
 - **THEN** it shows the panel title, a refresh control, a read-only filter-rule summary, and a close button
-
 ### Requirement: Right dock draggable resize
 
 The right dock SHALL be resizable by dragging its left edge, clamped to the
@@ -67,7 +65,6 @@ the changed center area in the same step.
 
 - **WHEN** the user drags the right dock's left edge and releases it
 - **THEN** the right dock keeps the new width and the terminal grid's column count reflects the new center width
-
 ### Requirement: Right dock close
 
 A close control on the right dock SHALL close the dock: it renders at zero

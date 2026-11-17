@@ -8,40 +8,10 @@ renders the active session's terminal output and forwards user input.
 
 ## Requirements
 
-### Requirement: Sidebar session creation
 
-The system SHALL provide a `[+ agent]` button at the bottom of each expanded
-workspace's agent list. Clicking it SHALL create a new agent session inside
-that workspace, assign it a per-workspace auto-incrementing name of the form
-`pi-N` (where `N` starts at 1 within that workspace and never reuses a number
-already issued inside that workspace), display it in the sidebar as
-`<dirname>/pi-N` (e.g. `foo/pi-1`), start an embedded session for it that
-drives the `pi` agent process over its RPC interface with a working directory
-equal to the workspace's absolute path, and make it the active session in the
-main pane. If no workspace exists yet, no `[+ agent]` button SHALL be rendered.
-
-#### Scenario: First session
-
-- **WHEN** the user expands a previously empty workspace for `/Users/me/code/foo`
-  and clicks `[+ agent]`
-- **THEN** a new item labelled `foo/pi-1` appears indented under the workspace,
-  the main pane shows that session's output area, and the session's `pi`
-  process runs with cwd `/Users/me/code/foo`
-
-#### Scenario: Multiple sessions
-
-- **WHEN** the user clicks `[+ agent]` twice in a row inside `foo`
-- **THEN** the sidebar contains `foo/pi-1` and `foo/pi-2`, and `foo/pi-2` is
-  the active session shown in the main pane
-
-#### Scenario: Independent counters per workspace
-
-- **WHEN** the user creates one agent in workspace `foo` and one agent in
-  workspace `bar`
-- **THEN** the sidebar shows both `foo/pi-1` and `bar/pi-1` as separate items
 ### Requirement: Sidebar session item display
 
-Each agent item in the sidebar SHALL be indented under its parent workspace
+Each agent item in the sidebar SHALL be indented under its parent project row
 and SHALL display the session's prefixed name (e.g. `foo/pi-1`), a status
 badge, and a close button that is visible on hover. The status badge SHALL
 reflect one of three states: `starting` (session created but no output yet),
@@ -56,8 +26,9 @@ connection).
 
 #### Scenario: Running session shows running
 
-- **WHEN** a session has emitted output and its agent connection is still open
-- **THEN** the sidebar item shows the prefixed name with a `running` badge
+- **WHEN** a session has emitted output and its agent connection is still
+  open
+- **THEN** the sidebar item shows a `running` badge
 
 #### Scenario: Exited session shows exited
 
@@ -69,46 +40,6 @@ connection).
 
 - **WHEN** the user hovers the pointer over a sidebar agent item
 - **THEN** a close button (`x`) becomes visible on that item
-### Requirement: Session selection focus model
-
-The center slot SHALL render as a tab group whose displayed content is the
-active tab. The console tab SHALL always render the currently selected agent
-session. Clicking an agent item in the sidebar SHALL switch the center slot
-back to the console tab, display that session, AND make it the recipient of
-keyboard input. Clicking a workspace row SHALL NOT switch the active tab. The
-macOS-level application losing focus SHALL be the only condition under which
-keyboard input is not forwarded to the active tab's panel. The console tab's
-status bar SHALL display the active session's full workspace absolute path,
-its prefixed agent name, and its status — for example
-`/Users/me/code/foo — pi-1 [Running]`.
-
-#### Scenario: Click sidebar item switches active session
-
-- **WHEN** the user clicks sidebar item `bar/pi-1` while `foo/pi-1` is active
-- **THEN** the console tab becomes the active tab rendering `bar/pi-1`,
-  subsequent keystrokes are sent to `bar/pi-1`, and the status bar shows
-  `…/bar — pi-1 [Running]`
-
-#### Scenario: Click sidebar item returns from a viewer tab
-
-- **WHEN** the user views `main.rs` in a viewer tab and then clicks sidebar
-  item `foo/pi-1`
-- **THEN** the center slot switches back to the console tab, which renders
-  `foo/pi-1`, and keystrokes are delivered to that session
-
-#### Scenario: Click workspace row does not switch main pane
-
-- **WHEN** the user clicks a workspace row while an agent in a different
-  workspace is active
-- **THEN** the active tab continues to display what it displayed before
-
-#### Scenario: Active session visual emphasis
-
-- **WHEN** a session is active
-- **THEN** its sidebar item is visually highlighted, and the console tab
-  shows a highlighted border or status bar indicating which session is
-  displayed
-
 ### Requirement: Active session startup placeholder
 
 While a newly created session is in the `starting` state, the main pane SHALL
@@ -126,7 +57,6 @@ be removed.
 
 - **WHEN** the active session transitions from `starting` to `running`
 - **THEN** the placeholder is no longer rendered
-
 ### Requirement: Terminal output rendering
 
 The console tab SHALL render the active session's terminal screen
@@ -162,7 +92,6 @@ cell of width.
 - **WHEN** the vt100 screen reports a cell as a wide-character continuation
 - **THEN** that cell contributes no additional rendered width beyond the two
   cells already consumed by its leading wide character
-
 ### Requirement: Keyboard input forwarding
 
 While the application window is focused, the system SHALL deliver input to
@@ -234,7 +163,6 @@ panel.
   composes text with an IME without clicking inside the pane area
 - **THEN** the committed text is delivered to the newly selected session,
   and no input is delivered to the previously selected session
-
 ### Requirement: Manual session close
 
 The user SHALL be able to close a session by clicking its sidebar close
@@ -308,7 +236,6 @@ the system SHALL NOT enable IME input routing to any session.
 - **WHEN** an agent session is selected for display in the console tab
 - **THEN** the pane border is drawn in the active color (blue); when no
   agent is selected, the pane is not rendered as an interactive surface
-
 ### Requirement: Adaptive terminal grid sizing
 
 The terminal grid's column and row counts SHALL be derived from the measured
@@ -328,7 +255,6 @@ minimum (never zero or an invalid size).
   the minimum columns or rows
 - **THEN** the grid uses the minimum dimensions instead of zero or an
   invalid size
-
 ### Requirement: Grid resize propagation
 
 When the computed grid dimensions differ from the current dimensions, the
@@ -375,7 +301,6 @@ deliver it to the active session.
 - **WHEN** the user scrolls down while partway up the history
 - **THEN** the session receives positive line counts and the view moves
   toward the newest content
-
 ### Requirement: Wheel input follows hover and stops propagation
 
 Wheel input SHALL follow pointer hover, not keyboard focus: nothing SHALL
@@ -394,7 +319,6 @@ containers do not scroll instead.
   also offers an outer scroll container
 - **THEN** the wheel input reaches the session and the outer container's
   scroll position is unchanged
-
 ### Requirement: Wheel deltas accumulate to whole lines
 
 Pixel wheel deltas SHALL accumulate across events until a whole line is
@@ -416,7 +340,6 @@ terminal's line height changes.
   metrics) while a fractional remainder is held
 - **THEN** the held remainder is discarded rather than applied at the new
   line height
-
 ### Requirement: Alt multiplies wheel input
 
 Holding Alt while scrolling SHALL multiply the delivered line count by the
@@ -426,7 +349,6 @@ session's alt-wheel multiplier, matching standalone terminal behavior.
 
 - **WHEN** the user scrolls one wheel notch while holding Alt
 - **THEN** the delivered line count is five times the unmodified count
-
 ### Requirement: Terminal area click coordinates forwarded
 
 Left-clicking inside the terminal grid area SHALL deliver the click's
@@ -463,7 +385,6 @@ coordinate means.
 - **WHEN** the user left-clicks an expandable tool card rendered in the
   terminal area
 - **THEN** the card toggles between its collapsed and expanded states
-
 ### Requirement: Terminal area text selection
 
 While the pointer hovers the terminal grid, a left-button press SHALL
@@ -490,7 +411,6 @@ keyboard focus, and SHALL NOT be forwarded to the session in any form.
 - **WHEN** the user completes a drag selection inside the grid
 - **THEN** keyboard focus remains on the console pane as it was after any
   other press in the pane area
-
 ### Requirement: Selection cleared when its content changes
 
 Selections SHALL be anchored to the visible frame, not to a scrollback
@@ -513,7 +433,6 @@ session switch).
 - **WHEN** the user scrolls the history while a selection is active and
   the scroll changes the selected region's content
 - **THEN** the selection is cleared on the next frame
-
 ### Requirement: Selection survives unrelated frame updates
 
 When a new frame arrives and the text at the selection's coordinates still
@@ -525,7 +444,6 @@ the selected region SHALL NOT disturb it.
 - **WHEN** the user has a selection and new output arrives that does not
   change the text at the selection's coordinates
 - **THEN** the selection and its overlay highlight remain
-
 ### Requirement: Copy selection with Cmd+C
 
 While a selection is active and the console pane has focus, pressing Cmd+C
@@ -547,7 +465,6 @@ is active, Cmd+C SHALL NOT write to the clipboard.
 
 - **WHEN** the user presses Cmd+C while no selection is active
 - **THEN** the system clipboard content is unchanged
-
 ### Requirement: Cross-platform monospace font resolution
 
 The terminal grid SHALL resolve its monospace font from an ordered list of
@@ -570,7 +487,6 @@ can never disagree.
   the cell width (quantized to the layout pixel grid) is exactly the grid
   the painted glyph positions land on — measurement and painting cannot
   disagree
-
 ### Requirement: Resolved font verified as monospace
 
 On first cell-width measurement the system SHALL verify that representative
@@ -593,7 +509,6 @@ time.
   classes
 - **THEN** verification passes with no diagnostic and the grid renders
   normally
-
 ### Requirement: No horizontal drift inside the cell grid
 
 For every rendered row, the horizontal position of the glyph painted for
@@ -620,7 +535,6 @@ cell boundaries.
 - **WHEN** the resolved font is monospace and the grid renders any row
 - **THEN** every glyph's painted x position equals its cell index times the
   cell width within sub-pixel tolerance
-
 ### Requirement: Real-font metrics regression coverage
 
 The test suite SHALL include at least one test that measures glyph advances
@@ -638,3 +552,112 @@ the resolved font is non-monospace, so a broken font fallback cannot pass CI.
 - **WHEN** existing cell-width tests run against the mock text system
 - **THEN** they still pass for their own contract but provide no verdict on
   real-font correctness, which the real-metrics test owns
+### Requirement: Project session creation
+
+The system SHALL provide a `[+ agent]` button at the bottom of each project
+row's agent list. Clicking it SHALL create a new agent session inside that
+project, assign a per-project auto-incrementing name `pi-N` (N starts at 1
+per project and is never reused within it), display it as `<project>/pi-N`,
+start an embedded session driving the `pi` agent process, and make it the
+active session in the main pane. If no project exists, no `[+ agent]` button
+SHALL render.
+
+#### Scenario: First session
+
+- **WHEN** the user expands a previously empty project `foo` rooted at
+  `/Users/me/code/foo` and clicks `[+ agent]`
+- **THEN** a new item labelled `foo/pi-1` appears indented under the project,
+  the main pane shows that session's output area, and the session's `pi`
+  process runs with cwd `/Users/me/code/foo`
+
+#### Scenario: Multiple sessions
+
+- **WHEN** the user clicks `[+ agent]` twice in a row inside project `foo`
+- **THEN** the sidebar contains `foo/pi-1` and `foo/pi-2`, and `foo/pi-2` is
+  the active session shown in the main pane
+
+#### Scenario: Independent counters per project
+
+- **WHEN** the user creates one agent in project `foo` and one agent in
+  project `bar`
+- **THEN** the sidebar shows both `foo/pi-1` and `bar/pi-1` as separate items
+
+#### Scenario: No project renders no button
+
+- **WHEN** the workspace has zero projects
+- **THEN** no `[+ agent]` button is rendered anywhere in the sidebar
+### Requirement: Session working directory
+
+A newly created session's embedded `pi` process SHALL run with its working
+directory equal to the owning project's root path.
+
+#### Scenario: Cwd equals project root
+
+- **WHEN** the user creates a session in project `foo` rooted at
+  `/Users/me/code/foo`, a directory outside the workspace
+- **THEN** the `pi` process runs with cwd `/Users/me/code/foo`, not the
+  workspace directory
+### Requirement: Project row and session selection focus model
+
+The center slot SHALL render as a tab group whose content is the active tab;
+the console tab SHALL always render the currently selected agent session.
+Clicking an agent item in the sidebar SHALL switch to the console tab,
+display that session, and make it the recipient of keyboard input. Clicking
+a project row SHALL switch only that row's expanded state and SHALL NOT
+switch the active tab.
+
+#### Scenario: Click sidebar item switches active session
+
+- **WHEN** the user clicks sidebar item `bar/pi-1` while `foo/pi-1` is active
+- **THEN** the console tab becomes the active tab rendering `bar/pi-1`,
+  subsequent keystrokes are sent to `bar/pi-1`, and the status bar shows
+  bar's project root path followed by `— pi-1 [Running]`
+
+#### Scenario: Click sidebar item returns from a viewer tab
+
+- **WHEN** the user views `main.rs` in a viewer tab and then clicks sidebar
+  item `foo/pi-1`
+- **THEN** the center slot switches back to the console tab, which renders
+  `foo/pi-1`, and keystrokes are delivered to that session
+
+#### Scenario: Click project row does not switch main pane
+
+- **WHEN** the user clicks a project row while an agent of a different
+  project is active
+- **THEN** the active tab continues to display what it displayed before, and
+  only the clicked project row's expansion state changes
+
+#### Scenario: Active session visual emphasis
+
+- **WHEN** a session is active
+- **THEN** its sidebar item is visually highlighted, and the console tab
+  shows a highlighted border or status bar indicating which session is
+  displayed
+### Requirement: Console status bar content
+
+The console tab's status bar SHALL display the active session's project root
+absolute path, its prefixed agent name, and its status — for example
+`/Users/me/code/foo — pi-1 [Running]`.
+
+#### Scenario: Status bar shows project path and status
+
+- **WHEN** session `pi-1` of project `foo` rooted at `/Users/me/code/foo` is
+  active and running
+- **THEN** the status bar reads `/Users/me/code/foo — pi-1 [Running]`
+### Requirement: Project row collapse toggle
+
+Each project row SHALL expose a collapse toggle that hides or reveals its
+agent rows. Toggling SHALL NOT change the active session, SHALL NOT switch
+the active tab, and SHALL NOT steal keyboard focus from the current pane.
+
+#### Scenario: Collapsed project hides its agents
+
+- **WHEN** the user collapses a project row that lists two agent items
+- **THEN** the two agent items are hidden while the project row remains
+  visible
+
+#### Scenario: Toggle preserves active session
+
+- **WHEN** the user collapses the project owning the active session
+- **THEN** the main pane still renders that session and keystrokes still
+  reach it

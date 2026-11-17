@@ -9,6 +9,7 @@ preserving session-emitted colors.
 
 ## Requirements
 
+
 ### Requirement: Theme follows operating-system appearance
 
 The application SHALL render in the light or dark theme matching the operating
@@ -29,7 +30,6 @@ and no persisted theme preference.
   versa) while the application is open
 - **THEN** all open windows re-render in the new theme before the next user
   interaction, with no restart required
-
 ### Requirement: Chrome surfaces are theme-consistent
 
 Every application chrome surface (sidebar rows, file tree, terminal pane
@@ -40,7 +40,7 @@ a color that is legible in only one theme.
 
 #### Scenario: Sidebar hover and active rows in both themes
 
-- **WHEN** the theme is dark and the user hovers or selects a workspace,
+- **WHEN** the theme is dark and the user hovers or selects a project,
   agent, or file-tree row
 - **THEN** the hover background, active-row highlight, and text colors are
   legible against the dark background (and symmetrically in the light theme)
@@ -51,7 +51,6 @@ a color that is legible in only one theme.
   close control
 - **THEN** badge and control colors remain distinguishable from the row
   background in the active theme
-
 ### Requirement: Terminal default colors follow the theme
 
 The terminal grid's default foreground and default background SHALL follow the
@@ -69,7 +68,6 @@ themes.
 
 - **WHEN** a session emits text with an explicit RGB color
 - **THEN** the cell renders in exactly that RGB value in both themes
-
 ### Requirement: ANSI palette is theme-appropriate
 
 ANSI color indices 0-15 SHALL map to a palette tuned for the active theme, so
@@ -91,7 +89,6 @@ session.
   index-colored content
 - **THEN** the same screen is displayed with the new theme's palette after the
   switch, session still running
-
 ### Requirement: Session content colors follow the injected theme
 
 Session-rendered content whose colors are designed by the embedded interface

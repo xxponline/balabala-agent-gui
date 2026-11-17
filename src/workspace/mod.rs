@@ -1,38 +1,48 @@
-//! Workspace entity: 一个 workspace 持有一个绝对路径, 以及该路径下的 agents。
+//! Workspace 实体: 单实例工作区 (change: single-workspace-project-model)。
 //!
-//! 这个模块只声明类型和 trait, 具体的持久化 IO 在 `store` 子模块。
+//! 一个应用实例同时只打开一个 workspace (design D1): 目录本身即工作区,
+//! 领域模型 (solutions → Projects) 持在其上, 会话按 Project 挂载。
+//! 持久化分工: workspace 内文件见 `crate::project_model`, 全局历史见
+//! `history`, legacy 迁移见 `store`。
 
+pub mod history;
 pub mod store;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use gpui_kit::Entity;
 
 use crate::agent_entities::AgentSession;
+use crate::project_model::WorkspaceModel;
 
-/// 一个工作区: 对应磁盘上的一个目录, 下面挂着若干 agent 会话。
+/// 当前打开的工作区: 目录 + 领域模型 + 会话。
+///
+/// 会话平铺在 workspace 级 (poll/主题/resize 遍历零分组开销); 所属
+/// Project 由 `AgentEntity::project_root()` 即 cwd 决定 (spec: Session
+/// working directory — agent 在哪个项目下 = cwd 指向哪个项目根)。
 pub struct Workspace {
-    /// 绝对路径, 作为去重 key
+    /// 工作区目录绝对路径 (去重身份; 右树扫描根)。
     pub path: PathBuf,
-    /// 折叠状态 (易失, 不持久化)
-    pub collapsed: bool,
-    /// 该 workspace 下的所有 agent 会话 (design D2: entity 持有)
+    /// 领域模型 (solutions + Projects; 纯数据, design D2)。
+    pub model: WorkspaceModel,
+    /// 折叠的 Project 行 (易失, 不持久化 — 对齐"折叠态不持久化"立场)。
+    pub collapsed_projects: HashSet<PathBuf>,
+    /// 该工作区下的全部会话 (平铺; 计数器在 `model` 的 Project 上)。
     pub agents: Vec<Entity<AgentSession>>,
-    /// 下一个 agent 编号: 每个 workspace 独立从 1 开始
-    pub next_agent_idx: u32,
 }
 
 impl Workspace {
-    pub fn new(path: PathBuf) -> Self {
+    pub fn new(path: PathBuf, model: WorkspaceModel) -> Self {
         Self {
             path,
-            collapsed: false,
+            model,
+            collapsed_projects: HashSet::new(),
             agents: Vec::new(),
-            next_agent_idx: 1,
         }
     }
 
-    /// sidebar 行内显示的短名字: 路径末段 (e.g. "foo" for "/Users/me/code/foo")
+    /// 行内短名: 路径末段 (e.g. "foo" for "/Users/me/code/foo")。
     pub fn display_name(&self) -> &str {
         self.path
             .file_name()
@@ -40,15 +50,8 @@ impl Workspace {
             .unwrap_or("?")
     }
 
-    /// tooltip 显示的完整绝对路径
+    /// tooltip 完整路径。
     pub fn full_path_str(&self) -> String {
-        self.path.to_string_lossy().to_string()
-    }
-
-    /// 生成下一个 agent 的显示名: "<dirname>/pi-<N>" 并自增计数器
-    pub fn new_agent_name(&mut self) -> String {
-        let name = format!("{}/pi-{}", self.display_name(), self.next_agent_idx);
-        self.next_agent_idx += 1;
-        name
+        self.path.to_string_lossy().into_owned()
     }
 }

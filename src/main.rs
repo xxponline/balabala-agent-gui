@@ -8,6 +8,7 @@
 mod agent_entities;
 mod app;
 mod pane;
+mod project_model;
 mod property_detail_manager;
 mod shell;
 mod sidebar;

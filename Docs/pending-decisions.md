@@ -128,26 +128,28 @@ CloseAgent), 统一投进 `TerminalApp::on_sidebar_event` 单一入口 match 分
 
 ## 持久化路径选择 (项目本地 vs 用户目录)
 
-**当前选择**: `.workspaces.json` 写在项目根目录下 — 且这已是 spec 措辞
-(workspace-management: "SHALL persist ... to `.workspaces.json` in the
-project root"), 迁移到用户目录须先开 spec delta。
+**状态: 已解决** (change `single-workspace-project-model`)。
 
-**为什么这样选**: 这是 demo / 开发期工具, 用户从哪启动 cargo run,
-workspaces.json 就在哪, 心智最简单。
+新形态不是“挪个位置的大文件”，而是按职责拆到两处:
+- **workspace 配置**在工作区目录内 — `.balabala.workspace.json` (marker +
+  `file_tree` 规则) + `balabala.solutions.json`；打开目录 = 打开工作区，
+  配置跟着数据走 (workspace-management/project-model spec)。
+- **MRU 历史**在全局应用数据目录 (`directories` crate →
+  `workspace_history.json`)；历史不属于任何工作区，放全局才不与
+  “配置都在工作区里”冲突 (design D4)。
+- legacy `.workspaces.json` 只读: 一次性播种历史 (`legacy_seeded` 标志) +
+  打开时按缺区段补拷规则；**永不改写** (Legacy migration spec)。
 
-**未来需要重新评估的信号**:
-- 把这个 app 发布给其他用户用 (他们不会 clone 源码)
-- 用户期望在不同项目里启动同一个 app 都能看到自己的 workspace 列表
-
-**要做的事**:
-- 引入 `directories` crate 拿平台特定的配置目录
-  (macOS: `~/Library/Application Support/pi-agent-shell/`)
-- 写一个一次性迁移: 如果项目根有旧的 `.workspaces.json`, 复制到新位置
-- 之后读新位置, 删项目根的旧文件
+原“要做的事”全部落地; 唯一形态差异: 没有引入单一用户目录配置文件,
+而是拆成 workspace 内 + 全局历史两件 (见 change design D3/D4)。
 
 ## 会话与折叠态不持久化
 
-**状态**: 待立项 (workspace-management spec 明确排除项)。
+**状态**: 维持不持久化 — change `single-workspace-project-model` 落地时
+对齐确认: agent 会话仍**不持久化** (重启即丢是既定语义；项目化后
+稳定键 (project root) 虽已具备，恢复仍是独立后置项)；折叠态从
+workspace 级改为 **per-project** (`collapsed_projects` 集合)，仍易失
+不写盘。
 
 **当前选择**: `.workspaces.json` 只存 workspace 路径列表 (+ `file_tree`
 规则区段); agent 会话与展开/折叠态重启即丢 — spec: "Collapse state and

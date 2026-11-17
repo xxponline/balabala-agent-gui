@@ -3,7 +3,8 @@
 //! part1 职责（design D6/D7）：
 //! - 定位活动 workspace 根（`resolve_active_root`；通知路径的同根比对
 //!   也收敛在此 — `refresh_if_needed`，D6）；
-//! - 读 `.workspaces.json` 的 `file_tree` 规则区段（按根路径键控）；
+//! - 读活动工作区自己配置文件的 `file_tree` 规则区段
+//!   （`.balabala.workspace.json`，单工作区不再按键控 — file-tree delta）；
 //! - 全量递归扫描（默认排除表 + 后台线程），落权威树；
 //! - `view()` 对权威树按 gitignore 式规则求值（**仅文件行**，目录恒显）。
 //!
@@ -16,8 +17,8 @@ use std::sync::{Arc, Mutex};
 use gpui_kit::{App, AsyncApp, Task, WeakEntity, Window};
 
 use crate::app::TerminalApp;
+use crate::project_model;
 use crate::property_detail_manager::OpenObject;
-use crate::workspace::store;
 
 use super::filter::Ruleset;
 use super::{
@@ -134,8 +135,6 @@ impl SourceInner {
 
 pub struct FileTreeSource {
     app: WeakEntity<TerminalApp>,
-    /// 规则文件路径（默认 `store::filepath()`；测试缝指向临时文件）。
-    rules_path: PathBuf,
     inner: Arc<Mutex<SourceInner>>,
     /// 刷新任务存根——drop 会取消 future（app.rs 同款约定）；
     /// 新 refresh 覆盖旧任务 = 新扫描取代在途旧扫描（supersede）。
@@ -146,10 +145,9 @@ pub struct FileTreeSource {
 }
 
 impl FileTreeSource {
-    pub fn new(app: WeakEntity<TerminalApp>, rules_path: PathBuf) -> Self {
+    pub fn new(app: WeakEntity<TerminalApp>) -> Self {
         Self {
             app,
-            rules_path,
             inner: Arc::new(Mutex::new(SourceInner::default())),
             _refresh_task: None,
             #[cfg(test)]
@@ -166,16 +164,19 @@ impl FileTreeSource {
 
 /// 定位活动 agent 所属 workspace 的根路径（file-tree spec: Tree scope）。
 ///
+/// 单工作区 (change: single-workspace-project-model): 活动会话在当前
+/// workspace 内 → 其目录即根；无活动会话 / 未开工作区 → None (空态)。
 /// `refresh` / `refresh_if_needed` 用它定位期望根 — 通知路径的
 /// "同根才不重扫"比对也收敛在源内 (design D6, 面板不再自行比对)。
 pub fn resolve_active_root(app: &WeakEntity<TerminalApp>, cx: &App) -> Option<PathBuf> {
     let app = app.upgrade()?;
     let app = app.read(cx);
     let active = app.active?;
-    app.workspaces
+    let ws = app.workspace.as_ref()?;
+    ws.agents
         .iter()
-        .find(|ws| ws.agents.iter().any(|a| a.entity_id() == active))
-        .map(|ws| ws.path.clone())
+        .any(|a| a.entity_id() == active)
+        .then(|| ws.path.clone())
 }
 
 /// 全量递归扫描（**后台线程执行**；design D6）。
@@ -273,12 +274,11 @@ impl WorkspacePropertySource for FileTreeSource {
     fn refresh(&mut self, cx: &mut App) {
         // part1a: 定位根 (活跃 agent 所属 workspace)
         let root = resolve_active_root(&self.app, cx);
-        // part1b: 重读配置规则 (按根键控; 缺失 = 空 = 全显)
-        let all_rules = store::load_file_tree_rules(&self.rules_path);
+        // part1b: 重读规则 — 工作区自己的配置文件 (缺失/损坏 = 空 = 全显;
+        // 启动期坏文件契约已由打开路径拦截, 刷新期容错 — file-tree delta)
         let rules = root
-            .as_ref()
-            .and_then(|r| all_rules.get(r.to_string_lossy().as_ref()))
-            .cloned()
+            .as_deref()
+            .map(project_model::load_file_tree_rules)
             .unwrap_or_default();
 
         let inner = self.inner.clone();

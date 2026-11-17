@@ -131,25 +131,20 @@ pub fn find_node_kind(node: &SourceNode, id: &str) -> Option<SourceNodeKind> {
 }
 
 /// 源工厂签名。
-type SourceFactory = fn(WeakEntity<TerminalApp>, PathBuf) -> Box<dyn WorkspacePropertySource>;
+type SourceFactory = fn(WeakEntity<TerminalApp>) -> Box<dyn WorkspacePropertySource>;
 
 /// 静态注册表（design: v1 仅 filetree；切换器立项后按 id 扩行）。
-const REGISTRY: &[(&str, SourceFactory)] = &[(
-    "filetree",
-    |app, rules_path| Box::new(filetree::FileTreeSource::new(app, rules_path)),
-)];
+/// 规则随活动工作区根解析 (filetree 内部读 marker), 工厂不再收静态规则路径。
+const REGISTRY: &[(&str, SourceFactory)] =
+    &[("filetree", |app| Box::new(filetree::FileTreeSource::new(app)))];
 
 /// 注册表 id：默认数据源。
 pub const DEFAULT_SOURCE_ID: &str = "filetree";
 
 /// 按 id 取源；未知 id 返回 None。
-pub fn create_source(
-    id: &str,
-    app: WeakEntity<TerminalApp>,
-    rules_path: PathBuf,
-) -> Option<Box<dyn WorkspacePropertySource>> {
+pub fn create_source(id: &str, app: WeakEntity<TerminalApp>) -> Option<Box<dyn WorkspacePropertySource>> {
     REGISTRY
         .iter()
         .find(|(registry_id, _)| *registry_id == id)
-        .map(|(_, factory)| factory(app, rules_path))
+        .map(|(_, factory)| factory(app))
 }
