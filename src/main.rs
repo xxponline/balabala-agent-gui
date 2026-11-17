@@ -21,6 +21,20 @@ use app::TerminalApp;
 use gpui_kit::AppContext;
 
 fn main() {
+    // Windows GUI 子系统下 (release, 无控制台) crossterm 的 ANSI 支持探测修复:
+    // `supports_ansi()` 先试 enable_vt_processing (需有效控制台句柄, GUI 进程必败),
+    // 失败则回退看 TERM != "dumb"。Windows 默认不设 TERM → 返回 false →
+    // crossterm queue() 改走 execute_winapi() 直连控制台句柄 → Os 6 (handle
+    // invalid) → pi-shell-rs embed 事件线程首帧 draw 即退 → 会话秒退、pi 子进程
+    // 被杀 (实测: release 弹控制台窗口后立即结束; debug 是控制台子系统故不触发)。
+    // 必须在任何 crossterm queue 调用前 (supports_ansi 的 Once 初始化前) 设置。
+    #[cfg(windows)]
+    unsafe {
+        if std::env::var_os("TERM").is_none() {
+            std::env::set_var("TERM", "xterm-256color");
+        }
+    }
+
     gpui_kit::application()
         // 图标资产 (tab 关闭 × 等 SVG): gpui 的默认 AssetSource 是 `()`,
         // 不挂 gpui_kit::assets::Assets 则所有 svg 加载失败 (空白按钮, 2026-11-10
