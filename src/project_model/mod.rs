@@ -18,7 +18,7 @@ pub use files::{
     MarkerStatus, append_simple_solution, create_workspace_files, load_file_tree_rules,
     marker_status, set_file_tree_rules,
 };
-pub use project::Project;
+pub use project::{Module, Project};
 pub use solution::SolutionItem;
 pub use validate::load;
 

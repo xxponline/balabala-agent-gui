@@ -17,6 +17,7 @@ use crate::agent_entities::{AgentSession, PiAgentShell};
 use crate::pane::TerminalPanel;
 use crate::property_detail_manager::{OpenObject, active_center_panel_id, handler_for};
 use crate::shell;
+use crate::asset_manager::AssetManager;
 use crate::project_model::{self, MarkerStatus, WorkspaceModel};
 use crate::sidebar::{SidebarEvent, SidebarPanel};
 use crate::tree::TreePanel;
@@ -57,6 +58,9 @@ pub struct TerminalApp {
     pub terminal: Entity<TerminalPanel>,
     /// 文件树面板实体 (right-dock-file-tree; notify 转发名单成员)
     pub tree: Entity<TreePanel>,
+    /// 右槽数据服务层 (asset-manager-right-dock D1): 面板读视图/代数,
+    /// app 钩子做注册与刷新
+    pub asset_manager: Entity<AssetManager>,
     /// 节流 drain 任务; drop 会取消循环 (design D3)
     _update_task: Option<Task<()>>,
     /// 输入触发的快速 drain burst (design D7): 8ms×4 拍取到帧即停,
@@ -82,7 +86,7 @@ pub struct TerminalApp {
     /// 累计转发给会话的点击坐标次数 (同上, 载荷在假会话端断言)
     pub click_forwards: usize,
     /// 默认打开系统的 dedup 表 (center-slot-multi-tab, design D1):
-    /// key = 对象绝对路径字符串 (与 SourceNode.id 同一身份体系),
+    /// key = 对象绝对路径字符串 (与 AssetNode.id 同一身份体系),
     /// value = 已开面板的 PanelId; 签关闭时经 `open_tab_removed` 摘除。
     pub(crate) open_tabs: HashMap<String, PanelId>,
 }
@@ -118,6 +122,7 @@ impl TerminalApp {
             KeyBinding::new("cmd-shift-m", ToggleMdView, None),
         ]);
 
+        #[allow(unused_mut)] // cfg(test) 不走 legacy 播种分支 → mut 不被用
         let mut history = History::load_at(&history_path);
         // legacy 播种: 正式构建一次性 (legacy_seeded 落盘后不再读);
         // cfg(test) 关闭 — 仓库根可能残留 legacy 文件, 测试不得读外部状态
@@ -136,7 +141,9 @@ impl TerminalApp {
             sidebar,
             terminal,
             tree,
-        } = shell::build(weak_app, window, cx);
+        } = shell::build(weak_app.clone(), window, cx);
+        // 右槽数据的服务层 (asset-manager-right-dock D1): 面板经 app 读它
+        let asset_manager = cx.new(|cx| AssetManager::new(weak_app, cx));
         // 主题跟随系统外观 (add-light-dark-theme D1): 启动同步一次,
         // 并订阅外观变化 → 每次变化重新 sync (Theme::change 内部会
         // refresh_windows, 全窗重渲即热切换生效), 并把新配色推给
@@ -173,6 +180,7 @@ impl TerminalApp {
             sidebar,
             terminal,
             tree,
+            asset_manager,
         };
         // 有历史 → 异步恢复最近工作区; 无历史/失效 → 留空态 (不报错)
         if let Some(path) = restore {
@@ -530,7 +538,12 @@ impl TerminalApp {
                 if let Err(e) = history.save_at(&self.history_path) {
                     eprintln!("workspace history save failed: {e}");
                 }
-                self.workspace = Some(Workspace::new(path, model));
+                let projects = model.projects.clone();
+                self.workspace = Some(Workspace::new(path.clone(), model));
+                // 注册进 asset_manager (design D6: 打开 = 全量替换;
+                // 规则已在上面 migrate_legacy_rules 就位 — 注册前规则先到)
+                self.asset_manager
+                    .update(cx, |m, cx| m.register(path, projects, cx));
             }
         }
         cx.notify();
@@ -597,16 +610,31 @@ impl TerminalApp {
             }
         };
         // 两条路径都进内存 model (项目行立即可见)
+        let mut added: Option<project_model::Project> = None;
         if let Some(ws) = self.workspace.as_mut() {
             if !ws.model.projects.iter().any(|p| p.root == path) {
-                ws.model
-                    .projects
-                    .push(project_model::Project::from_root(path));
+                let project = project_model::Project::from_root(path.clone());
+                ws.model.projects.push(project.clone());
+                added = Some(project);
             }
         }
         if let Some(e) = write_err {
             self.save_error = Some(e);
         }
+        // 增量注册 (design D6): add-solution → 新项目无重启入右树
+        if let Some(project) = added {
+            self.asset_manager
+                .update(cx, |m, cx| m.register_project(project, cx));
+        }
+        cx.notify();
+        self.notify_panels(cx);
+    }
+
+    /// 右槽 ⟳ 入口 (asset-manager-right-dock 4.1): 请求 manager 重枚举
+    /// (规则重读 + supersede 在途; 保展开是面板侧的事 — spec: Refresh
+    /// triggers and behavior)。落地通知由 manager 经 notify_panels 转发。
+    pub fn refresh_assets(&mut self, cx: &mut Context<Self>) {
+        self.asset_manager.update(cx, |m, cx| m.refresh(cx));
         cx.notify();
         self.notify_panels(cx);
     }
@@ -1783,6 +1811,7 @@ mod tests {
     //  其决策点已拆成纯函数/同步方法被下面测试覆盖。
 
     use super::{GateDecision, OpenProbe, switch_gate};
+    use crate::asset_manager::{AssetKind, AssetView, project_id};
     use crate::project_model::{self, Project, SolutionItem, WorkspaceModel};
     use crate::workspace::history::History;
 
@@ -2351,5 +2380,112 @@ mod tests {
         });
 
         let _ = fs::remove_dir_all(&stub_dir);
+    }
+
+    // ===== 4.1: asset_manager 注册接线 =====
+
+    /// 打开工作区 → 项目全量注册落树 (commit_open 钩子)。
+    #[gpui_kit::test]
+    fn workspace_open_registers_projects_into_manager(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let (_handle, app_entity) = open_app_with_history(cx, history);
+        let ws = temp_dir("reg-open");
+        let project_dir = ws.join("foo");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(project_dir.join("lib.rs"), "x").unwrap();
+        project_model::create_workspace_files(&ws).unwrap();
+        project_model::append_simple_solution(&ws, project_dir.clone()).unwrap();
+
+        app_entity.update(cx, |app, cx| app.begin_open(ws.clone(), cx));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            let view = app.asset_manager.read(cx).view();
+            let AssetView::Forest { nodes, .. } = &view else {
+                panic!("应注册落树, got {view:?}")
+            };
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].id, project_id(&project_dir));
+            assert_eq!(nodes[0].kind, AssetKind::Project);
+        });
+    }
+
+    /// add-solution → 增量注册, 新项目行无重启出现 (spec: register
+    /// incrementally … without restarting)。
+    #[gpui_kit::test]
+    fn add_solution_registers_project_incrementally(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let (_handle, app_entity) = open_app_with_history(cx, history);
+        let ws = temp_dir("reg-add");
+        project_model::create_workspace_files(&ws).unwrap();
+        app_entity.update(cx, |app, cx| app.begin_open(ws.clone(), cx));
+        cx.run_until_parked();
+        // 零 solution → 空视图
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            assert_eq!(app.asset_manager.read(cx).view(), AssetView::Empty);
+        });
+
+        let pdir = ws.join("bar");
+        fs::create_dir_all(&pdir).unwrap();
+        fs::write(pdir.join("main.rs"), "x").unwrap();
+        app_entity.update(cx, |app, cx| {
+            let items = project_model::append_simple_solution(&ws, pdir.clone()).unwrap();
+            app.apply_add_solution(pdir.clone(), Ok(items), cx);
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            let view = app.asset_manager.read(cx).view();
+            let AssetView::Forest { nodes, .. } = &view else {
+                panic!("增量注册后应落树, got {view:?}")
+            };
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].id, project_id(&pdir));
+        });
+    }
+
+    /// 切换工作区 → 注册集整体替换, 旧项目行无残留 (spec: Workspace
+    /// switch replaces the registration … no stale rows)。
+    #[gpui_kit::test]
+    fn switching_workspace_replaces_registration(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let (_handle, app_entity) = open_app_with_history(cx, history);
+        let ws1 = temp_dir("reg-switch-1");
+        let one = ws1.join("one");
+        fs::create_dir_all(&one).unwrap();
+        project_model::create_workspace_files(&ws1).unwrap();
+        project_model::append_simple_solution(&ws1, one.clone()).unwrap();
+        let ws2 = temp_dir("reg-switch-2");
+        let two = ws2.join("two");
+        fs::create_dir_all(&two).unwrap();
+        project_model::create_workspace_files(&ws2).unwrap();
+        project_model::append_simple_solution(&ws2, two.clone()).unwrap();
+
+        app_entity.update(cx, |app, cx| app.begin_open(ws1, cx));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            let AssetView::Forest { nodes, .. } = app.asset_manager.read(cx).view() else {
+                panic!("ws1 应落树")
+            };
+            assert_eq!(nodes[0].id, project_id(&one));
+        });
+
+        app_entity.update(cx, |app, cx| app.begin_open(ws2.clone(), cx));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            assert_eq!(app.workspace.as_ref().unwrap().path, ws2);
+            let AssetView::Forest { nodes, .. } = app.asset_manager.read(cx).view() else {
+                panic!("ws2 应落树")
+            };
+            assert_eq!(nodes.len(), 1, "只剩 ws2 的注册");
+            assert_eq!(nodes[0].id, project_id(&two));
+            assert!(
+                !nodes.iter().any(|n| n.id == project_id(&one)),
+                "旧项目行不得残留"
+            );
+        });
     }
 }

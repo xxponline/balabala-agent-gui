@@ -62,10 +62,10 @@ src/
 ├── pane/               中央终端面板: 网格渲染 + 输入转发 / center terminal
 ├── property_detail_manager/  默认打开系统 (页签分发/dedup) / default-open dispatch
 ├── sidebar/            左槽: 切换入口 + Project/Agent 树 / project tree sidebar
-├── tree/               文件树面板 / file tree panel
+├── tree/               右槽资产树面板 (纯显示) / right-dock asset tree (view)
 ├── project_model/      领域模型: solutions → Project/Module (纯数据层) / domain model
 ├── workspace/          工作区实体 + 全局历史 + legacy 迁移 / workspace, history, migration
-├── workspace_property_source/  文件树数据源 (插件化) / pluggable tree data source
+├── asset_manager/      右槽数据服务层: 注册/枚举/过滤/视图 (ViewModel) / asset service
 └── agent_entities/     会话实体 (pi-shell-rs 嵌入) / session entities
 
 pi-shell-rs (git)       TUI 引擎 (ssh git 依赖) / TUI engine (ssh git dep)
@@ -98,9 +98,10 @@ Development follows OpenSpec; durable behavior contracts live in `openspec/specs
 | Capability | 说明 / Description |
 | --- | --- |
 | `agent-shell` | 会话外壳：Project 树、焦点、键盘/滚轮/点击转发、选区复制 (27 reqs) |
+| `asset-manager` | 右槽数据服务：注册、异步枚举、项目根相对过滤、刷新与守卫 (8 reqs) |
 | `center-tabs` | 中槽页签与默认打开系统 (6 reqs) |
 | `dock-layout` | 三槽停靠布局 (5 reqs) |
-| `file-tree` | 文件树数据源与交互 (11 reqs) |
+| `file-tree` | 右槽树面板的显示与交互 (7 reqs) |
 | `project-model` | Solution → Project/Module 结构与加载契约 (5 reqs) |
 | `theming` | 浅色/深色主题与终端配色映射 (5 reqs) |
 | `workspace-management` | 单工作区生命周期：恢复/选择/创建/切换 (8 reqs) |

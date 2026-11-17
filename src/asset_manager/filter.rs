@@ -4,8 +4,13 @@
 //! 手写段匹配 + `**` 递归，不引 globset/regex——字符类 `[]`、转义等
 //! 超出 spec 子集的 gitignore 特性**有意不实现**（design Risks）。
 //!
-//! 目录行不参与求值（结构保留——对 gitignore 的有意偏离），由调用方
-//! （`FileTreeSource::view`）保证只对文件行调用本引擎。
+//! 目录类行不参与求值（结构保留——对 gitignore 的有意偏离），由
+//! [`filter_assets`] 保证只对文件行调用本引擎。
+//! 模式语义 (asset-manager-right-dock): **相对各 Project 根** —
+//! 由 land 路径逐 project 传入自己的 `root_id` (spec: … relative to
+//! each project's root)。
+
+use super::dto::AssetNode;
 
 /// 编译后的单条规则。
 struct Rule {
@@ -124,6 +129,32 @@ impl Ruleset {
     }
 }
 
+/// 对一棵资产子树按 `root_id`（Project 根的绝对路径）求值:
+/// 文件行按 [`Ruleset`] 过滤, 目录类行 (Project/Module/Dir) 恒显
+/// (spec: Rules SHALL apply to file rows only)。
+///
+/// 在 land 路径调用 (结果随视图固化 — 数据通知零重过滤)。
+pub fn filter_assets(node: &AssetNode, root_id: &str, rules: &Ruleset) -> AssetNode {
+    let rel_of = |id: &str| -> String {
+        id.strip_prefix(root_id)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .map(str::to_string)
+            .unwrap_or_else(|| id.to_string())
+    };
+    let children = node
+        .children
+        .iter()
+        .filter(|child| child.kind.is_folder() || rules.is_visible(&rel_of(&child.id)))
+        .map(|child| filter_assets(child, root_id, rules))
+        .collect();
+    AssetNode {
+        id: node.id.clone(),
+        label: node.label.clone(),
+        kind: node.kind,
+        children,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +217,85 @@ mod tests {
         let r = ruleset(&["build/"]);
         assert!(!r.is_visible("pkg/build/out.js"), "尾斜杠 = 目录前缀语义");
         assert!(r.is_visible("pkg/out.js"));
+    }
+
+    // ===== filter_assets (spec: File-row filtering relative to project roots) =====
+
+    use crate::asset_manager::{AssetKind, AssetNode};
+
+    fn file(id: &str) -> AssetNode {
+        AssetNode {
+            id: id.to_string(),
+            label: id.rsplit('/').next().unwrap().to_string(),
+            kind: AssetKind::File,
+            children: Vec::new(),
+        }
+    }
+
+    fn dir(id: &str, children: Vec<AssetNode>) -> AssetNode {
+        AssetNode {
+            id: id.to_string(),
+            label: id.rsplit('/').next().unwrap().to_string(),
+            kind: AssetKind::Dir,
+            children,
+        }
+    }
+
+    /// 合成一棵 `<root>/src/a.rs` + `<root>/docs/b.md` 的目录树。
+    fn fixture(root: &str) -> AssetNode {
+        dir(
+            root,
+            vec![
+                dir(&format!("{root}/src"), vec![file(&format!("{root}/src/a.rs"))]),
+                dir(&format!("{root}/docs"), vec![file(&format!("{root}/docs/b.md"))]),
+            ],
+        )
+    }
+
+    #[test]
+    fn filter_assets_keeps_folders_hides_matching_files() {
+        let r = ruleset(&["*.md"]);
+        let out = filter_assets(&fixture("/p1"), "/p1", &r);
+        // 目录行恒显 (含各层), 匹配文件隐藏, 非匹配文件显示
+        assert_eq!(out.children.len(), 2, "目录行不参与求值");
+        let docs = &out.children[1];
+        assert!(docs.children.is_empty(), "b.md 被过滤");
+        let src = &out.children[0];
+        assert_eq!(src.children.len(), 1, "a.rs 不匹配 *.md → 在");
+    }
+
+    #[test]
+    fn filter_assets_deny_all_with_reinclude_and_last_match() {
+        let r = ruleset(&["*", "!*.rs", "*_test.rs"]);
+        let out = filter_assets(&fixture("/p1"), "/p1", &r);
+        let src = &out.children[0];
+        assert_eq!(src.children.len(), 1, "*.rs 重包含, 但 *_test.rs 后写胜出");
+        assert_eq!(src.children[0].label, "a.rs");
+        assert!(out.children[1].children.is_empty(), "deny-all 段非 .rs 全隐");
+    }
+
+    #[test]
+    fn filter_assets_evaluates_each_project_root_separately() {
+        // 同一条相对规则分别对两个 Project 根求值 (spec: patterns
+        // evaluated per project root — 两侧各自的 src 命中)
+        let r = ruleset(&["src/**"]);
+        for root in ["/p1", "/p2"] {
+            let out = filter_assets(&fixture(root), root, &r);
+            let src = out.children.iter().find(|n| n.label == "src").unwrap();
+            assert!(
+                src.children.is_empty(),
+                "{root}: src 子树相对自身根命中规则 → 隐藏"
+            );
+            let docs = out.children.iter().find(|n| n.label == "docs").unwrap();
+            assert_eq!(docs.children.len(), 1, "{root}: 非 src 文件不受影响");
+        }
+    }
+
+    #[test]
+    fn filter_assets_empty_rules_show_everything() {
+        let r = ruleset(&[]);
+        let out = filter_assets(&fixture("/p1"), "/p1", &r);
+        assert_eq!(out.children[0].children.len(), 1);
+        assert_eq!(out.children[1].children.len(), 1);
     }
 }

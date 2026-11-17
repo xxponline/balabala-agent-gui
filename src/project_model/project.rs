@@ -8,14 +8,18 @@ use std::path::PathBuf;
 pub struct Module {
     /// 模块名 (root module 与 Project 同名, spec)。
     pub name: String,
+    /// 模块根目录 — 界定资产枚举范围
+    /// (spec: Module root mirrors the project root)。
+    pub root: PathBuf,
     /// 子模块 (树形; DAG 校验针对引用边, 见 `validate::check_dag`)。
     pub children: Vec<Module>,
 }
 
 impl Module {
-    pub fn new(name: impl Into<String>) -> Self {
+    pub fn new(name: impl Into<String>, root: PathBuf) -> Self {
         Self {
             name: name.into(),
+            root,
             children: Vec::new(),
         }
     }
@@ -48,7 +52,7 @@ impl Project {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "/".to_string());
         Self {
-            modules: vec![Module::new(name.clone())],
+            modules: vec![Module::new(name.clone(), root.clone())],
             name,
             root,
             next_agent_idx: 1,
@@ -74,6 +78,13 @@ mod tests {
         assert_eq!(p.name, "foo");
         assert_eq!(p.modules.len(), 1);
         assert_eq!(p.modules[0].name, p.name);
+    }
+
+    /// spec: Module root mirrors the project root.
+    #[test]
+    fn root_module_mirrors_project_root() {
+        let p = Project::from_root("/a/bar".into());
+        assert_eq!(p.modules[0].root, PathBuf::from("/a/bar"));
     }
 
     #[test]

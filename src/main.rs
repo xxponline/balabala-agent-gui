@@ -7,6 +7,7 @@
 
 mod agent_entities;
 mod app;
+mod asset_manager;
 mod pane;
 mod project_model;
 mod property_detail_manager;
@@ -15,7 +16,6 @@ mod sidebar;
 mod tree;
 mod ui;
 mod workspace;
-mod workspace_property_source;
 
 use app::TerminalApp;
 use gpui_kit::AppContext;

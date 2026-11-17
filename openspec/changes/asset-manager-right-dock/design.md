@@ -95,6 +95,10 @@ children}` 身份语义不变：id 仍是绝对路径字符串——center-tab d
 
 **Why**: "source" 是被拆除的概念，留旧名等于让后来者找不到概念的主人；
 `id` 身份体系不变是**关键稳定面**——dedup/菜单/open 的载荷零迁移。
+**补充 (实施中钉死)**: Project 行 id = `project://<root>` 命名空间前缀 —
+  v1 Project 根与 root Module 根同目录, 裸路径会撞行 id; Project 行无
+  菜单/打开语义 (kind=Project 不是 file/directory row), 路径语义仍全由
+  Module/文件行的裸绝对路径承载。
 **Alternative rejected**: DTO 独立成第三个模块（`asset_dto`）——两个
 消费者而已，按"数据随拥有者走"归 manager，少一次跳转。
 

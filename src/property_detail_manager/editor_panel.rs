@@ -19,7 +19,7 @@ use gpui_kit::{
 
 use crate::app::TerminalApp;
 use crate::property_detail_manager::{OpenHandler, OpenObject};
-use crate::workspace_property_source::SourceNodeKind;
+use crate::asset_manager::AssetKind;
 use gpui_kit::component::dock::BasePanel;
 use gpui_kit::component::dock::Panel as ComponentPanel;
 
@@ -69,7 +69,7 @@ impl EditorPanel {
 
 /// v1: 仅 `rs` 认领（proposal 定案; 放宽 = predicate 一行改）。
 fn claims_rust(obj: &OpenObject) -> bool {
-    obj.kind == SourceNodeKind::File
+    obj.kind == AssetKind::File
         && obj.path.extension().is_some_and(|ext| ext == "rs")
 }
 

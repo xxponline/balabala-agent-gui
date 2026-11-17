@@ -3,7 +3,7 @@
 //! 统一后端接口：任意槽（当前=右槽文件树）把**中立封装对象**
 //! [`OpenObject`] 交给 [`TerminalApp::open_object`]，由静态 handler
 //! 注册表 [`HANDLERS`] 按序认领，未命中 no-op；命中则查 dedup 表
-//! （key = 绝对路径字符串，与 `SourceNode.id` 同一身份体系）：
+//! （key = 绝对路径字符串，与 `AssetNode.id` 同一身份体系）：
 //! 已有 → 聚焦既有签，没有 → `add_panel_view(Center)` 尾插新签。
 //!
 //! console 恒为第一签：尾插天然保位 + `TerminalPanel::closable()=false`
@@ -19,18 +19,18 @@ use gpui_kit::component::dock::DockPlacement;
 use gpui_kit::{Context, Window};
 
 use crate::app::TerminalApp;
-use crate::workspace_property_source::SourceNodeKind;
+use crate::asset_manager::AssetKind;
 use editor_panel::RustViewerHandler;
 use md_panel::MarkdownViewerHandler;
 
 /// 待打开对象的中立封装——不含 gpui 类型，可跨插件边界
-/// （design D2; `kind` 由数据源查权威树给出）。
+/// （design D2; `kind` 由 asset_manager 查视图给出）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenObject {
     /// 对象的绝对路径（去重 key = 其字符串形式）。
     pub path: std::path::PathBuf,
     /// 对象种类（Dir 在认领阶段被天然拒绝）。
-    pub kind: SourceNodeKind,
+    pub kind: AssetKind,
 }
 
 /// 打开处理器契约（dyn-safe, design D1）。
@@ -721,7 +721,7 @@ mod tests {
             &app,
             OpenObject {
                 path: PathBuf::from(&path),
-                kind: SourceNodeKind::File,
+                kind: AssetKind::File,
             },
         );
         let _ = render(handle, cx);
@@ -869,7 +869,7 @@ mod tests {
             &app,
             OpenObject {
                 path: PathBuf::from(&unclaimed),
-                kind: SourceNodeKind::File,
+                kind: AssetKind::File,
             },
         );
         open_object_in(
@@ -878,7 +878,7 @@ mod tests {
             &app,
             OpenObject {
                 path: PathBuf::from("/pdm-definitely-missing-dir"),
-                kind: SourceNodeKind::Dir,
+                kind: AssetKind::Dir,
             },
         );
         cx.run_until_parked();
@@ -895,7 +895,7 @@ mod tests {
         let path = write_temp_file("dedup", "rs", "fn dedup_probe() {}");
         let obj = || OpenObject {
             path: PathBuf::from(&path),
-            kind: SourceNodeKind::File,
+            kind: AssetKind::File,
         };
 
         open_object_in(cx, handle, &app, obj());
@@ -933,7 +933,7 @@ mod tests {
         let path = write_temp_file("reopen", "rs", "fn reopen_probe() {}");
         let obj = || OpenObject {
             path: PathBuf::from(&path),
-            kind: SourceNodeKind::File,
+            kind: AssetKind::File,
         };
 
         open_object_in(cx, handle, &app, obj());
@@ -966,7 +966,7 @@ mod tests {
             &app,
             OpenObject {
                 path: PathBuf::from(&path),
-                kind: SourceNodeKind::File,
+                kind: AssetKind::File,
             },
         );
 
@@ -1002,7 +1002,7 @@ mod tests {
             &app,
             OpenObject {
                 path: PathBuf::from(&path),
-                kind: SourceNodeKind::File,
+                kind: AssetKind::File,
             },
         );
 
@@ -1059,7 +1059,7 @@ mod tests {
             &app,
             OpenObject {
                 path: PathBuf::from(&rs),
-                kind: SourceNodeKind::File,
+                kind: AssetKind::File,
             },
         );
         assert_eq!(center_tabs(cx, &app).0.len(), 2, ".rs → 开 viewer 签");
@@ -1078,7 +1078,7 @@ mod tests {
             &app,
             OpenObject {
                 path: PathBuf::from(&unclaimed),
-                kind: SourceNodeKind::File,
+                kind: AssetKind::File,
             },
         );
         open_object_in(
@@ -1087,7 +1087,7 @@ mod tests {
             &app,
             OpenObject {
                 path: PathBuf::from("/pdm-claim-dir"),
-                kind: SourceNodeKind::Dir,
+                kind: AssetKind::Dir,
             },
         );
         assert_eq!(
@@ -1135,7 +1135,7 @@ mod tests {
             app,
             OpenObject {
                 path: PathBuf::from(path),
-                kind: SourceNodeKind::File,
+                kind: AssetKind::File,
             },
         );
     }
@@ -1279,7 +1279,7 @@ mod tests {
             &app,
             OpenObject {
                 path: PathBuf::from(&rs),
-                kind: SourceNodeKind::File,
+                kind: AssetKind::File,
             },
         );
         let _ = render(handle, cx);
@@ -1363,7 +1363,7 @@ mod tests {
             &app,
             OpenObject {
                 path: PathBuf::from(&path),
-                kind: SourceNodeKind::File,
+                kind: AssetKind::File,
             },
         );
         let (tabs, active) = center_tabs(cx, &app);
@@ -1419,7 +1419,7 @@ mod tests {
             &app,
             OpenObject {
                 path: PathBuf::from(&path),
-                kind: SourceNodeKind::File,
+                kind: AssetKind::File,
             },
         );
         let viewer = viewer_entity(cx, &app, &path);
@@ -1485,7 +1485,7 @@ mod tests {
             &app,
             OpenObject {
                 path: PathBuf::from(&path),
-                kind: SourceNodeKind::File,
+                kind: AssetKind::File,
             },
         );
         let viewer = viewer_entity(cx, &app, &path);

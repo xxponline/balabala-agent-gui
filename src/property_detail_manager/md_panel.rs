@@ -24,7 +24,7 @@ use gpui_kit::{
 
 use crate::app::TerminalApp;
 use crate::property_detail_manager::{OpenHandler, OpenObject};
-use crate::workspace_property_source::SourceNodeKind;
+use crate::asset_manager::AssetKind;
 
 /// 查看模式（design D1; 默认 Rendered — proposal 定案, 不记忆）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -99,7 +99,7 @@ impl MdPanel {
 
 /// md 认领（proposal: default-open 认领表扩展 `md`）。
 fn claims_markdown(obj: &OpenObject) -> bool {
-    obj.kind == SourceNodeKind::File
+    obj.kind == AssetKind::File
         && obj.path.extension().is_some_and(|ext| ext == "md")
 }
 
