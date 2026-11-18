@@ -6,8 +6,10 @@
 //! - Project 的枚举器 = 自身 → 异步枚举出所有 Module (其子节点)。
 //! - Module 的枚举器 = 标准文件枚举器 (从 `module.root` 递归扫文件)。
 //!
-//! 扫描体 (排除表 / 符号链接不跟随 / 排序) 自旧 `filetree` 平移,
-//! 语义逐字。
+//! 过滤(design D2/D5):链上携带可克隆的 [`FilterSpec`] 配方,
+//! [`FileEnumerator`] 构造时 `build()` 出 filter 列表并存为字段,
+//! `scan_dir` 逐条目无序 OR 求值 — 任一命中即排除, 目录命中即减支。
+//! 扫描体 (符号链接不跟随 / 排序) 自旧 `filetree` 平移, 语义逐字。
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -18,13 +20,17 @@ use gpui_kit::BackgroundExecutor;
 use crate::project_model::{Module, Project};
 
 use super::dto::{AssetKind, AssetNode, project_id};
+use super::filter::{FileFilter, FilterSpec};
 
 /// 异步枚举结果的盒装 future (BoxFuture 别名; 零新依赖)。
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// 可枚举资产的实体 (Project / Module)。
+///
+/// `spec` 是可克隆的过滤配方 (design D2 修订):存储后逐层
+/// `clone()` 转发, 由 [`FileEnumerator`] 构建并保存 filter 列表。
 pub trait AssetEnumeratable {
-    fn enumerator(&self) -> Box<dyn AssetEnumerator>;
+    fn enumerator(&self, spec: FilterSpec) -> Box<dyn AssetEnumerator>;
 }
 
 /// 资产枚举器: 异步产出该实体的完整资产子树。
@@ -38,7 +44,8 @@ pub trait AssetEnumerator: Send {
     ) -> BoxFuture<'static, Result<AssetNode, String>>;
 }
 
-/// spec 锚定的默认排除表 (asset-manager: Default exclusions)。
+/// spec 锚定的默认排除表 (asset-manager: Default exclusions);
+/// 由 [`super::filter::DefaultExcludesFilter`] 消费 (design D5)。
 pub const EXCLUDES: &[&str] = &[
     ".git",
     "node_modules",
@@ -48,19 +55,38 @@ pub const EXCLUDES: &[&str] = &[
     ".DS_Store",
 ];
 
-/// 标准文件资产枚举器 (单独实现): 从根目录全量递归枚举。
+/// 标准文件资产枚举器 (单独实现): 构造时从 [`FilterSpec`] 构建
+/// filter 列表并**保存为字段** (design D2), 从根目录递归枚举、
+/// 逐条目过滤减支。
 ///
 /// - 根不可读 → `Err` (manager 落降级态);
 /// - 子目录不可读 → 跳过其内容 (best-effort, 目录仍显示);
 /// - `file_type()` 不跟随符号链接: 链接按文件显示, 天然规避递归环;
+/// - 过滤: `filters` 无序 OR, 任一命中即排除; 目录命中即不 `read_dir`;
 /// - 排序: 目录在前、文件在后, 各自按标签 (大小写不敏感) 字典序。
 pub struct FileEnumerator {
     pub root: PathBuf,
+    filters: Vec<Box<dyn FileFilter>>,
 }
 
 impl FileEnumerator {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+    /// 从配方构建并保存 filter 列表 (design D2: 默认排除第一员 +
+    /// 用户规则, `FilterSpec::build`)。
+    pub fn new(root: impl Into<PathBuf>, spec: &FilterSpec) -> Self {
+        Self {
+            root: root.into(),
+            filters: spec.build(),
+        }
+    }
+
+    /// 直接注入建好的 filter (测试/自定义组合, design D2)。
+    /// (bin crate 无外部使用者, 仅测试消费 — 放行未用。)
+    #[allow(dead_code)]
+    pub fn with_filters(root: impl Into<PathBuf>, filters: Vec<Box<dyn FileFilter>>) -> Self {
+        Self {
+            root: root.into(),
+            filters,
+        }
     }
 }
 
@@ -70,16 +96,20 @@ impl AssetEnumerator for FileEnumerator {
         bg: BackgroundExecutor,
     ) -> BoxFuture<'static, Result<AssetNode, String>> {
         let root = self.root;
-        Box::pin(async move { bg.spawn(async move { scan_root(&root) }).await })
+        let filters = self.filters;
+        Box::pin(async move { bg.spawn(async move { scan_root(&root, &filters) }).await })
     }
 }
 
-/// 全量递归扫描 (后台执行; 模块根 → `Dir` 根节点)。
-pub fn scan_root(root: &Path) -> Result<AssetNode, String> {
+/// 递归扫描 (后台执行; 模块根 → `Dir` 根节点), 按 `filters` 过滤减支。
+pub fn scan_root(
+    root: &Path,
+    filters: &[Box<dyn FileFilter>],
+) -> Result<AssetNode, String> {
     if !root.is_dir() {
         return Err(format!("{} 不是可读目录", root.display()));
     }
-    let children = scan_dir(root)?;
+    let children = scan_dir(root, "", filters)?;
     Ok(AssetNode {
         id: root.to_string_lossy().to_string(),
         label: root
@@ -91,21 +121,33 @@ pub fn scan_root(root: &Path) -> Result<AssetNode, String> {
     })
 }
 
-fn scan_dir(dir: &Path) -> Result<Vec<AssetNode>, String> {
+fn scan_dir(
+    dir: &Path,
+    rel_prefix: &str,
+    filters: &[Box<dyn FileFilter>],
+) -> Result<Vec<AssetNode>, String> {
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
     let mut nodes = Vec::new();
     for entry in entries.flatten() {
         let label = entry.file_name().to_string_lossy().to_string();
-        if EXCLUDES.contains(&label.as_str()) {
+        // rel = 枚举根相对路径, '/' 连接 (design D7 逐层前缀)
+        let rel = if rel_prefix.is_empty() {
+            label.clone()
+        } else {
+            format!("{rel_prefix}/{label}")
+        };
+        // file_type = lstat: 符号链接不视为目录 (不递归, 防环)
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        // 无序 OR: 任一 filter 命中即排除 (EXCLUDES 已折叠为 filter,
+        // 无特权分支 — design D5); 目录命中即减支, 不 read_dir。
+        if filters.iter().any(|f| f.is_ignored(&rel, is_dir)) {
             continue;
         }
         let path = entry.path();
-        // file_type = lstat: 符号链接不视为目录 (不递归, 防环)
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         let id = path.to_string_lossy().to_string();
         if is_dir {
-            let children = scan_dir(&path).unwrap_or_default(); // 子目录不可读 → 空目录仍显示
+            let children = scan_dir(&path, &rel, filters).unwrap_or_default(); // 子目录不可读 → 空目录仍显示
             nodes.push(AssetNode {
                 id,
                 label,
@@ -139,6 +181,7 @@ fn scan_dir(dir: &Path) -> Result<Vec<AssetNode>, String> {
 /// id 保持裸绝对路径, 目录行的菜单/复制语义直接成立 (design D3)。
 struct ModuleEnumerator {
     module: Module,
+    spec: FilterSpec,
 }
 
 /// Module 行组装 (纯函数): 扫描产物换壳为模块行。
@@ -158,8 +201,10 @@ impl AssetEnumerator for ModuleEnumerator {
         bg: BackgroundExecutor,
     ) -> BoxFuture<'static, Result<AssetNode, String>> {
         let module = self.module;
+        let spec = self.spec;
         Box::pin(async move {
-            let scanned = Box::new(FileEnumerator::new(module.root.clone()))
+            // FileEnumerator 构造时构建并保存 filter 列表 (design D2)
+            let scanned = Box::new(FileEnumerator::new(module.root.clone(), &spec))
                 .enumerate(bg)
                 .await?;
             Ok(module_row(&module, scanned))
@@ -168,9 +213,10 @@ impl AssetEnumerator for ModuleEnumerator {
 }
 
 impl AssetEnumeratable for Module {
-    fn enumerator(&self) -> Box<dyn AssetEnumerator> {
+    fn enumerator(&self, spec: FilterSpec) -> Box<dyn AssetEnumerator> {
         Box::new(ModuleEnumerator {
             module: self.clone(),
+            spec,
         })
     }
 }
@@ -182,6 +228,7 @@ impl AssetEnumeratable for Module {
 /// "父排除子" 的重叠策略等有真实多模块 solution 时再接 (design Risks)。
 struct ProjectEnumerator {
     project: Project,
+    spec: FilterSpec,
 }
 
 /// Project 行组装 (纯函数): 子节点 = 各 Module 行。
@@ -200,10 +247,14 @@ impl AssetEnumerator for ProjectEnumerator {
         bg: BackgroundExecutor,
     ) -> BoxFuture<'static, Result<AssetNode, String>> {
         let project = self.project;
+        let spec = self.spec;
         Box::pin(async move {
             let mut modules = Vec::with_capacity(project.modules.len());
             for module in &project.modules {
-                let node = module.enumerator().enumerate(bg.clone()).await?;
+                let node = module
+                    .enumerator(spec.clone())
+                    .enumerate(bg.clone())
+                    .await?;
                 modules.push(node);
             }
             Ok(project_row(&project, modules))
@@ -212,9 +263,10 @@ impl AssetEnumerator for ProjectEnumerator {
 }
 
 impl AssetEnumeratable for Project {
-    fn enumerator(&self) -> Box<dyn AssetEnumerator> {
+    fn enumerator(&self, spec: FilterSpec) -> Box<dyn AssetEnumerator> {
         Box::new(ProjectEnumerator {
             project: self.clone(),
+            spec,
         })
     }
 }
@@ -249,6 +301,32 @@ mod tests {
         nodes.iter().find(|n| n.label == label)
     }
 
+    /// 默认 filter 列表 (FilterSpec::build: DefaultExcludes + 空规则
+    /// GitIgnore) — 沿用原硬编码排除表行为。
+    fn default_filters() -> Vec<Box<dyn FileFilter>> {
+        FilterSpec::default().build()
+    }
+
+    /// design D2: FileEnumerator 构造时从配方构建并保存 filter 列表;
+    /// `with_filters` 直接注入 (测试/自定义组合)。
+    #[test]
+    fn file_enumerator_builds_and_stores_filters_from_spec() {
+        let spec = FilterSpec::new(vec!["*.log".to_string()]);
+        let e = FileEnumerator::new("/tmp", &spec);
+        assert_eq!(e.filters.len(), 2, "默认排除 + 用户规则各一");
+        assert!(
+            e.filters.iter().any(|f| f.is_ignored("a.log", false)),
+            "spec 规则已生效"
+        );
+        assert!(
+            e.filters.iter().any(|f| f.is_ignored("node_modules", true)),
+            "默认排除在列"
+        );
+
+        let e2 = FileEnumerator::with_filters("/tmp", vec![Box::new(DefaultExcludesFilter)]);
+        assert_eq!(e2.filters.len(), 1, "直接注入的列表原样保存");
+    }
+
     /// 平移自 filetree: 排除表 / dotfile / kind / 排序。
     #[test]
     fn file_enumerator_excludes_and_kinds() {
@@ -263,7 +341,7 @@ mod tests {
         }
         touch(&root.join("src/deep/node_modules/dep/index.js"));
 
-        let tree = scan_root(&root).expect("root 可读");
+        let tree = scan_root(&root, &default_filters()).expect("root 可读");
         assert_eq!(tree.kind, AssetKind::Dir);
 
         let top = labels(&tree.children);
@@ -304,10 +382,10 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&missing);
-        assert!(scan_root(&missing).is_err(), "根不存在 → Err");
+        assert!(scan_root(&missing, &default_filters()).is_err(), "根不存在 → Err");
         let file = temp_root("not-a-dir").join("plain.txt");
         touch(&file);
-        assert!(scan_root(&file).is_err(), "非目录 → Err");
+        assert!(scan_root(&file, &default_filters()).is_err(), "非目录 → Err");
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
@@ -318,7 +396,7 @@ mod tests {
         touch(&root.join("lib.rs"));
         let module = crate::project_model::Module::new("wrap", root.clone());
 
-        let scanned = scan_root(&root).expect("可读");
+        let scanned = scan_root(&root, &default_filters()).expect("可读");
         let node = module_row(&module, scanned);
         assert_eq!(node.id, root.to_string_lossy(), "id = 模块根裸路径");
         assert_eq!(node.label, "wrap");
@@ -335,7 +413,7 @@ mod tests {
         touch(&root.join("main.rs"));
         let project = Project::from_root(root.clone());
 
-        let scanned = scan_root(&root).expect("可读");
+        let scanned = scan_root(&root, &default_filters()).expect("可读");
         let module_node = module_row(&project.modules[0], scanned);
         let node = project_row(&project, vec![module_node]);
         assert_eq!(node.id, project_id(&root));
@@ -344,6 +422,240 @@ mod tests {
         assert_eq!(node.kind, AssetKind::Project);
         assert_eq!(node.label, project.name, "label = 项目名 (目录末段)");
         assert_eq!(node.children[0].kind, AssetKind::Module);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ===== 减支 / 多 filter OR (spec: Enumeration prunes excluded directories) =====
+
+    use super::super::filter::{DefaultExcludesFilter, GitIgnoreStyleFilter};
+    use std::sync::{Arc, Mutex};
+
+    fn owned(rules: &[&str]) -> Vec<String> {
+        rules.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 默认排除 + 用户规则 (FilterSpec::build 的手写等价)。
+    fn ignore_filters(rules: &[&str]) -> Vec<Box<dyn FileFilter>> {
+        vec![
+            Box::new(DefaultExcludesFilter),
+            Box::new(GitIgnoreStyleFilter::compile(&owned(rules))),
+        ]
+    }
+
+    /// 减支证明的 spy: 记录每次求值, 并把 `build` 目录剪掉。
+    struct SpyPruner {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FileFilter for SpyPruner {
+        fn is_ignored(&self, rel_path: &str, is_dir: bool) -> bool {
+            self.seen.lock().unwrap().push(rel_path.to_string());
+            rel_path == "build" && is_dir
+        }
+    }
+
+    /// 递归断言: 树中无任何节点的 id/path 含 `needle`。
+    fn assert_no_row(node: &AssetNode, needle: &str) {
+        assert!(
+            !node.id.contains(needle) && !node.label.contains(needle),
+            "泄漏行: {}",
+            node.id
+        );
+        for child in &node.children {
+            assert_no_row(child, needle);
+        }
+    }
+
+    /// spec: Excluded subtree is never enumerated — 被排除目录连同子树
+    /// 无任何行 (含多个深度), 且 spy 对剪枝子树零求值 (证明不 read_dir)。
+    #[test]
+    fn pruning_skips_subtree_and_filter_never_asked_beneath() {
+        let root = temp_root("prune-spy");
+        touch(&root.join("build/top.js"));
+        touch(&root.join("build/deep/inner.js"));
+        touch(&root.join("build/deep/er/innermost.js"));
+        touch(&root.join("keep/main.rs"));
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let filters: Vec<Box<dyn FileFilter>> = vec![
+            Box::new(SpyPruner {
+                seen: seen.clone(),
+            }),
+            Box::new(DefaultExcludesFilter),
+        ];
+        let tree = scan_root(&root, &filters).expect("可读");
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            !seen.iter().any(|p| p.starts_with("build/")),
+            "被剪枝子树零求值 (不 read_dir): {seen:?}"
+        );
+        assert!(seen.iter().any(|p| p == "build"), "目录自身被问到一次");
+        assert!(
+            seen.iter().any(|p| p.starts_with("keep")),
+            "未剪枝分支正常求值"
+        );
+        drop(seen);
+        assert_no_row(&tree, "build");
+        assert!(find(&tree.children, "keep").is_some(), "未剪枝目录在场");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// OR 组合: 两个 filter 任一命中即排除, 与注入顺序无关。
+    #[test]
+    fn any_of_two_filters_excludes_entry_regardless_of_order() {
+        let root = temp_root("or-two");
+        touch(&root.join("a.txt"));
+        touch(&root.join("b.txt"));
+        touch(&root.join("c.txt"));
+
+        for order in 0..2 {
+            let f1 = GitIgnoreStyleFilter::compile(&owned(&["a.txt"]));
+            let f2 = GitIgnoreStyleFilter::compile(&owned(&["b.txt"]));
+            let mut filters: Vec<Box<dyn FileFilter>> = if order == 0 {
+                vec![Box::new(f1), Box::new(f2)]
+            } else {
+                vec![Box::new(f2), Box::new(f1)]
+            };
+            filters.push(Box::new(DefaultExcludesFilter));
+            let tree = scan_root(&root, &filters).expect("可读");
+            assert_eq!(
+                labels(&tree.children),
+                vec!["c.txt"],
+                "顺序 {order}: a/b 各自被不同的 filter 命中, 仅 c 在场"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// design D5: 用户规则的 `!node_modules` 救不回默认排除 (OR 无跨
+    /// filter 反悔)。
+    #[test]
+    fn user_negation_cannot_rescue_default_excludes() {
+        let root = temp_root("no-rescue");
+        touch(&root.join("node_modules/dep/index.js"));
+        touch(&root.join("src/main.rs"));
+
+        let filters = ignore_filters(&["!node_modules"]);
+        let tree = scan_root(&root, &filters).expect("可读");
+        assert!(
+            find(&tree.children, "node_modules").is_none(),
+            "DefaultExcludes 的排除不可被另一 filter 的 `!` 反悔"
+        );
+        assert!(find(&tree.children, "src").is_some(), "其余照常");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// spec: Re-include beneath an excluded directory has no effect
+    /// (spike 事实 3 — build 连同 keep.txt 整支缺席)。
+    #[test]
+    fn gotcha_reinclude_beneath_excluded_dir_absent() {
+        let root = temp_root("gotcha");
+        touch(&root.join("build/keep.txt"));
+        touch(&root.join("build/other/x.js"));
+        touch(&root.join("src/main.rs"));
+
+        let filters = ignore_filters(&["build/", "!build/keep.txt"]);
+        let tree = scan_root(&root, &filters).expect("可读");
+        assert_no_row(&tree, "build");
+        assert!(find(&tree.children, "src").is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// spec: Re-including a directory re-includes its subtree。
+    #[test]
+    fn reinclude_directory_restores_subtree() {
+        let root = temp_root("reinclude");
+        touch(&root.join("src/a.rs"));
+        touch(&root.join("src/deep/b.rs"));
+        touch(&root.join("docs/d.md"));
+        touch(&root.join("main.rs"));
+
+        let filters = ignore_filters(&["*", "!src/", "!src/**"]);
+        let tree = scan_root(&root, &filters).expect("可读");
+        assert_eq!(labels(&tree.children), vec!["src"], "仅 src 生还");
+        let src = find(&tree.children, "src").expect("src 在场");
+        assert!(find(&src.children, "a.rs").is_some(), "子文件在场");
+        let deep = find(&src.children, "deep").expect("孙目录在场");
+        assert!(find(&deep.children, "b.rs").is_some(), "孙文件在场");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// spec: Unexcluded directory with all children filtered stays visible
+    /// (design D6 空目录行保留)。
+    #[test]
+    fn unexcluded_dir_with_all_children_filtered_stays() {
+        let root = temp_root("empty-dir");
+        touch(&root.join("logs/a.log"));
+        touch(&root.join("other/x.rs"));
+
+        let filters = ignore_filters(&["*.log"]);
+        let tree = scan_root(&root, &filters).expect("可读");
+        let logs = find(&tree.children, "logs").expect("logs 目录行保留");
+        assert!(logs.children.is_empty(), "子文件全被过滤 → 空行仍显示");
+        assert!(find(&tree.children, "other").is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// design D3: lstat 即 dtype — 符号链接按文件求值, `build/`
+    /// (MUSTBEDIR) 不命中链接行。
+    #[cfg(unix)]
+    #[test]
+    fn symlink_is_file_for_dir_only_rules() {
+        use std::os::unix::fs::symlink;
+        let root = temp_root("symlink");
+        touch(&root.join("build/real.txt"));
+        symlink(&root.join("build"), &root.join("link")).expect("symlink");
+
+        let filters = ignore_filters(&["build/"]);
+        let tree = scan_root(&root, &filters).expect("可读");
+        assert!(find(&tree.children, "build").is_none(), "目录 build 剪枝");
+        let link = find(&tree.children, "link").expect("链接行在场");
+        assert_eq!(
+            link.kind,
+            AssetKind::File,
+            "链接 = 文件 (lstat) → 目录专属规则不命中, 不递归"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// spec: Patterns are evaluated per project root — 同一批规则分别
+    /// 对两个扫描根求值, 各自相对自己的根命中 (扫描期覆盖, 接替
+    /// 已删除的后处理测试)。
+    #[test]
+    fn rules_evaluate_relative_to_each_scan_root() {
+        for name in ["root-a", "root-b"] {
+            let root = temp_root(name);
+            touch(&root.join("src/x.rs"));
+            touch(&root.join("docs/y.md"));
+
+            let tree = scan_root(&root, &ignore_filters(&["src/**"])).expect("可读");
+            let src = find(&tree.children, "src").expect("src 目录在 (src/** 不命中自身)");
+            assert!(
+                src.children.is_empty(),
+                "{name}: src 子文件相对自身根命中 → 隐藏"
+            );
+            let docs = find(&tree.children, "docs").expect("docs 在");
+            assert_eq!(docs.children.len(), 1, "{name}: 非 src 文件不受影响");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// spec: Deny-all with re-include — 仅根层 .rs 可见, 一切目录被
+    /// 排除连同子树 (嵌套 .rs 不可达 = gotcha), 扫描期覆盖。
+    #[test]
+    fn deny_all_shows_only_root_level_rs() {
+        let root = temp_root("deny-all");
+        touch(&root.join("main.rs"));
+        touch(&root.join("src/lib.rs"));
+        touch(&root.join("docs/readme.md"));
+
+        let tree = scan_root(&root, &ignore_filters(&["*", "!*.rs"])).expect("可读");
+        assert_eq!(
+            labels(&tree.children),
+            vec!["main.rs"],
+            "根层 .rs 生还; 目录全部剪枝, 嵌套 .rs 不可达"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

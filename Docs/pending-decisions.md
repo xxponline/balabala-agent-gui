@@ -255,9 +255,17 @@ surrounding-text deletion) SHALL NOT be delivered"), 立项须开 spec delta。
 **当前选择 (已由 spec 固化)**: 过滤规则纯配置驱动 — file-tree spec
 Requirement "File-row filtering with gitignore-style rules": 规则来自
 `.workspaces.json` 的 `file_tree` 区段 (按 workspace 绝对路径键控, 模式行
-数组), gitignore 语义 (`* ? **` 通配、`!` 重包含、最后匹配胜出), 只作用于
-文件行 (目录行恒可见); dock-layout spec 规定右 dock 头部只有**只读**的
-过滤规则摘要。v1 右 dock **无任何可聚焦文本输入**, ⟳ 刷新时重读生效。
+数组), gitignore 语义 (`* ? **` 通配、`!` 重包含、最后匹配胜出), **文件行与
+目录行同等求值** (asset-manager change `file-filter-prune` 起): 被排除目录
+连同子树不进视图, 枚举时即减支 (不读其内容); gitignore 同款 gotcha 一并
+生效 — 被排除目录内部的 `!` 救不回, `!` 命中目录自身才救回整个子树
+(如 `["*", "!src/", "!src/**"]`); 目录自身未被排除、仅子文件全被过滤时,
+空目录行仍显示; 默认排除表 (.git/node_modules/target/build/dist/.DS_Store)
+是独立 filter, 用户规则的 `!node_modules` 救不回; dock-layout spec 规定右
+dock 头部只有**只读**的过滤规则摘要。v1 右 dock **无任何可聚焦文本输入**,
+⟳ 刷新时重读生效。语义出处: change `file-filter-prune` 的 asset-manager
+delta (Requirement "File-row filtering relative to project roots" /
+"Enumeration prunes excluded directories")。
 
 **为什么这样选**: `agent-shell` 两条键盘契约是绝对条款 ("仅 macOS 应用失焦
 才不转发键盘/IME"), dock 内一旦有输入控件, 打字即违反 spec。配置文件绕开了

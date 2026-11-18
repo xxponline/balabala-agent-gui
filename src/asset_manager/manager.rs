@@ -191,27 +191,19 @@ impl AssetManager {
                 async move {
                     // 规则读取: 容错 = 空 (启动期坏文件契约在打开路径拦截)
                     let rules = project_model::load_file_tree_rules(&ws_dir);
-                    let mut raw = Vec::with_capacity(projects.len());
+                    // 配方随链携带 (design D2): 每次运行重建 → 刷新重读;
+                    // FileEnumerator 构造时 build 并保存 filter 列表。
+                    let spec = crate::asset_manager::filter::FilterSpec::new(rules.clone());
+                    let mut nodes = Vec::with_capacity(projects.len());
                     for project in &projects {
-                        let node = project.enumerator().enumerate(bg.clone()).await?;
-                        raw.push(node);
+                        let node = project
+                            .enumerator(spec.clone())
+                            .enumerate(bg.clone())
+                            .await?;
+                        nodes.push(node);
                     }
-                    // 过滤挂入 land (task 3.1): 逐 Project strip 自己的 root
-                    // 后跑 Ruleset — 目录类行恒显, 文件按相对路径求值
-                    // (spec: File-row filtering relative to project roots)。
-                    let ruleset = crate::asset_manager::filter::Ruleset::compile(&rules);
-                    let nodes = raw
-                        .into_iter()
-                        .zip(projects.iter())
-                        .map(|(node, project)| {
-                            let root = project.root.to_string_lossy();
-                            crate::asset_manager::filter::filter_assets(
-                                &node,
-                                &root,
-                                &ruleset,
-                            )
-                        })
-                        .collect();
+                    // 单一求值权威在扫描期 (design D1): 枚举产物即视图,
+                    // land 前不再有后处理 pass (filter_assets 已删除)。
                     Ok::<(Vec<String>, Vec<super::dto::AssetNode>), String>((rules, nodes))
                 }
             })
@@ -481,6 +473,51 @@ mod tests {
                     "目录恒显但其下 *.log 已过滤"
                 );
             }
+        });
+    }
+
+    /// spec: Dependency directories absent — 默认排除经 `FilterSpec`
+    /// 注入的 filter 链, 在全链路 (注册 → 枚举 → land) 生效,
+    /// 且任何深度都不出现。
+    #[gpui_kit::test]
+    fn default_excludes_apply_through_full_chain(cx: &mut TestAppContext) {
+        let app = open_app(cx);
+        let manager = manager_of(cx, &app);
+        let ws = temp_dir("excl-ws");
+        let p = ws.join("proj");
+        touch(&p.join("src/main.rs"));
+        touch(&p.join("node_modules/dep/index.js"));
+        touch(&p.join(".git/config"));
+        touch(&p.join("target/debug/bin"));
+        let project = Project::from_root(p.clone());
+
+        manager.update(cx, |m, cx| m.register(ws, vec![project], cx));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let view = manager.read(cx).view();
+            let AssetView::Forest { nodes, .. } = &view else {
+                panic!("应落地 Forest, got {view:?}")
+            };
+            assert_eq!(nodes.len(), 1, "一个 project");
+
+            fn labels_in<'a>(node: &'a AssetNode, out: &mut Vec<&'a str>) {
+                out.push(&node.label);
+                for child in &node.children {
+                    labels_in(child, out);
+                }
+            }
+            let mut labels = Vec::new();
+            for node in nodes {
+                labels_in(node, &mut labels);
+            }
+            for excluded in crate::asset_manager::enumerator::EXCLUDES {
+                assert!(
+                    !labels.contains(excluded),
+                    "排除项 {excluded} 泄漏: {labels:?}"
+                );
+            }
+            assert!(labels.contains(&"src"), "正常目录保留");
+            assert!(labels.contains(&"main.rs"), "正常文件保留");
         });
     }
 

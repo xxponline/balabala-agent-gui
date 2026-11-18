@@ -3,7 +3,8 @@
 ## Purpose
 
 The right dock's data view: browse the active workspace's file and directory
-tree, filter file rows with gitignore-style rules stored in workspace config,
+tree, filter file and directory rows with gitignore-style rules stored in
+workspace config,
 and expose the deferred default-open hook plus file operations through menus
 described by the data source.
 
