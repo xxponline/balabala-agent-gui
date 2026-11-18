@@ -3,10 +3,10 @@
 ## Purpose
 
 The right dock's data view: browse the active workspace's file and directory
-tree, filter file and directory rows with gitignore-style rules stored in
-workspace config,
-and expose the deferred default-open hook plus file operations through menus
-described by the data source.
+tree, filter file and directory rows with gitignore-style rules each
+project provides from its root `.gitignore`, and expose the deferred
+default-open hook plus file operations through menus described by the
+data source.
 
 ## Requirements
 
@@ -73,8 +73,9 @@ back to the asset manager for execution.
 The panel's refresh control SHALL request asset re-enumeration from the
 asset manager on click; first registration and a changed registered project
 set likewise trigger re-enumeration. A refresh SHALL run in the background
-without blocking interaction, SHALL re-read the workspace's filter rules,
-and SHALL preserve the expansion state of previously expanded directories.
+without blocking interaction, SHALL re-read each project's filter rules
+(the project root's `.gitignore` and git state), and SHALL preserve the
+expansion state of previously expanded directories.
 
 #### Scenario: Refresh picks up new files
 
@@ -83,9 +84,9 @@ and SHALL preserve the expansion state of previously expanded directories.
 
 #### Scenario: Refresh re-reads filter rules
 
-- **WHEN** the user edits the `file_tree` rules in the workspace's
-  `.balabala.workspace.json` and clicks refresh
-- **THEN** the tree applies the new rules
+- **WHEN** the user edits the project root's `.gitignore` and clicks
+  refresh
+- **THEN** the tree applies the newly read rules
 
 #### Scenario: Refresh preserves expansion
 

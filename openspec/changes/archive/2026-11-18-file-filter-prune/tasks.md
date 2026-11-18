@@ -76,6 +76,44 @@
       测试中断言。
       验证:测试清单与场景清单一一对应的核对记录。
 
+## 6. Filter 域迁移与供给重划 (bundle)
+
+- [x] 6.1 filter 引擎与 trait 迁至 `src/project_model/filter.rs`
+      (更名 `GitIgnoreFilter`),`DefaultExcludesFilter` 重写为
+      `DotFilter` (只藏 `.` 开头, 文件/目录/任意深度), 删除
+      `EXCLUDES` 常量。验证: 迁移后单测全绿, 含 dot 判定用例
+      (任意深度 dot 目录缺席、非点名放行、六项名单项如
+      `node_modules` 不再命中)。
+- [x] 6.2 供给与注入: `Module` 增 `filters: Vec<Arc<dyn
+      FileFilter>>` (trait 界 +`Sync`, 手写 `Debug`, 摘
+      `PartialEq/Eq` 并全量验证使用点); Project 增 git 判定
+      (`root/.git` 存在性) + 读 `project.root/.gitignore` +
+      构建 `[Dot, GitIgnore?]` + 枚举时现建 Module 并注入。
+      验证: 单测 — git 项目注入生效 / 非 git 项目不读根下
+      `.gitignore` / 缺 `.gitignore` 只挂 Dot / Clone 链 (manager
+      spawn 路径) 不回归。
+- [x] 6.3 asset_manager 消费化: 删除 `asset_manager/filter.rs` 与
+      `FilterSpec`, `AssetEnumeratable::enumerator()` 回无参,
+      `FileEnumerator` 走 `module.filters` (`with_filters` 主路径),
+      manager 不再读 workspace 规则, `AssetView::Forest.rules` 字段
+      删除且 tree 头部摘要位渲染移除 (design D9, dock-layout delta
+      已随规划更新), `load/set_file_tree_rules`、app 默认规则自举、
+      legacy 规则补拷路径一并清退。验证: `cargo build` + 全链路测试绿。
+- [x] 6.4 spec 场景测试改造: `write_rules` → 写项目根
+      `.gitignore`; refresh/full-chain/manager 过滤测试改源;
+      excludes 断言反转 (`node_modules` 默认在场、dot 条目缺席、
+      `!.env` 救不回)。验证: `cargo test` 全绿, 新增供给链场景
+      (非 git 不读、git 生效) 有测试对应。
+- [x] 6.5 文档同步: `Docs/pending-decisions.md` 三处 — 240 配置界面
+      一节整体消解 (配置源退役)、263 排除表描述改 dot-only、310
+      "全量递归 + 排除表" 措辞与未来信号消费记录; `file-tree`
+      spec Purpose 措辞 (workspace config → 项目供给) 按规则直接改
+      主 spec。验证: 文档与更新后 delta 场景逐条一致。
+- [x] 6.6 集成验证: 全量 `cargo test`;对照更新后的 delta
+      (asset-manager 2 MODIFIED + 1 REMOVED + 3 ADDED,
+      file-tree 1 MODIFIED, dock-layout 1 MODIFIED) 逐场景核对测试对应关系。验证: 场景↔测试
+      核对记录。
+
 ## Workflow follow-up
 
 - 实现完成后走 `/opsx-archive` 归档(届时 delta 合入

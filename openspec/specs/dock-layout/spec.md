@@ -41,11 +41,10 @@ remain reachable at all times.
 ### Requirement: Right dock renders by default
 
 On startup the right dock SHALL be visible and render the file tree panel: a
-header carrying the panel title, a refresh control, a read-only summary of
-the active filter rules, and a close button, plus a body area that shows the
-asset tree of registered projects or its empty state. The panel SHALL
-register through the dock's standard panel path so resize and close mechanics
-apply to it unchanged.
+header carrying the panel title, a refresh control, and a close button, plus
+a body area that shows the asset tree of registered projects or its empty
+state. The panel SHALL register through the dock's standard panel path so
+resize and close mechanics apply to it unchanged.
 
 #### Scenario: Right dock visible on startup
 
@@ -55,7 +54,7 @@ apply to it unchanged.
 #### Scenario: Header chrome present
 
 - **WHEN** the user inspects the right dock header
-- **THEN** it shows the panel title, a refresh control, a read-only filter-rule summary, and a close button
+- **THEN** it shows the panel title, a refresh control, and a close button
 ### Requirement: Right dock draggable resize
 
 The right dock SHALL be resizable by dragging its left edge, clamped to the
