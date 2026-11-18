@@ -1,10 +1,10 @@
 //! legacy `.workspaces.json` 只读迁移源 (change: single-workspace-
 //! project-model — app 根的 workspace 列表格式退役)。
 //!
-//! 职责只剩两件 (workspace-management: Legacy .workspaces.json migration):
-//! 1. 播种全局历史 (`seed_legacy`, 由 `legacy_seeded` 标志保证一次性);
-//! 2. 按需补拷 `file_tree` 规则到工作区自己的配置 (`legacy_rules_for`,
-//!    工作区配置缺区段时调用)。
+//! 职责只剩一件 (workspace-management: Legacy .workspaces.json migration):
+//! 播种全局历史 (`seed_legacy`, 由 `legacy_seeded` 标志保证一次性)。
+//! 过滤规则的 legacy 补拷 (`legacy_rules_for`) 已随过滤源迁到项目根
+//! `.gitignore` 一并退役 (change: file-filter-prune D9)。
 //!
 //! **本模块永不写 legacy 文件**; 原 `save`/`save_at` 写路径已随
 //! workspace 列表持久化一并移除 (task 6.2)。
@@ -14,17 +14,18 @@ use std::path::{Path, PathBuf};
 use crate::workspace::history::History;
 
 /// legacy 持久化文件 (app 根; 当前进程 cwd 即 app 根)。
+/// 仅正式构建的播种分支调用 (cfg(not(test))) — 测试目标放行未用。
+#[cfg_attr(test, allow(dead_code))]
 pub fn legacy_path() -> PathBuf {
     PathBuf::from(".workspaces.json")
 }
 
-/// legacy 文件的完整形状 (列表 + 按 workspace 路径键控的规则区段)。
+/// legacy 文件的完整形状 (工作区列表; 规则区段已退役 — 残留键被
+/// serde 忽略)。
 #[derive(serde::Deserialize, Default)]
 pub(crate) struct LegacyPersisted {
     #[serde(default)]
     pub workspaces: Vec<PathBuf>,
-    #[serde(default)]
-    pub file_tree: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// 容错读: 缺失/损坏 → None (legacy 不再承重, 坏文件不再阻断启动 —
@@ -52,20 +53,6 @@ pub fn seed_legacy(history: &mut History, legacy_file: &Path) -> bool {
         }
     }
     true
-}
-
-/// legacy 里该 workspace 的 `file_tree` 规则 (迁移补拷的数据源)。
-/// 缺失/损坏/无该键/空数组 → `None` (无可拷, 不写工作区配置)。
-pub fn legacy_rules_for(legacy_file: &Path, workspace_path: &Path) -> Option<Vec<String>> {
-    let legacy = read_legacy(legacy_file)?;
-    let rules = legacy
-        .file_tree
-        .get(workspace_path.to_string_lossy().as_ref())?;
-    if rules.is_empty() {
-        None
-    } else {
-        Some(rules.clone())
-    }
 }
 
 #[cfg(test)]
@@ -128,30 +115,5 @@ mod tests {
         assert!(seed_legacy(&mut h, &missing));
         assert!(h.legacy_seeded);
         assert!(h.recent.is_empty());
-    }
-
-    #[test]
-    fn legacy_rules_lookup_is_keyed_and_tolerant() {
-        let legacy = temp_file("rules");
-        std::fs::write(
-            &legacy,
-            r#"{ "workspaces": ["/ws"], "file_tree": { "/ws": ["*.log", "!keep.log"] } }"#,
-        )
-        .unwrap();
-        assert_eq!(
-            legacy_rules_for(&legacy, Path::new("/ws")),
-            Some(vec!["*.log".to_string(), "!keep.log".to_string()])
-        );
-        assert_eq!(legacy_rules_for(&legacy, Path::new("/other")), None);
-        assert_eq!(legacy_rules_for(Path::new("/nonexistent"), Path::new("/ws")), None);
-        let _ = std::fs::remove_file(&legacy);
-    }
-
-    #[test]
-    fn empty_legacy_rules_entry_means_nothing_to_copy() {
-        let legacy = temp_file("empty-rules");
-        std::fs::write(&legacy, r#"{ "workspaces": [], "file_tree": { "/ws": [] } }"#).unwrap();
-        assert_eq!(legacy_rules_for(&legacy, Path::new("/ws")), None);
-        let _ = std::fs::remove_file(&legacy);
     }
 }

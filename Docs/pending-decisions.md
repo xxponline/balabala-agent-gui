@@ -131,14 +131,15 @@ CloseAgent), 统一投进 `TerminalApp::on_sidebar_event` 单一入口 match 分
 **状态: 已解决** (change `single-workspace-project-model`)。
 
 新形态不是“挪个位置的大文件”，而是按职责拆到两处:
-- **workspace 配置**在工作区目录内 — `.balabala.workspace.json` (marker +
-  `file_tree` 规则) + `balabala.solutions.json`；打开目录 = 打开工作区，
-  配置跟着数据走 (workspace-management/project-model spec)。
+- **workspace 配置**在工作区目录内 — `.balabala.workspace.json` (仅
+  marker 身份; `file_tree` 规则区段已随过滤源迁到项目根 `.gitignore`
+  退役 — file-filter-prune D9) + `balabala.solutions.json`；打开目录 =
+  打开工作区，配置跟着数据走 (workspace-management/project-model spec)。
 - **MRU 历史**在全局应用数据目录 (`directories` crate →
   `workspace_history.json`)；历史不属于任何工作区，放全局才不与
   “配置都在工作区里”冲突 (design D4)。
-- legacy `.workspaces.json` 只读: 一次性播种历史 (`legacy_seeded` 标志) +
-  打开时按缺区段补拷规则；**永不改写** (Legacy migration spec)。
+- legacy `.workspaces.json` 只读: 一次性播种历史 (`legacy_seeded` 标志);
+  **永不改写**。原“按缺区段补拷规则”已随过滤源退役 (file-filter-prune)。
 
 原“要做的事”全部落地; 唯一形态差异: 没有引入单一用户目录配置文件,
 而是拆成 workspace 内 + 全局历史两件 (见 change design D3/D4)。
@@ -151,8 +152,9 @@ CloseAgent), 统一投进 `TerminalApp::on_sidebar_event` 单一入口 match 分
 workspace 级改为 **per-project** (`collapsed_projects` 集合)，仍易失
 不写盘。
 
-**当前选择**: `.workspaces.json` 只存 workspace 路径列表 (+ `file_tree`
-规则区段); agent 会话与展开/折叠态重启即丢 — spec: "Collapse state and
+**当前选择**: `.workspaces.json` (legacy, 只读) 只存 workspace 路径
+列表 — 其中历史遗留的 `file_tree` 区段不再被读取 (规则源 = 项目根
+`.gitignore`); agent 会话与展开/折叠态重启即丢 — spec: "Collapse state and
 agent sessions SHALL NOT be persisted"。
 
 **为什么这样选**: 会话恢复要么重开 `pi --mode rpc` 进程要么重放 RPC 状态,
@@ -247,40 +249,26 @@ surrounding-text deletion) SHALL NOT be delivered"), 立项须开 spec delta。
 
 **备选方案**: 原 A (pi-shell-rs 修复 Tab) 已完成; B (文档化已知限制) 作废。
 
-## 文件树过滤的配置界面 (含 agent-shell 键盘条款修订)
+## 文件树过滤的配置界面 (含 agent-shell 键盘条款修订) — 已消解
 
-**状态**: 规则语义已入 spec (file-tree, 2026-11-09 change
-`right-dock-file-tree`; 2026-11-15 对齐复核); 可输入的配置界面仍待立项。
+**状态 (2026-11-18, change `file-filter-prune`)**: **消解** — 过滤源
+已从 workspace 配置改为项目级供给, 可输入的配置界面**永不立项**:
 
-**当前选择 (已由 spec 固化)**: 过滤规则纯配置驱动 — file-tree spec
-Requirement "File-row filtering with gitignore-style rules": 规则来自
-`.workspaces.json` 的 `file_tree` 区段 (按 workspace 绝对路径键控, 模式行
-数组), gitignore 语义 (`* ? **` 通配、`!` 重包含、最后匹配胜出), **文件行与
-目录行同等求值** (asset-manager change `file-filter-prune` 起): 被排除目录
-连同子树不进视图, 枚举时即减支 (不读其内容); gitignore 同款 gotcha 一并
-生效 — 被排除目录内部的 `!` 救不回, `!` 命中目录自身才救回整个子树
-(如 `["*", "!src/", "!src/**"]`); 目录自身未被排除、仅子文件全被过滤时,
-空目录行仍显示; 默认排除表 (.git/node_modules/target/build/dist/.DS_Store)
-是独立 filter, 用户规则的 `!node_modules` 救不回; dock-layout spec 规定右
-dock 头部只有**只读**的过滤规则摘要。v1 右 dock **无任何可聚焦文本输入**,
-⟳ 刷新时重读生效。语义出处: change `file-filter-prune` 的 asset-manager
-delta (Requirement "File-row filtering relative to project roots" /
-"Enumeration prunes excluded directories")。
-
-**为什么这样选**: `agent-shell` 两条键盘契约是绝对条款 ("仅 macOS 应用失焦
-才不转发键盘/IME"), dock 内一旦有输入控件, 打字即违反 spec。配置文件绕开了
-这个问题, 且配置语义随数据源走 (i 定案)。
-
-**未来需要重新评估的信号**:
-- 用户想要即输即筛的体验 (改配置文件 + 点刷新太绕)
-
-**要做的事** (配置界面立项时):
-- spec: `agent-shell` 的 Session selection focus model 与 Keyboard input
-  forwarding 两条 MUST 开一个明确例外 — "明确获得焦点的 dock 交互控件
-  (当前即右 dock 过滤框) 可接收键盘/IME, 直到其失焦"; 补对应场景
-  (2026-11-15 复核: 现行 spec 仍无此例外 — "macOS 失焦是唯一不转发条件"
-  措辞未动)
-- 面板侧: 过滤输入框持焦期间, 树行点击仍即时交回终端 (纪律不变)
+- 规则源 = 项目根 `.gitignore` (仅 git 管理的项目读取), 默认排除只藏
+  `.` 开头 (六项名单撤销, node_modules/target 等默认可见); workspace
+  的 `file_tree` 配置源、`load/set_file_tree_rules`、legacy 规则补拷、
+  app 默认规则自举全部退役。
+- 自定义过滤的唯一入口 = 编辑项目根 `.gitignore` + ⟳ 刷新重读
+  (spec: asset-manager "Filter provisioning from the project root" /
+  "Refresh re-enumerates in the background")。
+- "即输即筛"信号随之作废; `agent-shell` 键盘例外 (过滤框持焦条款) 的
+  立项前提消失 — 现行 "macOS 失焦是唯一不转发条件" 措辞保持不动。
+- 右 dock header 的只读规则摘要位一并撤除 (dock-layout delta,
+  file-filter-prune)。
+- 求值语义 (目录行同等求值 / 枚举减支 / gotcha / 空目录行保留) 已由
+  change `file-filter-prune` 的 asset-manager delta 钉住 (File-row
+  filtering relative to project roots / Enumeration prunes excluded
+  directories / default dot exclusions)。
 
 ## 文件树的自动刷新 (焦点重扫 / FS 监听)
 
@@ -303,16 +291,19 @@ delta (Requirement "File-row filtering relative to project roots" /
 
 ## 文件树的惰性扫描 (大仓)
 
-**状态**: 排除表与后台扫描已入 spec (file-tree "Default scan exclusions" /
-"Refresh ... background"); 惰性扫描本身仍待立项 (2026-11-09, change
-`right-dock-file-tree` design D6)。
+**状态**: 后台扫描已入 spec (file-tree "Refresh triggers and behavior");
+默认排除已随 change `file-filter-prune` 改为 dot-only (asset-manager
+"Module file enumeration with default dot exclusions"); 惰性扫描本身仍
+待立项 (2026-11-09, change `right-dock-file-tree` design D6)。
 
-**当前选择**: 全量递归 + 排除表 (`.git node_modules target build dist
-.DS_Store`) + 后台线程。
+**当前选择**: 全量递归 + dot-only 默认排除 (只藏 `.` 开头) + 项目根
+`.gitignore` 规则 + 后台线程; node_modules/target/build/dist **默认可见**
+(想藏就写 .gitignore)。
 
 **未来需要重新评估的信号**:
-- 排除表挡不住的超大仓 (数据目录 / 未排除的生成物) 刷新明显卡顿
-- 用户要求浏览被排除目录 (如按需展开 node_modules)
+- 无 `.gitignore` 的超大仓 (依赖/构建目录全量入树) 刷新明显卡顿
+- ~~用户要求浏览被排除目录 (如按需展开 node_modules)~~ → **已消费**
+  (2026-11-18, change `file-filter-prune`: 六项名单撤销, 依赖目录默认在树)
 
 **要做的事**:
 - 首展才扫该目录 (惰性) — 需解决两件事: `is_folder()` 对未扫目录为 false

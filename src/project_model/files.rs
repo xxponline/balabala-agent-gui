@@ -1,7 +1,8 @@
 //! workspace 文件契约 (design D3): marker 最后写, marker 是成立唯一真值。
 //!
-//! - `.balabala.workspace.json` = 身份 + 配置 (`version` 必有, `file_tree`
-//!   规则区段按需省略 — 单工作区, 规则不再按路径键控)。
+//! - `.balabala.workspace.json` = 身份 (`version` 必有; `file_tree`
+//!   规则区段已随过滤源迁到项目根 `.gitignore` 退役 — 残留字段被
+//!   serde 忽略, 无数据迁移)。
 //! - `balabala.solutions.json` = solution items 数组 (缺失 = 合法空工作区,
 //!   spec: Solution configuration file)。
 //! - 创建顺序: **先 solutions 后 marker** — 任一步失败都不留"半个工作区"
@@ -26,21 +27,17 @@ pub fn solutions_path(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join(SOLUTIONS_FILE)
 }
 
-/// marker 文件内容: 身份 (version) + 工作区配置 (file_tree 规则)。
+/// marker 文件内容: 仅身份 (version) — 过滤规则源在项目根
+/// `.gitignore` (file-filter-prune D9), 不再进工作区配置。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WorkspaceMarker {
     pub version: u32,
-    /// gitignore 式过滤规则 (file-tree spec: 来自工作区自己的配置文件)。
-    /// 空省略 — 保持无规则时的字节稳定。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub file_tree: Vec<String>,
 }
 
 impl WorkspaceMarker {
     pub fn new() -> Self {
         Self {
             version: MARKER_VERSION,
-            file_tree: Vec::new(),
         }
     }
 }
@@ -131,29 +128,6 @@ pub(super) fn load_solutions(workspace_dir: &Path) -> Result<Vec<SolutionItem>, 
     serde_json::from_str(&contents).map_err(|e| format!("parse {path:?}: {e}"))
 }
 
-/// 读工作区 `file_tree` 规则 (file-tree spec: 刷新期容错读 — 缺失/解析
-/// 失败 = 空规则 = 全显; 启动期的坏文件契约已由打开路径拦截)。
-pub fn load_file_tree_rules(workspace_dir: &Path) -> Vec<String> {
-    match marker_status(workspace_dir) {
-        MarkerStatus::Valid(marker) => marker.file_tree,
-        _ => Vec::new(),
-    }
-}
-
-/// 把规则写进 marker (保留 version; legacy 迁移的补拷与未来配置写入用)。
-/// 文件缺失/损坏 → Err (由调用方决定是否落红条)。
-pub fn set_file_tree_rules(workspace_dir: &Path, rules: Vec<String>) -> Result<(), String> {
-    let mut marker = match marker_status(workspace_dir) {
-        MarkerStatus::Valid(m) => m,
-        MarkerStatus::Missing => WorkspaceMarker::new(),
-        MarkerStatus::Corrupt(e) => return Err(e),
-    };
-    marker.file_tree = rules;
-    let json = serde_json::to_string_pretty(&marker).map_err(|e| format!("serialize: {e}"))?;
-    std::fs::write(marker_path(workspace_dir), json)
-        .map_err(|e| format!("write {}: {e}", marker_path(workspace_dir).display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,21 +213,6 @@ mod tests {
         fs::remove_file(solutions_path(&dir)).unwrap();
         append_simple_solution(&dir, "/a/x".into()).unwrap();
         assert_eq!(load_solutions(&dir).unwrap().len(), 1);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn file_tree_rules_roundtrip_via_marker() {
-        let dir = temp_dir("rules");
-        create_workspace_files(&dir).unwrap();
-        assert!(load_file_tree_rules(&dir).is_empty(), "无区段 = 空规则");
-        set_file_tree_rules(&dir, vec!["*.log".into(), "!keep.log".into()]).unwrap();
-        assert_eq!(
-            load_file_tree_rules(&dir),
-            vec!["*.log".to_string(), "!keep.log".to_string()]
-        );
-        // solutions 区段不受影响 (两个文件各管各的)
-        assert!(solutions_path(&dir).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

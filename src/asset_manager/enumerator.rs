@@ -6,31 +6,33 @@
 //! - Project 的枚举器 = 自身 → 异步枚举出所有 Module (其子节点)。
 //! - Module 的枚举器 = 标准文件枚举器 (从 `module.root` 递归扫文件)。
 //!
-//! 过滤(design D2/D5):链上携带可克隆的 [`FilterSpec`] 配方,
-//! [`FileEnumerator`] 构造时 `build()` 出 filter 列表并存为字段,
-//! `scan_dir` 逐条目无序 OR 求值 — 任一命中即排除, 目录命中即减支。
+//! 过滤 (design D2/D5/D8): filter 域在 `project_model::filter` —
+//! Project 枚举时判 git、读自身根 `.gitignore`、构建 filter 集并注入
+//! 现建的 Module;[`FileEnumerator`] 保存 `module.filters`,`scan_dir`
+//! 逐条目无序 OR 求值 — 任一命中即排除, 目录命中即减支。
 //! 扫描体 (符号链接不跟随 / 排序) 自旧 `filetree` 平移, 语义逐字。
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 
 use gpui_kit::BackgroundExecutor;
 
+use crate::project_model::filter::FileFilter;
 use crate::project_model::{Module, Project};
 
 use super::dto::{AssetKind, AssetNode, project_id};
-use super::filter::{FileFilter, FilterSpec};
 
 /// 异步枚举结果的盒装 future (BoxFuture 别名; 零新依赖)。
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// 可枚举资产的实体 (Project / Module)。
 ///
-/// `spec` 是可克隆的过滤配方 (design D2 修订):存储后逐层
-/// `clone()` 转发, 由 [`FileEnumerator`] 构建并保存 filter 列表。
+/// 链上不携带过滤输入 — filter 由 Project 在枚举需要 Module 时
+/// 构建并注入 (design D2/D8), 所有输入从 `root` 自身推导。
 pub trait AssetEnumeratable {
-    fn enumerator(&self, spec: FilterSpec) -> Box<dyn AssetEnumerator>;
+    fn enumerator(&self) -> Box<dyn AssetEnumerator>;
 }
 
 /// 资产枚举器: 异步产出该实体的完整资产子树。
@@ -44,20 +46,8 @@ pub trait AssetEnumerator: Send {
     ) -> BoxFuture<'static, Result<AssetNode, String>>;
 }
 
-/// spec 锚定的默认排除表 (asset-manager: Default exclusions);
-/// 由 [`super::filter::DefaultExcludesFilter`] 消费 (design D5)。
-pub const EXCLUDES: &[&str] = &[
-    ".git",
-    "node_modules",
-    "target",
-    "build",
-    "dist",
-    ".DS_Store",
-];
-
-/// 标准文件资产枚举器 (单独实现): 构造时从 [`FilterSpec`] 构建
-/// filter 列表并**保存为字段** (design D2), 从根目录递归枚举、
-/// 逐条目过滤减支。
+/// 标准文件资产枚举器 (单独实现): 保存注入的 filter 列表
+/// (design D2), 从根目录递归枚举、逐条目过滤减支。
 ///
 /// - 根不可读 → `Err` (manager 落降级态);
 /// - 子目录不可读 → 跳过其内容 (best-effort, 目录仍显示);
@@ -66,23 +56,13 @@ pub const EXCLUDES: &[&str] = &[
 /// - 排序: 目录在前、文件在后, 各自按标签 (大小写不敏感) 字典序。
 pub struct FileEnumerator {
     pub root: PathBuf,
-    filters: Vec<Box<dyn FileFilter>>,
+    filters: Vec<Arc<dyn FileFilter>>,
 }
 
 impl FileEnumerator {
-    /// 从配方构建并保存 filter 列表 (design D2: 默认排除第一员 +
-    /// 用户规则, `FilterSpec::build`)。
-    pub fn new(root: impl Into<PathBuf>, spec: &FilterSpec) -> Self {
-        Self {
-            root: root.into(),
-            filters: spec.build(),
-        }
-    }
-
-    /// 直接注入建好的 filter (测试/自定义组合, design D2)。
-    /// (bin crate 无外部使用者, 仅测试消费 — 放行未用。)
-    #[allow(dead_code)]
-    pub fn with_filters(root: impl Into<PathBuf>, filters: Vec<Box<dyn FileFilter>>) -> Self {
+    /// 注入建好的 filter 列表 (主路径: `module.filters` 克隆;
+    /// 测试/自定义组合直接给列表 — design D2)。
+    pub fn with_filters(root: impl Into<PathBuf>, filters: Vec<Arc<dyn FileFilter>>) -> Self {
         Self {
             root: root.into(),
             filters,
@@ -104,7 +84,7 @@ impl AssetEnumerator for FileEnumerator {
 /// 递归扫描 (后台执行; 模块根 → `Dir` 根节点), 按 `filters` 过滤减支。
 pub fn scan_root(
     root: &Path,
-    filters: &[Box<dyn FileFilter>],
+    filters: &[Arc<dyn FileFilter>],
 ) -> Result<AssetNode, String> {
     if !root.is_dir() {
         return Err(format!("{} 不是可读目录", root.display()));
@@ -124,7 +104,7 @@ pub fn scan_root(
 fn scan_dir(
     dir: &Path,
     rel_prefix: &str,
-    filters: &[Box<dyn FileFilter>],
+    filters: &[Arc<dyn FileFilter>],
 ) -> Result<Vec<AssetNode>, String> {
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
@@ -139,8 +119,8 @@ fn scan_dir(
         };
         // file_type = lstat: 符号链接不视为目录 (不递归, 防环)
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        // 无序 OR: 任一 filter 命中即排除 (EXCLUDES 已折叠为 filter,
-        // 无特权分支 — design D5); 目录命中即减支, 不 read_dir。
+        // 无序 OR: 任一 filter 命中即排除 (默认 dot 排除是独立硬
+        // filter — design D5; 目录命中即减支, 不 read_dir。
         if filters.iter().any(|f| f.is_ignored(&rel, is_dir)) {
             continue;
         }
@@ -181,7 +161,6 @@ fn scan_dir(
 /// id 保持裸绝对路径, 目录行的菜单/复制语义直接成立 (design D3)。
 struct ModuleEnumerator {
     module: Module,
-    spec: FilterSpec,
 }
 
 /// Module 行组装 (纯函数): 扫描产物换壳为模块行。
@@ -201,22 +180,23 @@ impl AssetEnumerator for ModuleEnumerator {
         bg: BackgroundExecutor,
     ) -> BoxFuture<'static, Result<AssetNode, String>> {
         let module = self.module;
-        let spec = self.spec;
         Box::pin(async move {
-            // FileEnumerator 构造时构建并保存 filter 列表 (design D2)
-            let scanned = Box::new(FileEnumerator::new(module.root.clone(), &spec))
-                .enumerate(bg)
-                .await?;
+            // filter 来自 Project 注入 (design D2); 非空由供给保证
+            let scanned = Box::new(FileEnumerator::with_filters(
+                module.root.clone(),
+                module.filters.clone(),
+            ))
+            .enumerate(bg)
+            .await?;
             Ok(module_row(&module, scanned))
         })
     }
 }
 
 impl AssetEnumeratable for Module {
-    fn enumerator(&self, spec: FilterSpec) -> Box<dyn AssetEnumerator> {
+    fn enumerator(&self) -> Box<dyn AssetEnumerator> {
         Box::new(ModuleEnumerator {
             module: self.clone(),
-            spec,
         })
     }
 }
@@ -228,7 +208,6 @@ impl AssetEnumeratable for Module {
 /// "父排除子" 的重叠策略等有真实多模块 solution 时再接 (design Risks)。
 struct ProjectEnumerator {
     project: Project,
-    spec: FilterSpec,
 }
 
 /// Project 行组装 (纯函数): 子节点 = 各 Module 行。
@@ -247,26 +226,25 @@ impl AssetEnumerator for ProjectEnumerator {
         bg: BackgroundExecutor,
     ) -> BoxFuture<'static, Result<AssetNode, String>> {
         let project = self.project;
-        let spec = self.spec;
         Box::pin(async move {
-            let mut modules = Vec::with_capacity(project.modules.len());
-            for module in &project.modules {
-                let node = module
-                    .enumerator(spec.clone())
-                    .enumerate(bg.clone())
-                    .await?;
-                modules.push(node);
+            // 枚举触发 Module 创建 (design D2): 判 git、读 .gitignore、
+            // 构建 [Dot, GitIgnore?] 并注入 — IO 在本 bg task 内,
+            // 刷新重跑即重读 (spec: Refresh re-reads filter rules)。
+            let modules = project.modules_for_enumeration();
+            let mut rows = Vec::with_capacity(modules.len());
+            for module in &modules {
+                let node = module.enumerator().enumerate(bg.clone()).await?;
+                rows.push(node);
             }
-            Ok(project_row(&project, modules))
+            Ok(project_row(&project, rows))
         })
     }
 }
 
 impl AssetEnumeratable for Project {
-    fn enumerator(&self, spec: FilterSpec) -> Box<dyn AssetEnumerator> {
+    fn enumerator(&self) -> Box<dyn AssetEnumerator> {
         Box::new(ProjectEnumerator {
             project: self.clone(),
-            spec,
         })
     }
 }
@@ -301,45 +279,47 @@ mod tests {
         nodes.iter().find(|n| n.label == label)
     }
 
-    /// 默认 filter 列表 (FilterSpec::build: DefaultExcludes + 空规则
-    /// GitIgnore) — 沿用原硬编码排除表行为。
-    fn default_filters() -> Vec<Box<dyn FileFilter>> {
-        FilterSpec::default().build()
+    /// 默认 filter 列表 — 非 git 项目的供给形态 (design D8: 仅 Dot)。
+    fn default_filters() -> Vec<Arc<dyn FileFilter>> {
+        vec![Arc::new(DotFilter)]
     }
 
-    /// design D2: FileEnumerator 构造时从配方构建并保存 filter 列表;
-    /// `with_filters` 直接注入 (测试/自定义组合)。
+    /// design D2: FileEnumerator 保存注入的 filter 列表
+    /// (主路径 `module.filters`; 组合由供给方决定)。
     #[test]
-    fn file_enumerator_builds_and_stores_filters_from_spec() {
-        let spec = FilterSpec::new(vec!["*.log".to_string()]);
-        let e = FileEnumerator::new("/tmp", &spec);
-        assert_eq!(e.filters.len(), 2, "默认排除 + 用户规则各一");
+    fn file_enumerator_stores_injected_filters() {
+        let e = FileEnumerator::with_filters(
+            "/tmp",
+            vec![
+                Arc::new(DotFilter),
+                Arc::new(GitIgnoreFilter::compile(&owned(&["*.log"]))),
+            ],
+        );
+        assert_eq!(e.filters.len(), 2, "注入列表原样保存");
+        assert!(
+            e.filters.iter().any(|f| f.is_ignored(".env", false)),
+            "dot filter 在列"
+        );
         assert!(
             e.filters.iter().any(|f| f.is_ignored("a.log", false)),
-            "spec 规则已生效"
+            "规则 filter 在列"
         );
-        assert!(
-            e.filters.iter().any(|f| f.is_ignored("node_modules", true)),
-            "默认排除在列"
-        );
-
-        let e2 = FileEnumerator::with_filters("/tmp", vec![Box::new(DefaultExcludesFilter)]);
-        assert_eq!(e2.filters.len(), 1, "直接注入的列表原样保存");
     }
 
-    /// 平移自 filetree: 排除表 / dotfile / kind / 排序。
+    /// spec: Dot entries absent at any depth + Dependency directories
+    /// present by default + kind/排序 (原 excludes 测试随六项撤销反转)。
     #[test]
-    fn file_enumerator_excludes_and_kinds() {
+    fn file_enumerator_hides_dot_entries_and_keeps_rest() {
         let root = temp_root("scan");
         touch(&root.join("src/app.rs"));
         touch(&root.join("src/pane/mod.rs"));
         touch(&root.join("README.md"));
-        touch(&root.join(".gitignore")); // dotfile 必须显示
-        for excluded in EXCLUDES {
-            touch(&root.join(format!("src/{excluded}/junk.js"))); // 任意深度排除
-            touch(&root.join(excluded)); // 文件形态也排除 (.DS_Store 等)
-        }
-        touch(&root.join("src/deep/node_modules/dep/index.js"));
+        touch(&root.join(".gitignore")); // dot -> 缺席 (原 dotfile 显示已反转)
+        touch(&root.join(".git/config")); // dot 目录整支缺席
+        touch(&root.join("src/.DS_Store")); // 任意深度 dot 文件缺席
+        touch(&root.join("src/.cache/x")); // 任意深度 dot 目录缺席
+        touch(&root.join("node_modules/dep/index.js")); // 六项撤销 -> 在场
+        touch(&root.join("target/debug/bin")); // 六项撤销 -> 在场
 
         let tree = scan_root(&root, &default_filters()).expect("root 可读");
         assert_eq!(tree.kind, AssetKind::Dir);
@@ -347,21 +327,17 @@ mod tests {
         let top = labels(&tree.children);
         assert_eq!(
             top,
-            vec!["src", ".gitignore", "README.md"],
-            "顶层排序: 目录前, 大小写不敏感字典序; 排除项全部缺席"
+            vec!["node_modules", "src", "target", "README.md"],
+            "目录前大小写不敏感字典序; 依赖目录在场, dot 条目全部缺席"
         );
 
-        fn assert_no_excluded(node: &AssetNode) {
-            assert!(
-                !EXCLUDES.contains(&node.label.as_str()),
-                "排除项泄漏: {}",
-                node.id
-            );
+        fn assert_no_dot(node: &AssetNode) {
+            assert!(!node.label.starts_with('.'), "dot 条目泄漏: {}", node.id);
             for child in &node.children {
-                assert_no_excluded(child);
+                assert_no_dot(child);
             }
         }
-        assert_no_excluded(&tree);
+        assert_no_dot(&tree);
 
         let src = find(&tree.children, "src").expect("src 在场");
         assert_eq!(src.kind, AssetKind::Dir);
@@ -370,6 +346,10 @@ mod tests {
         let pane = find(&src.children, "pane").expect("pane 在场");
         assert_eq!(pane.kind, AssetKind::Dir);
         assert_eq!(labels(&pane.children), vec!["mod.rs"]);
+        assert!(
+            find(&src.children, ".DS_Store").is_none() && find(&src.children, ".cache").is_none(),
+            "任意深度 dot 缺席"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -427,18 +407,18 @@ mod tests {
 
     // ===== 减支 / 多 filter OR (spec: Enumeration prunes excluded directories) =====
 
-    use super::super::filter::{DefaultExcludesFilter, GitIgnoreStyleFilter};
+    use crate::project_model::filter::{DotFilter, GitIgnoreFilter};
     use std::sync::{Arc, Mutex};
 
     fn owned(rules: &[&str]) -> Vec<String> {
         rules.iter().map(|s| s.to_string()).collect()
     }
 
-    /// 默认排除 + 用户规则 (FilterSpec::build 的手写等价)。
-    fn ignore_filters(rules: &[&str]) -> Vec<Box<dyn FileFilter>> {
+    /// 默认 dot 排除 + 规则 (非 git 供给形态的手写等价, design D8)。
+    fn ignore_filters(rules: &[&str]) -> Vec<Arc<dyn FileFilter>> {
         vec![
-            Box::new(DefaultExcludesFilter),
-            Box::new(GitIgnoreStyleFilter::compile(&owned(rules))),
+            Arc::new(DotFilter),
+            Arc::new(GitIgnoreFilter::compile(&owned(rules))),
         ]
     }
 
@@ -477,11 +457,11 @@ mod tests {
         touch(&root.join("keep/main.rs"));
 
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let filters: Vec<Box<dyn FileFilter>> = vec![
-            Box::new(SpyPruner {
+        let filters: Vec<Arc<dyn FileFilter>> = vec![
+            Arc::new(SpyPruner {
                 seen: seen.clone(),
             }),
-            Box::new(DefaultExcludesFilter),
+            Arc::new(DotFilter),
         ];
         let tree = scan_root(&root, &filters).expect("可读");
 
@@ -510,14 +490,14 @@ mod tests {
         touch(&root.join("c.txt"));
 
         for order in 0..2 {
-            let f1 = GitIgnoreStyleFilter::compile(&owned(&["a.txt"]));
-            let f2 = GitIgnoreStyleFilter::compile(&owned(&["b.txt"]));
-            let mut filters: Vec<Box<dyn FileFilter>> = if order == 0 {
-                vec![Box::new(f1), Box::new(f2)]
+            let f1 = GitIgnoreFilter::compile(&owned(&["a.txt"]));
+            let f2 = GitIgnoreFilter::compile(&owned(&["b.txt"]));
+            let mut filters: Vec<Arc<dyn FileFilter>> = if order == 0 {
+                vec![Arc::new(f1), Arc::new(f2)]
             } else {
-                vec![Box::new(f2), Box::new(f1)]
+                vec![Arc::new(f2), Arc::new(f1)]
             };
-            filters.push(Box::new(DefaultExcludesFilter));
+            filters.push(Arc::new(DotFilter));
             let tree = scan_root(&root, &filters).expect("可读");
             assert_eq!(
                 labels(&tree.children),
@@ -528,19 +508,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// design D5: 用户规则的 `!node_modules` 救不回默认排除 (OR 无跨
-    /// filter 反悔)。
+    /// design D5: `.gitignore` 的 `!` 救不回默认 dot 排除 (OR 无跨
+    /// filter 反悔) — spec: Dot ignore cannot be re-included。
     #[test]
-    fn user_negation_cannot_rescue_default_excludes() {
+    fn user_negation_cannot_rescue_dot_filter() {
         let root = temp_root("no-rescue");
-        touch(&root.join("node_modules/dep/index.js"));
+        touch(&root.join(".env"));
         touch(&root.join("src/main.rs"));
 
-        let filters = ignore_filters(&["!node_modules"]);
+        let filters = ignore_filters(&["!.env"]);
         let tree = scan_root(&root, &filters).expect("可读");
         assert!(
-            find(&tree.children, "node_modules").is_none(),
-            "DefaultExcludes 的排除不可被另一 filter 的 `!` 反悔"
+            find(&tree.children, ".env").is_none(),
+            "DotFilter 的排除不可被另一 filter 的 `!` 反悔"
         );
         assert!(find(&tree.children, "src").is_some(), "其余照常");
         let _ = std::fs::remove_dir_all(&root);

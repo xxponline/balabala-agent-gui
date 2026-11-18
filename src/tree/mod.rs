@@ -20,7 +20,6 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use gpui_kit::base::TestTextExt;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::dock::{BasePanel, DockPlacement, Panel, PanelEvent};
 use gpui_kit::component::list::ListItem;
@@ -305,14 +304,8 @@ impl Render for TreePanel {
         let theme_danger = cx.theme().danger;
         let theme_border = cx.theme().border;
         let theme_accent = cx.theme().accent;
-        // 只读规则摘要 (spec: header chrome; 数据来自 manager 当前生效规则)
-        let rules_summary = match &self.last_synced {
-            Some(AssetView::Forest { rules, .. }) if !rules.is_empty() => {
-                format!("过滤: {}", rules.join("  "))
-            }
-            Some(AssetView::Forest { .. }) => "无过滤规则".to_string(),
-            _ => "—".to_string(),
-        };
+        // 规则摘要位已撤除 (file-filter-prune D9: 规则源 = 项目根
+        // .gitignore, 头部无数据源 — dock-layout delta 同步收窄)
         // render 读同步缓存（on_data_changed 已保证先于 notify 同步）
         let body = match &self.last_synced {
             None | Some(AssetView::Empty) => div()
@@ -464,16 +457,6 @@ impl Render for TreePanel {
                             .flex()
                             .items_center()
                             .gap_2()
-                            // 只读规则摘要 (数据来自 manager view.rules)
-                            .child(
-                                div()
-                                    .id("tree-rules")
-                                    .text_xs()
-                                    .text_color(theme_muted)
-                                    // texts() 只收录 test_text/ObservedText
-                                    .child(rules_summary.clone())
-                                    .test_text(rules_summary),
-                            )
                             .child(
                                 div()
                                     .id("tree-refresh")
@@ -581,10 +564,12 @@ mod tests {
         cx.run_until_parked();
     }
 
-    /// 写 hermetic 规则 (进工作区自己的配置文件 — manager land 时读取)。
+    /// 写 hermetic 规则 (项目根 `.gitignore` + `.git` 标记 —
+    /// 过滤源 = 项目根 git 供给, file-filter-prune D9)。
     fn write_rules(ws: &Path, rules: &[&str]) {
-        let owned: Vec<String> = rules.iter().map(|s| (*s).to_string()).collect();
-        crate::project_model::set_file_tree_rules(ws, owned).unwrap();
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let body: String = rules.iter().map(|s| format!("{s}\n")).collect();
+        std::fs::write(ws.join(".gitignore"), body).unwrap();
     }
 
     /// 注入一个以 `ws` 为根的注册项目 (真实 FileEnumerator 链)。
@@ -1248,7 +1233,7 @@ mod tests {
         .expect("update window");
     }
 
-    /// spec: Refresh re-reads filter rules — 改 marker → ⟳ 生效。
+    /// spec: Refresh re-reads filter rules — 改 .gitignore → ⟳ 生效。
     #[gpui_kit::test]
     fn refresh_rereads_filter_rules(cx: &mut TestAppContext) {
         let (handle, app) = open_app(cx);
@@ -1364,16 +1349,17 @@ mod tests {
         render(handle, cx);
     }
 
-    /// 5.2 (spec: header chrome): header 只读规则摘要随 manager 规则更新。
+    /// dock-layout delta (file-filter-prune): header 摘要位已撤除 —
+    /// 规则源 = 项目根 .gitignore, 头部只保留 标题 + ⟳ + 关闭。
     #[gpui_kit::test]
-    fn header_shows_rule_summary(cx: &mut TestAppContext) {
+    fn header_has_no_rule_summary(cx: &mut TestAppContext) {
         let (handle, app) = open_app(cx);
         let ws = temp_ws("summary");
         std::fs::write(ws.join("summary-a.txt"), "x").unwrap();
         setup_filetree(cx, &app, &ws, Some(&["*.txt"]));
         render(handle, cx);
 
-        let read_summary = |cx: &mut TestAppContext| -> Vec<String> {
+        let read_texts = |cx: &mut TestAppContext| -> Vec<String> {
             cx.update_window(handle, |_, window, _cx| {
                 gpui_kit::base::test_support::texts(window)
                     .iter()
@@ -1382,20 +1368,33 @@ mod tests {
             })
             .expect("update window")
         };
-        let texts = read_summary(cx);
+        // 标题/摘要位按 id 查 (texts() 只收录 test_text 节点 — 原摘要
+        // 用 test_text, 标题与结构性检查走 try_find)
+        cx.update_window(handle, |_, window, _cx| {
+            assert!(
+                window.try_find("tree-title").is_some(),
+                "header 标题在帧 (dock-layout: Header chrome present)"
+            );
+            assert!(
+                window.try_find("tree-rules").is_none(),
+                "摘要位已撤除 (dock-layout delta): tree-rules 不在帧"
+            );
+        })
+        .expect("update window");
+        let texts = read_texts(cx);
         assert!(
-            texts.iter().any(|t| t.contains("过滤: *.txt")),
-            "header 摘要应显示当前生效规则, 实际文本: {texts:?}"
+            !texts.iter().any(|t| t.contains("过滤:")),
+            "摘要位已撤除, 不应出现规则摘要, 实际文本: {texts:?}"
         );
 
-        // 改规则 → ⟳ → 摘要随规则更新 (spec: header chrome)
+        // 刷新后仍无摘要 (规则变化不再映射为头部文本; ⟳ 钮仍在)
         write_rules(&ws, &["*.log"]);
         click_id(handle, "tree-refresh", cx);
         render(handle, cx);
-        let texts = read_summary(cx);
+        let texts = read_texts(cx);
         assert!(
-            texts.iter().any(|t| t.contains("过滤: *.log")),
-            "刷新后摘要应更新为新规则, 实际文本: {texts:?}"
+            !texts.iter().any(|t| t.contains("过滤:")),
+            "刷新后仍无摘要, 实际文本: {texts:?}"
         );
     }
     /// 7.1 全链路 (app × 面板贯通): 打开注册 → 异步枚举落树 → 过滤 →
@@ -1410,8 +1409,8 @@ mod tests {
         std::fs::write(ws1.join("noise.log"), "x").unwrap();
         std::fs::create_dir_all(ws1.join("keepdir")).unwrap();
         std::fs::write(ws1.join("keepdir/child.txt"), "x").unwrap();
-        // 顺序: 先建工作区文件 (创建会写空规则 marker), 再改规则 —
-        // 反了会被 create 覆写
+        // 规则在项目根 .gitignore (file-filter-prune D9), 与 marker
+        // 无涉 — 先建工作区文件后写规则即可
         crate::project_model::create_workspace_files(&ws1).unwrap();
         crate::project_model::append_simple_solution(&ws1, ws1.clone()).unwrap();
         write_rules(&ws1, &["*.log"]);

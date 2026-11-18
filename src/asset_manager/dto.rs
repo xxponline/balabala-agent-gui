@@ -77,8 +77,9 @@ pub enum AssetView {
     Empty,
     /// 模块根枚举失败 — 面板显示降级提示 (命名失败原因)。
     Degraded { message: String },
-    /// 已过滤的完整森林 (一次落地; `rules` = header 只读摘要用)。
-    Forest { rules: Vec<String>, nodes: Vec<AssetNode> },
+    /// 已过滤的完整森林 (一次落地; 过滤规则源 = 项目根 `.gitignore`,
+    /// 不再随视图携带 — design D9, 头部摘要位一并撤除)。
+    Forest { nodes: Vec<AssetNode> },
 }
 
 /// 在视图中按 id 找资产种类 (打开钩子的 kind 依据; 纯遍历)。

@@ -18,7 +18,7 @@ use gpui_kit::*;
 
 use crate::app::TerminalApp;
 use crate::asset_manager::dto::{AssetEffect, AssetKind, AssetMenu, find_kind};
-use crate::project_model::{self, Project};
+use crate::project_model::Project;
 use crate::property_detail_manager::OpenObject;
 
 use super::dto::AssetView;
@@ -176,9 +176,9 @@ impl AssetManager {
 
     /// 一次 spawn 内跑完整条枚举链, 末尾主线程一次 swap (原子 land)。
     fn spawn_enumerate(&mut self, cx: &mut Context<Self>) {
-        let Some(ws_dir) = self.ws_dir.clone() else {
+        if self.ws_dir.is_none() {
             return; // 从未注册 (defensive)
-        };
+        }
         let projects = self.projects.clone();
         let app = self.app.clone();
         #[cfg(test)]
@@ -189,29 +189,23 @@ impl AssetManager {
             let outcome = bg.spawn({
                 let bg = bg.clone();
                 async move {
-                    // 规则读取: 容错 = 空 (启动期坏文件契约在打开路径拦截)
-                    let rules = project_model::load_file_tree_rules(&ws_dir);
-                    // 配方随链携带 (design D2): 每次运行重建 → 刷新重读;
-                    // FileEnumerator 构造时 build 并保存 filter 列表。
-                    let spec = crate::asset_manager::filter::FilterSpec::new(rules.clone());
+                    // 过滤供给在 Project 侧 (design D2/D8): 枚举时判
+                    // git、读 .gitignore、注入 Module — manager 只消费。
                     let mut nodes = Vec::with_capacity(projects.len());
                     for project in &projects {
-                        let node = project
-                            .enumerator(spec.clone())
-                            .enumerate(bg.clone())
-                            .await?;
+                        let node = project.enumerator().enumerate(bg.clone()).await?;
                         nodes.push(node);
                     }
                     // 单一求值权威在扫描期 (design D1): 枚举产物即视图,
-                    // land 前不再有后处理 pass (filter_assets 已删除)。
-                    Ok::<(Vec<String>, Vec<super::dto::AssetNode>), String>((rules, nodes))
+                    // land 前不再有后处理 pass。
+                    Ok::<Vec<super::dto::AssetNode>, String>(nodes)
                 }
             })
             .await;
             // 回主线程: 换 view + 代数 +1, 再经 app 枢纽转发通知
             this.update(cx, |m, _cx| {
                 m.view = match outcome {
-                    Ok((rules, nodes)) => AssetView::Forest { rules, nodes },
+                    Ok(nodes) => AssetView::Forest { nodes },
                     Err(message) => AssetView::Degraded { message },
                 };
                 m.generation += 1;
@@ -245,7 +239,7 @@ mod tests {
     use super::{AssetManager, FUNC_COPY_PATH, FUNC_REVEAL};
     use crate::app::TerminalApp;
     use crate::asset_manager::{AssetKind, AssetNode, AssetView, project_id};
-    use crate::project_model::{self, Project};
+    use crate::project_model::Project;
     use gpui_kit::{
         AppContext, Bounds, Point, TestAppContext, WindowBounds, WindowOptions, px, size,
     };
@@ -347,10 +341,9 @@ mod tests {
         cx.update(|cx| {
             let m = manager.read(cx);
             let view = m.view();
-            let AssetView::Forest { rules, nodes } = &view else {
+            let AssetView::Forest { nodes } = &view else {
                 panic!("应落地 Forest, got {view:?}")
             };
-            assert!(rules.is_empty(), "无规则区段 = 空规则");
             assert_eq!(nodes.len(), 1, "一个注册 project 一行");
             let p = &nodes[0];
             assert_eq!(p.kind, AssetKind::Project);
@@ -423,16 +416,21 @@ mod tests {
         });
     }
 
-    /// spec: Hide matching files in every project — 规则从工作区 marker
-    /// 读入, land 时逐 Project 各自根求值。
+    /// spec: Hide matching files in every project — 规则来自各项目根
+    /// `.gitignore` (供给链: git 判定 + 读取 + 注入), land 时逐
+    /// Project 各自根求值。
     #[gpui_kit::test]
     fn filtering_applies_to_every_project_at_land(cx: &mut TestAppContext) {
         let app = open_app(cx);
         let manager = manager_of(cx, &app);
         let ws = temp_dir("filter-ws");
-        project_model::set_file_tree_rules(&ws, vec!["*.log".to_string()]).unwrap();
         let p1 = ws.join("one");
         let p2 = ws.join("two");
+        // 供给前提: 两个项目各自 git 管理 + 项目根 .gitignore 隐藏 *.log
+        for p in [&p1, &p2] {
+            std::fs::create_dir_all(p.join(".git")).unwrap();
+            std::fs::write(p.join(".gitignore"), "*.log\n").unwrap();
+        }
         touch(&p1.join("a.log"));
         touch(&p1.join("b.rs"));
         touch(&p2.join("a.log"));
@@ -448,10 +446,9 @@ mod tests {
         cx.run_until_parked();
         cx.update(|cx| {
             let view = manager.read(cx).view();
-            let AssetView::Forest { rules, nodes } = &view else {
+            let AssetView::Forest { nodes } = &view else {
                 panic!("应落地 Forest, got {view:?}")
             };
-            assert_eq!(rules, &vec!["*.log".to_string()], "规则随视图携带");
             assert_eq!(nodes.len(), 2, "两个 project 都在");
             for node in nodes {
                 let module = &node.children[0];
@@ -476,11 +473,11 @@ mod tests {
         });
     }
 
-    /// spec: Dependency directories absent — 默认排除经 `FilterSpec`
-    /// 注入的 filter 链, 在全链路 (注册 → 枚举 → land) 生效,
-    /// 且任何深度都不出现。
+    /// spec: Dot entries absent at any depth + Dependency directories
+    /// present by default — dot-only 默认经全链路 (注册 → 枚举 → land)
+    /// 生效; 非 git 项目不读任何 ignore 文件 (design D8)。
     #[gpui_kit::test]
-    fn default_excludes_apply_through_full_chain(cx: &mut TestAppContext) {
+    fn dot_only_default_applies_through_full_chain(cx: &mut TestAppContext) {
         let app = open_app(cx);
         let manager = manager_of(cx, &app);
         let ws = temp_dir("excl-ws");
@@ -488,6 +485,7 @@ mod tests {
         touch(&p.join("src/main.rs"));
         touch(&p.join("node_modules/dep/index.js"));
         touch(&p.join(".git/config"));
+        touch(&p.join(".gitignore")); // dot 缺席, 且非 git 项目本就不读
         touch(&p.join("target/debug/bin"));
         let project = Project::from_root(p.clone());
 
@@ -510,14 +508,55 @@ mod tests {
             for node in nodes {
                 labels_in(node, &mut labels);
             }
-            for excluded in crate::asset_manager::enumerator::EXCLUDES {
-                assert!(
-                    !labels.contains(excluded),
-                    "排除项 {excluded} 泄漏: {labels:?}"
-                );
+            for label in labels.iter() {
+                assert!(!label.starts_with('.'), "dot 条目泄漏: {labels:?}");
             }
+            assert!(
+                labels.contains(&"node_modules"),
+                "六项撤销: 依赖目录默认在场"
+            );
+            assert!(labels.contains(&"target"), "六项撤销: 构建目录默认在场");
             assert!(labels.contains(&"src"), "正常目录保留");
             assert!(labels.contains(&"main.rs"), "正常文件保留");
+        });
+    }
+
+    /// spec: Workspace-owned files are not managed — marker/solutions 在
+    /// 项目根之外的 workspace 目录, 永不入树 (且 dot 名被默认排除双重
+    /// 把守)。
+    #[gpui_kit::test]
+    fn workspace_owned_files_never_in_view(cx: &mut TestAppContext) {
+        let app = open_app(cx);
+        let manager = manager_of(cx, &app);
+        let ws = temp_dir("owned-ws");
+        crate::project_model::create_workspace_files(&ws).unwrap(); // marker + solutions 在 ws 根
+        let p = ws.join("proj");
+        touch(&p.join("main.rs"));
+        let project = Project::from_root(p);
+
+        manager.update(cx, |m, cx| m.register(ws, vec![project], cx));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let view = manager.read(cx).view();
+            let AssetView::Forest { nodes } = &view else {
+                panic!("应落地 Forest, got {view:?}")
+            };
+            fn labels_in<'a>(node: &'a AssetNode, out: &mut Vec<&'a str>) {
+                out.push(&node.label);
+                for child in &node.children {
+                    labels_in(child, out);
+                }
+            }
+            let mut labels = Vec::new();
+            for node in nodes {
+                labels_in(node, &mut labels);
+            }
+            assert!(
+                !labels.contains(&".balabala.workspace.json")
+                    && !labels.contains(&"balabala.solutions.json"),
+                "workspace 自有文件永不入树: {labels:?}"
+            );
+            assert!(labels.contains(&"main.rs"), "项目文件照常");
         });
     }
 
@@ -619,7 +658,6 @@ mod tests {
         // 合成 fixture: Project → Module → (dir, file)
         manager.update(cx, |m, _cx| {
             m.view = AssetView::Forest {
-                rules: Vec::new(),
                 nodes: vec![AssetNode {
                     id: project_id(Path::new("/a/proj")),
                     label: "proj".to_string(),

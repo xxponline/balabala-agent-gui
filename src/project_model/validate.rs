@@ -224,9 +224,10 @@ mod tests {
             serde_json::json!([{ "type": "simple", "path": dir.join("ghost") }]).to_string(),
         )
         .unwrap();
+        // 比较仅限错误值: WorkspaceModel 已随 filter 字段摘 PartialEq
         assert_eq!(
-            load(&dir),
-            Err(ModelError::MissingPath(dir.join("ghost")))
+            load(&dir).err(),
+            Some(ModelError::MissingPath(dir.join("ghost")))
         );
         let _ = fs::remove_dir_all(&dir);
     }

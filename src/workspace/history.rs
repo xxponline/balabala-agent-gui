@@ -5,8 +5,8 @@
 //! 历史是便利数据不是身份数据: 损坏 → 按无历史处理, 不退出 (D4)。
 //!
 //! 一次性迁移: legacy `.workspaces.json` (app 根) 播种历史, `legacy_seeded`
-//! 标志落盘后不再读它做播种 (规则补拷按需另读, 见 `store::legacy_rules_for`;
-//! legacy 文件永不被改写 — workspace-management: Legacy migration)。
+//! 标志落盘后不再读它做播种 (legacy 文件永不被改写 —
+//! workspace-management: Legacy migration)。
 
 use std::path::{Path, PathBuf};
 

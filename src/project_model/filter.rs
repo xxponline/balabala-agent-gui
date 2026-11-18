@@ -1,4 +1,7 @@
-//! gitignore式过滤引擎(design D4/D5)——spec 承诺的子集:
+//! Filter 域(design D2/D3/D4/D5)——归属在 project_model,由
+//! Project 构建、注入 Module,asset_manager 只消费并在扫描期执行。
+//!
+//! gitignore式过滤引擎(design D4)——spec 承诺的子集:
 //! `*`(不跨 `/`)/ `?` / `**` / 路径模式(相对模块根)/ 后写覆盖先写 /
 //! `!` 前缀反悔,外加 gitignore **格式层**:行首 `#` 注释、空行、
 //! CRLF、行尾空白、BOM、尾斜杠 = 只匹配目录(MUSTBEDIR)、裸词 =
@@ -6,20 +9,19 @@
 //! 手写段匹配,不引 globset/regex——字符类 `[]`、转义等超出 spec
 //! 子集的特性**有意不实现**(design Non-Goals)。
 //!
-//! [`FileFilter`] 是枚举期注入的过滤契约(design D2/D3):枚举器对
-//! 每个条目依次求值,**任一命中即排除、目录命中即减支**(无序 OR,
-//! 无跨 filter 反悔)。首批实现:[`GitIgnoreStyleFilter`]、
-//! [`DefaultExcludesFilter`]。
+//! [`FileFilter`] 是过滤契约:枚举器对每个条目依次求值,**任一命中
+//! 即排除、目录命中即减支**(无序 OR,无跨 filter 反悔)。两个实现:
+//! [`DotFilter`](默认硬排除, design D5)、[`GitIgnoreFilter`]
+//! (Project 根 `.gitignore`, design D8)。
 //! 求值:倒序首命中即定(对齐 git `last_matching_pattern_from_list`,
 //! dir.c:1428);规则 flag 对齐 `parse_path_pattern`(dir.c:702)。
 //! 模式语义:相对各模块根(design D7 逐层 `rel_prefix`)——
-//! 单一求值权威在扫描期(design D1,后处理 pass 已删除)。
-use super::enumerator::EXCLUDES;
+//! 单一求值权威在扫描期(design D1)。
 
-/// 枚举期过滤契约(design D3):`rel_path` 用 `/` 分隔、相对枚举根;
-/// `is_dir` 来自 lstat(符号链接 = 文件)。对象安全、`Send`(可入
-/// background spawn),无状态、可注入多个(design D2)。
-pub trait FileFilter: Send {
+/// 过滤契约(design D3):`rel_path` 用 `/` 分隔、相对枚举根;
+/// `is_dir` 来自 lstat(符号链接 = 文件)。对象安全、`Send + Sync`
+/// (经 `Arc` 随 Project 克隆进 bg spawn),无状态、可注入多个。
+pub trait FileFilter: Send + Sync {
     fn is_ignored(&self, rel_path: &str, is_dir: bool) -> bool;
 }
 
@@ -39,7 +41,7 @@ struct Rule {
 
 impl Rule {
     /// 单行编译:剥 `\r` + 裁行尾空白(git `trim_trailing_spaces`;
-    /// 转义空格属非目标)。空行/行首 `#` 由 [`GitIgnoreStyleFilter::compile`] 跳过。
+    /// 转义空格属非目标)。空行/行首 `#` 由 [`GitIgnoreFilter::compile`] 跳过。
     fn compile(raw: &str) -> Option<Rule> {
         let trimmed = raw.strip_suffix('\r').unwrap_or(raw);
         let trimmed = trimmed.trim_end();
@@ -135,15 +137,15 @@ impl Rule {
 }
 
 /// 编译好的 gitignore 规则集(design D4):编译一次、逐条目复用。
-pub struct GitIgnoreStyleFilter {
+pub struct GitIgnoreFilter {
     rules: Vec<Rule>,
 }
 
-impl GitIgnoreStyleFilter {
-    /// 从行数组编译(workspace `file_tree` 配置即行数组)。
+impl GitIgnoreFilter {
+    /// 从行数组编译(每行一条 gitignore 规则)。
     /// 跳过:空行、行首 `#`(注释只认行首)、首行 UTF-8 BOM(git
     /// `add_patterns_from_buffer`, dir.c:1231)。
-    pub fn compile(lines: &[String]) -> GitIgnoreStyleFilter {
+    pub fn compile(lines: &[String]) -> GitIgnoreFilter {
         let mut rules = Vec::new();
         for (i, raw) in lines.iter().enumerate() {
             let mut line = raw.as_str();
@@ -157,19 +159,17 @@ impl GitIgnoreStyleFilter {
                 rules.push(rule);
             }
         }
-        GitIgnoreStyleFilter { rules }
+        GitIgnoreFilter { rules }
     }
 
-    /// 从整段忽略文本编译(按行拆)。
-    /// (bin crate 无外部使用者, 仅测试消费 — 放行未用。)
-    #[allow(dead_code)]
-    pub fn from_text(text: &str) -> GitIgnoreStyleFilter {
+    /// 从整段忽略文本编译(按行拆)—— `.gitignore` 文件内容直接喂入。
+    pub fn from_text(text: &str) -> GitIgnoreFilter {
         let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
         Self::compile(&lines)
     }
 }
 
-impl FileFilter for GitIgnoreStyleFilter {
+impl FileFilter for GitIgnoreFilter {
     /// gitignore 求值:**倒序首命中即定**(对齐 dir.c:1428);
     /// 命中 `!` → 重新纳入;无任何命中 = 放行。
     fn is_ignored(&self, rel_path: &str, is_dir: bool) -> bool {
@@ -182,44 +182,15 @@ impl FileFilter for GitIgnoreStyleFilter {
     }
 }
 
-/// 默认排除表 filter(design D5):包 [`EXCLUDES`],按 rel 末段 label
-/// 判断、文件/目录同判。与用户规则 OR 组合:用户 filter 的 `!` 无法
-/// 跨层反悔,`!node_modules` 救不回 — 与原硬检查逐条目等价。
-pub struct DefaultExcludesFilter;
+/// 默认硬排除 filter(design D5):rel 末段 label 以 `.` 开头 → 忽略
+/// (文件/目录同判、任意深度)。六项名单已撤销;独立 filter、OR 组合、
+/// **无跨层反悔** — `.gitignore` 的 `!.env` 救不回。
+pub struct DotFilter;
 
-impl FileFilter for DefaultExcludesFilter {
+impl FileFilter for DotFilter {
     fn is_ignored(&self, rel_path: &str, _is_dir: bool) -> bool {
         let label = rel_path.rsplit('/').next().unwrap_or(rel_path);
-        EXCLUDES.contains(&label)
-    }
-}
-
-/// 枚举链携带的过滤配方(design D2 修订):`Clone` 逐层转发
-/// (便宜),`FileEnumerator` 构造时据此**构建并保存** filter 列表。
-#[derive(Clone, Debug)]
-pub struct FilterSpec {
-    /// workspace `file_tree` 行数组(gitignore 格式)。
-    pub rules: Vec<String>,
-}
-
-impl FilterSpec {
-    pub fn new(rules: Vec<String>) -> Self {
-        Self { rules }
-    }
-
-    /// 构建 filter 列表(design D5: 组合写死 — 默认排除第一员、
-    /// 用户规则其次;未来新增 filter 类型在此扩)。
-    pub fn build(&self) -> Vec<Box<dyn FileFilter>> {
-        vec![
-            Box::new(DefaultExcludesFilter),
-            Box::new(GitIgnoreStyleFilter::compile(&self.rules)),
-        ]
-    }
-}
-
-impl Default for FilterSpec {
-    fn default() -> Self {
-        Self { rules: Vec::new() }
+        label.starts_with('.')
     }
 }
 
@@ -227,9 +198,9 @@ impl Default for FilterSpec {
 mod tests {
     use super::*;
 
-    fn gitignore(rules: &[&str]) -> GitIgnoreStyleFilter {
+    fn gitignore(rules: &[&str]) -> GitIgnoreFilter {
         let owned: Vec<String> = rules.iter().map(|s| s.to_string()).collect();
-        GitIgnoreStyleFilter::compile(&owned)
+        GitIgnoreFilter::compile(&owned)
     }
 
     #[test]
@@ -313,7 +284,7 @@ mod tests {
         assert!(!r.is_ignored("build", false), "同名文件不中 (MUSTBEDIR)");
         assert!(
             !r.is_ignored("pkg/build/out.js", false),
-            "文件行不中 — 由父目录减支承担 (2.2)"
+            "文件行不中 — 由父目录减支承担"
         );
     }
 
@@ -340,7 +311,7 @@ mod tests {
         assert!(!r.is_ignored("main.rs", false), "spike: 根层 .rs 被 `!` 救回");
         assert!(
             !r.is_ignored("src/a.rs", false),
-            "直接求值可救回 — 但目录已剪, 枚举中永不会被问到 (整支缺席由 2.2 钉)"
+            "直接求值可救回 — 但目录已剪, 枚举中永不会被问到 (整支缺席由扫描测试钉)"
         );
     }
 
@@ -351,7 +322,7 @@ mod tests {
         assert!(r.is_ignored("build", true), "spike: build 目录被 `build/` 命中 → 剪枝");
         assert!(
             !r.is_ignored("build/keep.txt", false),
-            "直接求值可救回 — 剪枝后永不会被问到 (整支缺席由 2.2 钉)"
+            "直接求值可救回 — 剪枝后永不会被问到 (整支缺席由扫描测试钉)"
         );
     }
 
@@ -360,23 +331,25 @@ mod tests {
     #[test]
     fn from_text_parses_gitignore_format_lines() {
         let text = "\u{feff}# 注释行\r\n\r\n   \n*.log\r\nbuild/\n";
-        let r = GitIgnoreStyleFilter::from_text(text);
+        let r = GitIgnoreFilter::from_text(text);
         assert!(r.is_ignored("a.log", false), "CRLF 行解析生效");
         assert!(r.is_ignored("build", true), "尾斜杠行生效");
         assert!(!r.is_ignored("main.rs", false), "注释/空行/空白行不产生规则");
     }
 
-    // ===== DefaultExcludesFilter (design D5) =====
+    // ===== DotFilter (design D5: dot-only 硬默认) =====
 
     #[test]
-    fn default_excludes_match_label_at_any_depth() {
-        let f = DefaultExcludesFilter;
-        assert!(f.is_ignored("node_modules", true), "目录命中");
-        assert!(f.is_ignored("src/deep/node_modules", true), "任意深度命中");
-        assert!(f.is_ignored(".DS_Store", false), "文件形态命中");
-        assert!(f.is_ignored("src/.git", true), ".git 目录");
-        assert!(!f.is_ignored("src/main.rs", false), "非排除项放行");
-        assert!(!f.is_ignored("mynode_modules", false), "label 精确匹配, 非子串");
-        assert!(!f.is_ignored("build.rs", false), "label 不等于排除名则放行");
+    fn dot_filter_hides_dot_entries_at_any_depth() {
+        let f = DotFilter;
+        assert!(f.is_ignored(".git", true), "dot 目录");
+        assert!(f.is_ignored(".gitignore", false), "dot 文件");
+        assert!(f.is_ignored(".DS_Store", false), "dot 文件");
+        assert!(f.is_ignored("src/.cache", true), "任意深度 dot 目录");
+        assert!(f.is_ignored("src/deep/.env", false), "任意深度 dot 文件");
+        assert!(!f.is_ignored("node_modules", true), "六项撤销: 非点名目录放行");
+        assert!(!f.is_ignored("target", true), "六项撤销: 非点名目录放行");
+        assert!(!f.is_ignored("build.rs", false), "非点名文件放行");
+        assert!(!f.is_ignored("src/main.rs", false), "普通文件放行");
     }
 }

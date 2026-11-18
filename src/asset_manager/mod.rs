@@ -9,7 +9,6 @@
 
 pub mod dto;
 pub mod enumerator;
-pub mod filter;
 pub mod manager;
 
 /// 模块公共 API — DTO 家族 + 常用辅助 (部分仅测试与后续 change 消费;

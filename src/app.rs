@@ -22,7 +22,7 @@ use crate::project_model::{self, MarkerStatus, WorkspaceModel};
 use crate::sidebar::{SidebarEvent, SidebarPanel};
 use crate::tree::TreePanel;
 use crate::workspace::history::History;
-use crate::workspace::{Workspace, store};
+use crate::workspace::Workspace;
 
 // Tab 在 Terminal context 下的转发动作: gpui-base 的 Root 全局绑定
 // `tab` → 焦点遍历会吞掉 Tab (原始 key event 不再派发), 更深的
@@ -128,7 +128,7 @@ impl TerminalApp {
         // cfg(test) 关闭 — 仓库根可能残留 legacy 文件, 测试不得读外部状态
         // (hermetic 教训, 2026-11-09)。播种逻辑本体见 store::seed_legacy。
         #[cfg(not(test))]
-        if store::seed_legacy(&mut history, &store::legacy_path()) {
+        if crate::workspace::store::seed_legacy(&mut history, &crate::workspace::store::legacy_path()) {
             if let Err(e) = history.save_at(&history_path) {
                 eprintln!("workspace history save failed: {e}");
             }
@@ -530,8 +530,6 @@ impl TerminalApp {
                 }
                 self.active = None;
                 self.notice = None;
-                // legacy 规则补拷 (配置缺区段时; 失败落红条)
-                self.migrate_legacy_rules(&path);
                 // 历史置顶 (便利数据: 失败仅日志, 不红条 — 非 workspace 配置)
                 let mut history = History::load_at(&self.history_path);
                 history.push(path.clone());
@@ -541,7 +539,7 @@ impl TerminalApp {
                 let projects = model.projects.clone();
                 self.workspace = Some(Workspace::new(path.clone(), model));
                 // 注册进 asset_manager (design D6: 打开 = 全量替换;
-                // 规则已在上面 migrate_legacy_rules 就位 — 注册前规则先到)
+                // 过滤规则由 Project 供给 — file-filter-prune D9)
                 self.asset_manager
                     .update(cx, |m, cx| m.register(path, projects, cx));
             }
@@ -549,18 +547,6 @@ impl TerminalApp {
         cx.notify();
         self.notify_panels(cx);
         true
-    }
-
-    /// legacy `.workspaces.json` 规则补拷 (spec: Legacy migration — 打开时
-    /// 配置缺 `file_tree` 区段才拷; legacy 永不改写)。
-    fn migrate_legacy_rules(&mut self, ws_path: &Path) {
-        if project_model::load_file_tree_rules(ws_path).is_empty() {
-            if let Some(rules) = store::legacy_rules_for(&store::legacy_path(), ws_path) {
-                if let Err(e) = project_model::set_file_tree_rules(ws_path, rules) {
-                    self.save_error = Some(e);
-                }
-            }
-        }
     }
 
     /// 空工作区的 "+ add solution" (spec: Solution creation via path picker):
@@ -861,7 +847,9 @@ impl TerminalApp {
 }
 
 /// 打开探测结果 (纯 fs, 跑在后台执行器 — 不占 app 借用, design D5)。
-#[derive(Debug, Clone, PartialEq)]
+/// (`PartialEq` 随 WorkspaceModel/Project 的 filter 字段改造一并摘除
+/// — 无比较使用点, change file-filter-prune D2)。
+#[derive(Debug, Clone)]
 pub(crate) enum OpenProbe {
     /// 目录不存在 / marker 缺失 → 启动恢复回空态 (不报错; picker 流程
     /// 在此之前已走确认创建分支, 不会进这里)。
