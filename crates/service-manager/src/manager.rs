@@ -19,6 +19,10 @@ use std::time::Duration;
 /// ask 默认超时（Router 持 deadline，D6）。
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 宿主构建指纹（build.rs 固化，与插件侧同一算法）——Loader 装载前比对，
+/// 不匹配**显式拒载**（task 3.2 / design D8、D12 路线甲）。
+pub const HOST_FINGERPRINT: &str = env!("SERVICE_HOST_FINGERPRINT");
+
 /// 服务管理中间层门面（对宿主暴露，**不泄漏 tokio/kameo 类型**，D9）。
 pub struct ServiceManager {
     /// 服务扫描目录（= plugins/ 落点，D8 静态扫描、无 watch）。
@@ -326,6 +330,7 @@ impl ServiceHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use service_core::fingerprint;
     use service_core::{ServiceFuture, ServiceState};
     use std::path::PathBuf;
     use tokio::sync::mpsc;
@@ -453,5 +458,28 @@ mod tests {
         let dir = std::env::temp_dir().join("smf-mgr-missing-dir");
         let mgr = ServiceManager::new(&dir).unwrap();
         assert!(mgr.catalog_names().is_empty());
+    }
+
+    #[test]
+    fn host_fingerprint_is_embedded_and_reproducible() {
+        // build.rs 固化的宿主指纹非空、带格式前缀
+        assert!(
+            HOST_FINGERPRINT.starts_with(fingerprint::FINGERPRINT_PREFIX),
+            "got {HOST_FINGERPRINT}"
+        );
+        // 用同一算法重新计算 (rustc 版本 + 契约源树), 必须与固化值一致
+        // —— 这正是插件侧 build.rs 将执行的同一计算
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let contract = fingerprint::contract_src_from(manifest).expect("workspace contracts/src");
+        let version = fingerprint::rustc_version().expect("rustc --version");
+        let recomputed = fingerprint::compute(&version, Some(&contract)).unwrap();
+        assert_eq!(
+            HOST_FINGERPRINT, recomputed,
+            "宿主指纹可重现 ⇒ 与插件侧可比"
+        );
+        // 一致通过 / 篡改拒载 (报错含 mismatch)
+        fingerprint::verify(HOST_FINGERPRINT, HOST_FINGERPRINT).unwrap();
+        let err = fingerprint::verify("smf-fp1|tampered", HOST_FINGERPRINT).unwrap_err();
+        assert!(err.to_string().contains("mismatch"));
     }
 }

@@ -1,0 +1,8 @@
+[package]
+name = "service-plugin"
+version = "0.1.0"
+edition.workspace = true
+description = "插件侧脚手架: 构建指纹嵌入 (build.rs 模板) + ingress/actor 脚手架 + extern 入口"
+
+[dependencies]
+service-core = { path = "../service-core" }

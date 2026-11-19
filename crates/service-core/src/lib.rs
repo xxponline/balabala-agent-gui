@@ -15,6 +15,7 @@
 
 pub mod envelope;
 pub mod error;
+pub mod fingerprint;
 pub mod route;
 pub mod service;
 pub mod state;

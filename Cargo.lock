@@ -7248,6 +7248,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "service-plugin"
+version = "0.1.0"
+dependencies = [
+ "service-core",
+]
+
+[[package]]
 name = "sha1_smol"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

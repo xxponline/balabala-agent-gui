@@ -10,6 +10,10 @@ libloading = "0.8"
 kameo = "0.22.2"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
 
+[build-dependencies]
+# 宿主指纹与插件侧同一算法 (task 3.2)
+service-core = { path = "../service-core" }
+
 [dev-dependencies]
 # 非 tokio executor: 验证 call() 返回的 future executor-agnostic (task 4.1)
 futures = "0.3"
