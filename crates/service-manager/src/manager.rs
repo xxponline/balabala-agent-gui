@@ -38,11 +38,14 @@ pub struct ServiceManager {
     /// 参与者 id 分配（服务实例与宿主参与者共用计数）。
     next_id: AtomicU64,
     /// 中间层自建自持运行时（D9：对外不泄漏 tokio）。
-    /// loader（task 3.3）接入前仅构造期使用，属预期。
-    #[allow(dead_code)]
     runtime: LayerRuntime,
     /// 中心路由（全部消息过 Router，D3）。
     router: Arc<Router>,
+    /// DLL 库缓存：`ManuallyDrop` ⇒ **永不 dlclose**（D8 真回收 = 进程重启）。
+    /// 不驱逐：同路径重载复用首载句柄（产物替换需重启进程才生效）。
+    pub(crate) libs: Mutex<std::collections::HashMap<PathBuf, Arc<std::mem::ManuallyDrop<libloading::Library>>>>,
+    /// 在跑 driver 的控制柄（每实例至多一个；enable/retry 换新代）。
+    pub(crate) drivers: Mutex<std::collections::HashMap<InstanceId, crate::loader::DriverControl>>,
 }
 
 impl ServiceManager {
@@ -72,6 +75,8 @@ impl ServiceManager {
             supervisor: Arc::new(supervisor),
             runtime,
             router,
+            libs: Mutex::new(std::collections::HashMap::new()),
+            drivers: Mutex::new(std::collections::HashMap::new()),
         };
         mgr.rebuild_catalog()?;
         Ok(mgr)
@@ -235,8 +240,6 @@ impl ServiceManager {
     }
 
     /// 中间层后台任务（driver/测试响应者；crate 内部，不对外暴露 tokio 类型）。
-    /// loader（task 3.3）接入 driver 后为常规路径。
-    #[allow(dead_code)]
     pub(crate) fn spawn_bg<F>(&self, fut: F) -> tokio::task::JoinHandle<F::Output>
     where
         F: std::future::Future + Send + 'static,

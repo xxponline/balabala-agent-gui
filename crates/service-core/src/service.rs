@@ -63,13 +63,17 @@ pub type ServiceFactory = fn(ServiceCtx) -> Box<dyn Service>;
 
 /// DLL 服务工厂（`ServiceOrigin::Dll`：dlopen 取 [`CREATE_SYMBOL`] 符号）。
 ///
+/// 用 `C-unwind` 而非 `C`：插件工厂与宿主同仓同编译（D11 "一起编译"），
+/// panic 可以安全地穿回宿主并被 `catch_unwind` 接住（= `LoadError::FactoryPanic`）；
+/// `extern "C"` 的 unwind-out 会 abort，故显式选 `C-unwind`。
+///
 /// # Safety
 /// 跨 cdylib 边界返回 `Box<dyn Service>` 依赖"同次编译 + 构建指纹校验"
 /// （D12 路线甲）；vtable/代码位于插件内，与"永不 dlclose"（D8）绑定。
 /// FFI-safety 警告是有意接受的：两侧同 rustc 同次构建（由 D8 指纹兜底），
-/// 胖指针（data + vtable）经 extern "C" sret 返回在同编译器下形状一致。
+/// 胖指针（data + vtable）经 sret 返回在同编译器下形状一致。
 #[allow(improper_ctypes_definitions)]
-pub type DllServiceFactory = unsafe extern "C" fn(ServiceCtx) -> Box<dyn Service>;
+pub type DllServiceFactory = unsafe extern "C-unwind" fn(ServiceCtx) -> Box<dyn Service>;
 
 /// 插件必须导出的工厂符号名。
 pub const CREATE_SYMBOL: &[u8] = b"service_create";

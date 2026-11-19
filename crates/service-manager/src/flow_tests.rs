@@ -421,3 +421,297 @@ fn router_and_manager_types_are_publicly_usable_without_tokio_names() {
     }
     let _ = takes_public_types as fn(&ServiceManager, &crate::Listener, &Router, &Envelope, &Payload, &RouteError);
 }
+
+// ---------------- task 3.3: Loader (内部服务路径; DLL 载荷见 5.2) ----------------
+
+use crate::LoadError;
+use service_core::{Service, ServiceCtx, ServiceFuture};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 会回 ask 的假服务（内部服务测试载体）。
+struct AskEcho {
+    ctx: ServiceCtx,
+}
+
+impl Service for AskEcho {
+    fn start(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn handle(&mut self, env: Envelope) -> ServiceFuture<'_> {
+        if env.corr.is_some() {
+            let _ = self
+                .ctx
+                .messaging
+                .reply(&env, "pong", Payload::new(format!("echo:{}", env.kind)));
+        }
+        Box::pin(std::future::ready(()))
+    }
+}
+
+fn echo_factory(ctx: ServiceCtx) -> Box<dyn Service> {
+    Box::new(AskEcho { ctx })
+}
+
+/// init 失败可控的假服务（仅本测试读写此开关，无并行冲突）。
+static FLAKY_FAIL: AtomicBool = AtomicBool::new(true);
+
+struct Flaky;
+
+impl Service for Flaky {
+    fn start(&mut self) -> Result<(), String> {
+        if FLAKY_FAIL.load(Ordering::SeqCst) {
+            Err("init boom".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn handle(&mut self, _env: Envelope) -> ServiceFuture<'_> {
+        Box::pin(std::future::ready(()))
+    }
+}
+
+fn flaky_factory(_ctx: ServiceCtx) -> Box<dyn Service> {
+    Box::new(Flaky)
+}
+
+#[test]
+fn task_3_3_internal_load_reaches_available_and_serves_asks() {
+    let mgr = test_manager();
+    mgr.register_internal("echo", echo_factory).unwrap();
+
+    let id = mgr.load(&"echo".into()).unwrap();
+    // 创建即 loading; driver init 极快, 断言容忍已翻转 available
+    // (loading→available 的纯转移由 supervisor 单测钉死)
+    assert!(
+        matches!(
+            mgr.supervisor().state_of(id),
+            Some(ServiceState::Loading | ServiceState::Available)
+        ),
+        "load 后在 loading/available (spec L5)"
+    );
+    assert!(
+        wait_until(
+            || mgr.supervisor().state_of(id) == Some(ServiceState::Available),
+            Duration::from_secs(2)
+        ),
+        "init ok → available"
+    );
+
+    // 装载后的实例可被 ask
+    let env = Envelope::new(Route::Instance(id), caller_addr(&mgr), "ping", Payload::new(()));
+    let reply = futures::executor::block_on(mgr.call(env)).expect("ask 成功");
+    let echoed: &String = reply.downcast().unwrap();
+    assert_eq!(echoed, "echo:ping");
+}
+
+#[test]
+fn task_3_3_missing_catalog_entry_is_rejected() {
+    // 内部服务: Catalog 查无 → 拒 (这同时是 task 3.1 的第 4 验证断言)
+    let mgr = test_manager();
+    mgr.register_internal("echo", echo_factory).unwrap();
+    assert!(mgr.has_service(&"echo".into()));
+
+    let err = mgr.load(&"missing".into()).expect_err("Catalog 查无 → 拒");
+    assert!(matches!(err, LoadError::NoSuchService(_)), "got {err:?}");
+    assert!(err.to_string().contains("no such service"), "报错可读: {err}");
+
+    // L2 场景: DLL 条目被删 + reload → 拒绝新 load (catalog 门先于 dlopen)
+    let dir = std::env::temp_dir().join(format!("smf-ghost-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("libghost.dylib"), b"").unwrap();
+    let mgr2 = ServiceManager::new(&dir).unwrap();
+    assert!(mgr2.has_service(&"ghost".into()));
+    std::fs::remove_file(dir.join("libghost.dylib")).unwrap();
+    mgr2.reload_catalog().unwrap();
+    let err = mgr2.load(&"ghost".into()).expect_err("条目消失 → 拒");
+    assert!(matches!(err, LoadError::NoSuchService(_)));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn task_3_3_init_failure_lands_in_error_and_retry_recovers() {
+    let mgr = test_manager();
+    FLAKY_FAIL.store(true, Ordering::SeqCst);
+    mgr.register_internal("flaky", flaky_factory).unwrap();
+
+    let id = mgr.load(&"flaky".into()).unwrap();
+    assert!(
+        wait_until(
+            || mgr.supervisor().state_of(id) == Some(ServiceState::Error),
+            Duration::from_secs(2)
+        ),
+        "init 失败 → error (spec L5)"
+    );
+    // error 态消息 fail-fast
+    assert!(!mgr.supervisor().allows_delivery(id));
+
+    // 显式 retry → loading → available (FLAKY_FAIL 关掉)
+    FLAKY_FAIL.store(false, Ordering::SeqCst);
+    mgr.retry(id).unwrap();
+    // retry 后处于 loading (或 driver 极快已完成 → available)
+    assert!(
+        matches!(
+            mgr.supervisor().state_of(id),
+            Some(ServiceState::Loading | ServiceState::Available)
+        ),
+        "retry → loading"
+    );
+    assert!(
+        wait_until(
+            || mgr.supervisor().state_of(id) == Some(ServiceState::Available),
+            Duration::from_secs(2)
+        ),
+        "retry 后 init 成功 → available"
+    );
+    FLAKY_FAIL.store(true, Ordering::SeqCst); // 复位
+}
+
+#[test]
+fn task_3_3_disable_enable_round_trip_through_loader() {
+    let mgr = test_manager();
+    mgr.register_internal("echo", echo_factory).unwrap();
+    let id = mgr.load(&"echo".into()).unwrap();
+    assert!(wait_until(
+        || mgr.supervisor().state_of(id) == Some(ServiceState::Available),
+        Duration::from_secs(2)
+    ));
+
+    mgr.disable(id).unwrap();
+    assert_eq!(mgr.supervisor().state_of(id), Some(ServiceState::Offline));
+    // offline → fail-fast (tell 死信 / ask 即拒)
+    let env = Envelope::new(Route::Instance(id), caller_addr(&mgr), "t", Payload::new(()));
+    assert_eq!(
+        mgr.tell(env).unwrap_err(),
+        RouteError::TargetNotAvailable(ServiceState::Offline)
+    );
+
+    mgr.enable(id).unwrap();
+    assert!(
+        matches!(
+            mgr.supervisor().state_of(id),
+            Some(ServiceState::Loading | ServiceState::Available)
+        ),
+        "enable → loading"
+    );
+    assert!(wait_until(
+        || mgr.supervisor().state_of(id) == Some(ServiceState::Available),
+        Duration::from_secs(2)
+    ));
+    let env = Envelope::new(Route::Instance(id), caller_addr(&mgr), "q", Payload::new(()));
+    let reply = futures::executor::block_on(mgr.call(env)).expect("重新可用");
+    assert!(reply.downcast::<String>().is_some());
+}
+
+#[test]
+fn task_3_3_unload_removes_instance_but_never_dlclose() {
+    let mgr = test_manager();
+    mgr.register_internal("echo", echo_factory).unwrap();
+    let id = mgr.load(&"echo".into()).unwrap();
+    assert!(wait_until(
+        || mgr.supervisor().state_of(id) == Some(ServiceState::Available),
+        Duration::from_secs(2)
+    ));
+
+    // available 不可删 (spec L5: 删除仅限 error)
+    assert!(matches!(
+        mgr.delete(id),
+        Err(crate::TransitionError::DeleteNotAllowed { .. })
+    ));
+
+    // unload = 停用 + 移出实例表 (spec L4)
+    mgr.unload(id).unwrap();
+    assert!(mgr.supervisor().state_of(id).is_none(), "实例表无该 id");
+    assert!(mgr.instances.lock().unwrap().get(id).is_none());
+    let env = Envelope::new(Route::Instance(id), caller_addr(&mgr), "q", Payload::new(()));
+    assert_eq!(mgr.tell(env).unwrap_err(), RouteError::NoSuchRoute, "已卸载不可达");
+
+    // 内部服务无库; DLL 库缓存断言见 5.2 (真 dlopen 载荷)
+    assert!(mgr.loaded_library_paths().is_empty());
+
+    // 重复 unload → NoSuchInstance
+    assert!(matches!(mgr.unload(id), Err(crate::TransitionError::NoSuchInstance(_))));
+}
+
+#[test]
+fn task_3_3_multi_instance_internal_service() {
+    let mgr = test_manager();
+    mgr.register_internal("echo", echo_factory).unwrap();
+    let a = mgr.load(&"echo".into()).unwrap();
+    let b = mgr.load(&"echo".into()).unwrap();
+    assert_ne!(a, b, "同服务两实例");
+    assert!(wait_until(
+        || {
+            mgr.supervisor().state_of(a) == Some(ServiceState::Available)
+                && mgr.supervisor().state_of(b) == Some(ServiceState::Available)
+        },
+        Duration::from_secs(2)
+    ));
+
+    // Any 挑一个 available 实例
+    let env = Envelope::new(
+        Route::Service("echo".into(), SelectPolicy::Any),
+        caller_addr(&mgr),
+        "fanout",
+        Payload::new(()),
+    );
+    let reply = futures::executor::block_on(mgr.call(env)).expect("Any 可用");
+    assert!(reply.downcast::<String>().is_some());
+
+    // Direct 断言: 实例属于该服务
+    let env = Envelope::new(
+        Route::Service("echo".into(), SelectPolicy::Direct(a)),
+        caller_addr(&mgr),
+        "direct",
+        Payload::new(()),
+    );
+    futures::executor::block_on(mgr.call(env)).expect("Direct 命中");
+}
+
+#[test]
+fn task_3_4_driver_panic_reports_crash_without_auto_restart() {
+    struct Bomb;
+    impl Service for Bomb {
+        fn start(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn handle(&mut self, _env: Envelope) -> ServiceFuture<'_> {
+            panic!("service exploded");
+        }
+    }
+    fn bomb_factory(_ctx: ServiceCtx) -> Box<dyn Service> {
+        Box::new(Bomb)
+    }
+
+    let mgr = test_manager();
+    mgr.register_internal("bomb", bomb_factory).unwrap();
+    let id = mgr.load(&"bomb".into()).unwrap();
+    assert!(wait_until(
+        || mgr.supervisor().state_of(id) == Some(ServiceState::Available),
+        Duration::from_secs(2)
+    ));
+
+    // 打一条消息 → handle panic → driver JoinErr → monitor 上报 crash
+    let env = Envelope::new(Route::Instance(id), caller_addr(&mgr), "boom", Payload::new(()));
+    mgr.tell(env).unwrap();
+
+    assert!(
+        wait_until(
+            || mgr.supervisor().state_of(id) == Some(ServiceState::Error),
+            Duration::from_secs(3)
+        ),
+        "crash → error (D7 只上报)"
+    );
+    // 不自动拉起: 状态稳定在 error, 实例数不变, 无新 driver
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(mgr.supervisor().state_of(id), Some(ServiceState::Error), "无自动重启");
+    assert_eq!(mgr.instances.lock().unwrap().service_count(), 1, "无新实例");
+    // 消息 fail-fast
+    assert!(!mgr.supervisor().allows_delivery(id));
+    let env = Envelope::new(Route::Instance(id), caller_addr(&mgr), "q", Payload::new(()));
+    assert_eq!(
+        mgr.tell(env).unwrap_err(),
+        RouteError::TargetNotAvailable(ServiceState::Error)
+    );
+}

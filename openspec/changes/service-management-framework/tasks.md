@@ -25,7 +25,7 @@
 
 ## 3. service-manager：Catalog / Loader / Supervisor
 
-- [ ] 3.1 Scanner + Catalog：启动扫服务目录建表；内部服务显式注册与 DLL
+- [x] 3.1 Scanner + Catalog：启动扫服务目录建表；内部服务显式注册与 DLL
       条目同表（`ServiceDescriptor { name, origin: Internal(fn)|Dll(path),
       meta }`）；`reload_catalog()` 只影响未来 load、不动实例表、同名新条目
       替换旧条目。验证：单测——扫描建表、内部/DLL 同表、reload 替换条目但
@@ -38,7 +38,7 @@
       实例 = 1 次 dlopen + N 次创建（`Arc<Library>` 共享）；unload = 停用 +
       移出实例表、**不 dlclose**，API 文档明示"停用"语义。验证：集成测试
       （示例插件）——两实例同库句柄；unload 后实例表无该 id 且库仍驻留。
-- [ ] 3.4 Supervisor 状态机：每实例状态与全部转移（load→loading、init
+- [x] 3.4 Supervisor 状态机：每实例状态与全部转移（load→loading、init
       ok→available、init 失败→error、disable→offline、enable→loading、
       crash→error、retry→loading）；删实例仅限 error；**禁用 kameo 自动
       restart**（on_failure 只上报）。验证：单测覆盖每个转移 + "crash 后
