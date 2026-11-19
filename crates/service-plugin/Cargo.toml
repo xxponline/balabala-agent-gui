@@ -6,3 +6,11 @@ description = "插件侧脚手架: 构建指纹嵌入 (build.rs 模板) + ingres
 
 [dependencies]
 service-core = { path = "../service-core" }
+# 插件侧服务本体是 kameo actor (D1); kameo/tokio 类型对插件作者可见 (D9 边界)
+kameo = "0.22.2"
+# 脚手架需要 tokio::runtime::Handle (enter 宿主上下文, D12 边界发现);
+# 版本与宿主/kameo 统一 (同一 workspace 构建, 指纹校验兑底)
+# ⚠ features 必须与另一侧 (service-manager / service-plugin / example-plugin) 完全一致:
+# tokio 须是 host 与 dylib 的**同一编译单元**, 否则 TypeId 分叉、
+# ServiceCtx::runtime_token downcast 失败 (D12 边界, 已踩)。
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }

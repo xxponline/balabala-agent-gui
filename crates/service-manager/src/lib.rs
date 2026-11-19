@@ -30,7 +30,7 @@ pub use catalog::{Catalog, ServiceDescriptor, ServiceMeta, ServiceOrigin};
 pub use instance::{Instances, Participant};
 pub use listener::Listener;
 pub use loader::{LoadError, INSTANCE_OUTLET_BOUND};
-pub use manager::{ServiceError, ServiceHandle, ServiceManager};
+pub use manager::{ServiceError, ServiceHandle, ServiceManager, HOST_FINGERPRINT};
 pub use router::{DeadLetterRecord, Router, TraceDirection, TraceEntry};
 pub use scanner::{scan, ScanError, PLUGIN_EXTENSIONS};
 pub use supervisor::{Action, Supervisor, TransitionError};

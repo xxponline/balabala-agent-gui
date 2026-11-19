@@ -8,6 +8,9 @@ description = "服务管理框架: Router/Scanner/Loader/Supervisor + 自建 tok
 service-core = { path = "../service-core" }
 libloading = "0.8"
 kameo = "0.22.2"
+# ⚠ features 必须与另一侧 (service-manager / service-plugin / example-plugin) 完全一致:
+# tokio 须是 host 与 dylib 的**同一编译单元**, 否则 TypeId 分叉、
+# ServiceCtx::runtime_token downcast 失败 (D12 边界, 已踩)。
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
 
 [build-dependencies]
@@ -17,3 +20,6 @@ service-core = { path = "../service-core" }
 [dev-dependencies]
 # 非 tokio executor: 验证 call() 返回的 future executor-agnostic (task 4.1)
 futures = "0.3"
+# 仅集成测试载荷 (D12 round-trip 要求宿主与插件认识同一契约类型);
+# **lib 依赖面不因此改变**: cargo tree (normal edges) 仍无 manager -> contracts
+contracts = { path = "../contracts" }

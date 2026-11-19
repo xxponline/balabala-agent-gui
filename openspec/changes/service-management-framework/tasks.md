@@ -30,11 +30,11 @@
       meta }`）；`reload_catalog()` 只影响未来 load、不动实例表、同名新条目
       替换旧条目。验证：单测——扫描建表、内部/DLL 同表、reload 替换条目但
       在跑实例不受影响、已删条目拒绝新 load。
-- [ ] 3.2 构建指纹：`service-plugin` 提供 build.rs 模板嵌入指纹（rustc
+- [x] 3.2 构建指纹：`service-plugin` 提供 build.rs 模板嵌入指纹（rustc
       版本 + 契约元数据哈希）并导出固定符号；Loader 在 create 前比对宿主
       指纹，不匹配显式拒载（落 error/诊断）。验证：单测——指纹一致通过、
       篡改指纹的产物被拒且报错信息含 mismatch。
-- [ ] 3.3 Loader：load()/unload() 流程按 origin 分支取符号；同一 DLL 多
+- [x] 3.3 Loader：load()/unload() 流程按 origin 分支取符号；同一 DLL 多
       实例 = 1 次 dlopen + N 次创建（`Arc<Library>` 共享）；unload = 停用 +
       移出实例表、**不 dlclose**，API 文档明示"停用"语义。验证：集成测试
       （示例插件）——两实例同库句柄；unload 后实例表无该 id 且库仍驻留。
@@ -65,10 +65,10 @@
 
 ## 5. service-plugin + 示例插件（D12 边界载体）
 
-- [ ] 5.1 `service-plugin`：插件侧 ingress/actor 脚手架 + extern 入口模板
+- [x] 5.1 `service-plugin`：插件侧 ingress/actor 脚手架 + extern 入口模板
       （typed extern fn 递 `&Msg` 的形状按 D12 路线乙预留接口）。
       验证：示例插件 cdylib 编译通过并可被扫描装载。
-- [ ] 5.2 D12 钉死测试：真 dlopen 示例插件后 round-trip 一个 Typed
+- [x] 5.2 D12 钉死测试：真 dlopen 示例插件后 round-trip 一个 Typed
       payload 并断言 downcast 成功；另加指纹不匹配拒载用例。
       验证：`cargo test` 集成测试绿（含 `plugins/` 产物构建脚本）。
 

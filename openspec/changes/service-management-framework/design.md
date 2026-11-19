@@ -46,6 +46,8 @@
 - 边界立场：一起编译 ⇒ 不预付兼容成本；契约 crate 的类型可直接过边界。
   将来接第三方：在插件侧加 Bridge 把契约降级为 C-ABI + 序列化，信封与 Router
   不动。
+- 实施补记：插件内 kameo actor 的生命周期由宿主 runtime 驱动（`spawn_task` +
+  逐 poll enter），插件侧不自调 `tokio::spawn`——机制细节见 D12 边界发现。
 - 备选（否决）：边界一律 C-ABI + bytes —— 在"一起编译"前提下是提前付费；
   边界一律共享 tokio actor 类型 —— 耦合运行时细节，且仍绕不开 ABI 问题。
 
@@ -270,6 +272,23 @@ balabala-agent-gui/  (workspace)
     闭包（契约类型已知），编好后以 typed extern fn 递 `&Msg` 进插件，
     插件侧永不碰 Any/TypeId。
 - 甲先行、接口形状为乙预留；甲的测试失败即触发切乙，不改信封与 Router。
+
+**实施期发现（spike 落地补记，两个新边界）：**
+
+1. **tokio/kameo 的 ambient 上下文是“每份二进制副本各自的 thread-local”**：
+   插件 dylib 里调 `tokio::spawn` 看不到宿主 runtime（panic “no reactor”）。
+   解法（已入 service-plugin 脚手架）：
+   - kameo actor 生命周期改用 `prepare()` + `run()` —— run-future 经
+     `Messaging::spawn_task` **由宿主 runtime 驱动**，插件侧不自建任务；
+   - 插件侧一切可能触发 `tokio::spawn`/timer 的 poll 用 `Handle::enter`
+     逐次包住（`EnterFut` 组合子），Handle 经 `ServiceCtx::runtime_token`
+     （`RuntimeToken::handle_ptr` 裸指针）传递。
+2. **依赖链可变的类型不得跨边界作 TypeId 用途**：tokio 依赖 proc-macro 链
+   （syn/quote），其 metadata 随 cargo **解析范围**变化（workspace vs `-p`
+   构建 syn feature 不同 → tokio 编两份 → TypeId 分叉 → downcast 静默失败，
+   实测复现）。故 runtime token 走裸指针（同 rustc/同版本/同 target ⇒ 布局
+   一致，与甲路线“一起编译”前提同源）；**契约 crate 必须保持零依赖**
+   （metadata 确定）才能继续享受跨界 TypeId —— 这也是 D2 零依赖的隐性红利。
 
 ## Risks / Trade-offs
 

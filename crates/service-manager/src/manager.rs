@@ -37,8 +37,8 @@ pub struct ServiceManager {
     pub(crate) supervisor: Arc<Supervisor>,
     /// 参与者 id 分配（服务实例与宿主参与者共用计数）。
     next_id: AtomicU64,
-    /// 中间层自建自持运行时（D9：对外不泄漏 tokio）。
-    runtime: LayerRuntime,
+    /// 中间层自建自持运行时（D9：对外不泄漏 tokio；loader 经 `runtime_token` 取句柄）。
+    pub(crate) runtime: LayerRuntime,
     /// 中心路由（全部消息过 Router，D3）。
     router: Arc<Router>,
     /// DLL 库缓存：`ManuallyDrop` ⇒ **永不 dlclose**（D8 真回收 = 进程重启）。
@@ -160,6 +160,14 @@ impl ServiceManager {
         &self.scan_dir
     }
 
+    /// 当前服务实例数（不含宿主参与者；观测口，GUI/测试用）。
+    pub fn instance_count(&self) -> usize {
+        self.instances
+            .lock()
+            .expect("instances poisoned")
+            .service_count()
+    }
+
     /// 每实例状态机（task 3.4）。
     pub fn supervisor(&self) -> &Arc<Supervisor> {
         &self.supervisor
@@ -214,6 +222,7 @@ impl ServiceManager {
         ServiceHandle {
             router: self.router.clone(),
             self_addr: Address::instance(self_id),
+            supervisor: Arc::clone(&self.supervisor),
         }
     }
 
@@ -274,6 +283,7 @@ impl std::error::Error for ServiceError {}
 pub struct ServiceHandle {
     router: Arc<Router>,
     self_addr: Address,
+    supervisor: Arc<Supervisor>,
 }
 
 impl ServiceHandle {
@@ -328,6 +338,24 @@ impl ServiceHandle {
         };
         self.router.send(env)
     }
+
+    /// 接收方 downcast 失败 → 死信 `TypeMismatch`（spec R1；D5：接收方契约
+    /// bug 不是路由错误）。
+    pub fn reject(&self, env: &Envelope) -> Result<(), RouteError> {
+        self.router.record_reject(env);
+        Ok(())
+    }
+
+    /// 把后台 future 交宿主 runtime 驱动；panic 按 crash 上报
+    /// （kameo actor 生命周期即走此路——插件侧零 tokio TLS，D12 边界发现）。
+    pub fn spawn_task(&self, fut: service_core::TaskFuture) {
+        let join = self.router.spawn(fut);
+        let _ = self.router.spawn(crate::loader::watch_for_crash(
+            Arc::clone(&self.supervisor),
+            self.self_addr.instance_id(),
+            join,
+        ));
+    }
 }
 
 /// [`ServiceHandle`] 即宿主侧 [`Messaging`] 实现：经 `ServiceCtx` 注入服务
@@ -356,6 +384,14 @@ impl Messaging for ServiceHandle {
         payload: Payload,
     ) -> Result<(), RouteError> {
         ServiceHandle::reply(self, req, kind, payload)
+    }
+
+    fn reject(&self, env: &Envelope) -> Result<(), RouteError> {
+        ServiceHandle::reject(self, env)
+    }
+
+    fn spawn_task(&self, fut: service_core::TaskFuture) {
+        ServiceHandle::spawn_task(self, fut)
     }
 }
 

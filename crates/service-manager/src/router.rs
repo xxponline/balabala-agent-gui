@@ -371,7 +371,23 @@ impl Router {
         Ok(corr)
     }
 
+    /// 在 layer runtime 上驱动一个 future（宿主代跑——插件侧 spawn 经
+    /// `Messaging::spawn_task` 汇聚于此，D12 边界发现：tokio ambient 上下文
+    /// 是每份二进制副本各自的 TLS，插件看不到宿主 runtime）。
+    pub(crate) fn spawn<F>(&self, fut: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.inner.handle.spawn(fut)
+    }
+
     // ---------- 订阅 (订阅塌缩成路由, D7/D9) ----------
+
+    /// 接收方拒收记录（downcast 失败 → 死信 `TypeMismatch`，spec R1）。
+    pub(crate) fn record_reject(&self, env: &Envelope) {
+        self.record_dead(env, DeadLetterReason::TypeMismatch);
+    }
 
     /// 订阅目标实例的状态翻转：加一条"翻转事件投到 subscriber 地址"的路由规则。
     pub fn subscribe_state(&self, target: InstanceId, subscriber: InstanceId) {

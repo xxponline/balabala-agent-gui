@@ -7,6 +7,11 @@
 //! 本 change 落地内容：
 //! - [`build`]：构建指纹嵌入模板（task 3.2）——插件 build.rs 调用，
 //!   生成 `SERVICE_CONTRACT_FINGERPRINT` 导出符号；
-//! - ingress / actor 脚手架 / extern 入口模板（task 5.1）。
+//! - [`actor`]：kameo actor 脚手架（`ActorService` + `Ingress`），
+//!   外加 D12 路线乙的 typed extern fn 预留形状（task 5.1）。
+//! - extern 入口模板：见 [`actor`] 文档与 `crates/example-plugin` 实例。
 
+pub mod actor;
 pub mod build;
+
+pub use actor::{actor_service, ActorService, Ingress, IngressFuture, TypedIngress};

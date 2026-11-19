@@ -1923,6 +1923,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-plugin"
+version = "0.1.0"
+dependencies = [
+ "contracts",
+ "kameo",
+ "service-core",
+ "service-plugin",
+ "tokio",
+]
+
+[[package]]
 name = "exr"
 version = "1.74.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7240,6 +7251,7 @@ dependencies = [
 name = "service-manager"
 version = "0.1.0"
 dependencies = [
+ "contracts",
  "futures",
  "kameo",
  "libloading",
@@ -7251,7 +7263,9 @@ dependencies = [
 name = "service-plugin"
 version = "0.1.0"
 dependencies = [
+ "kameo",
  "service-core",
+ "tokio",
 ]
 
 [[package]]

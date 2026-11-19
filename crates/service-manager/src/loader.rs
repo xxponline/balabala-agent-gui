@@ -12,7 +12,7 @@
 
 use crate::instance::Participant;
 use crate::manager::{ServiceManager, HOST_FINGERPRINT};
-use crate::supervisor::{Action, TransitionError};
+use crate::supervisor::{Action, Supervisor, TransitionError};
 use service_core::{
     fingerprint, DllServiceFactory, InstanceId, Service, ServiceCtx, ServiceName, ServiceState,
     CREATE_SYMBOL, FINGERPRINT_SYMBOL,
@@ -118,6 +118,12 @@ impl ServiceManager {
         Ok(id)
     }
 
+    /// 运行时句柄的不透明载体（插件脚手架按裸指针取 `Handle` 并 enter；
+    /// 为何不用 TypeId 见 `service_core::RuntimeToken` 文档）。
+    pub(crate) fn runtime_token(&self) -> Arc<dyn service_core::RuntimeToken> {
+        Arc::new(HostHandle(self.runtime.handle().clone()))
+    }
+
     /// 按 origin 创建服务对象（内部 vs DLL 唯一差异点，D8）。
     /// 返回 `(服务, Some((库路径, Arc<Library>)))`。
     fn create_service(
@@ -133,6 +139,7 @@ impl ServiceManager {
             instance: id,
             service,
             messaging,
+            runtime_token: self.runtime_token(),
         };
         match origin {
             crate::catalog::ServiceOrigin::Internal(factory) => {
@@ -232,6 +239,7 @@ impl ServiceManager {
             instance: id,
             service: name,
             messaging,
+            runtime_token: self.runtime_token(),
         };
         let created = match &origin {
             crate::catalog::ServiceOrigin::Internal(factory) => {
@@ -340,26 +348,45 @@ impl ServiceManager {
             }
         });
 
-        // monitor: 观察 driver 出口
-        let supervisor = Arc::clone(&self.supervisor);
-        let _ = self.spawn_bg(async move {
-            match join.await {
-                Ok(DriverExit::Stopped) | Ok(DriverExit::Closed) | Ok(DriverExit::InitFailed) => {
-                    // 主动停用/关闭/init失败: 状态已由相应方设置, 不重复上报
-                }
-                Err(join_err) if join_err.is_panic() => {
-                    // crash → 只上报, **不自动拉起** (D7): 重建只能显式 retry/enable
-                    let state = supervisor.state_of(id);
-                    let action = match state {
-                        Some(ServiceState::Loading) => Action::InitErr, // start/handle 期 panic 未过 loading
-                        _ => Action::Crash,
-                    };
-                    let _ = supervisor.apply(id, action);
-                }
-                Err(_) => {} // runtime shutdown 取消
-            }
-        });
+        // monitor: 观察 driver 出口 (crash 只上报不拉起, D7)
+        let _ = self.spawn_bg(watch_for_crash(
+            Arc::clone(&self.supervisor),
+            id,
+            join,
+        ));
         ctrl_tx
+    }
+}
+
+/// 观察 task 出口：panic → 按 crash 上报（`loading` 期按 init 失败落
+/// `error`）——**只上报，不自动拉起**，重建只能显式 retry/enable（D7）。
+/// driver 与 kameo actor（`Messaging::spawn_task`）共用此路。
+pub(crate) async fn watch_for_crash<T: Send + 'static>(
+    supervisor: Arc<Supervisor>,
+    id: InstanceId,
+    join: tokio::task::JoinHandle<T>,
+) {
+    if let Err(join_err) = join.await {
+        if join_err.is_panic() {
+            let state = supervisor.state_of(id);
+            let action = match state {
+                Some(ServiceState::Loading) => Action::InitErr,
+                _ => Action::Crash,
+            };
+            let _ = supervisor.apply(id, action);
+        }
+        // 其余 JoinError (runtime shutdown 取消) 不动状态
+    }
+}
+
+/// 宿主运行时句柄载体（[`service_core::RuntimeToken`] 的宿主实现）。
+/// `handle_ptr` 指向内部 `Handle` 字段——插件侧按同版本同 rustc 的
+/// `tokio::runtime::Handle` 布局解引用（一起编译前提，D12）。
+struct HostHandle(tokio::runtime::Handle);
+
+impl service_core::RuntimeToken for HostHandle {
+    fn handle_ptr(&self) -> *const () {
+        &self.0 as *const tokio::runtime::Handle as *const ()
     }
 }
 

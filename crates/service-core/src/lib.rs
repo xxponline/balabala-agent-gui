@@ -24,8 +24,8 @@ pub use envelope::{Envelope, Payload};
 pub use error::{DeadLetterReason, RouteError};
 pub use route::{Address, Corr, InstanceId, Route, SelectPolicy, ServiceName};
 pub use service::{
-    CallFuture, DllServiceFactory, Messaging, Service, ServiceCtx, ServiceFactory, ServiceFuture,
-    CREATE_SYMBOL, FINGERPRINT_SYMBOL,
+    CallFuture, DllServiceFactory, Messaging, RuntimeToken, Service, ServiceCtx, ServiceFactory,
+    ServiceFuture, TaskFuture, CREATE_SYMBOL, FINGERPRINT_SYMBOL,
 };
 pub use state::{ServiceState, StateChange};
 

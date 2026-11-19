@@ -1,0 +1,22 @@
+[package]
+name = "example-plugin"
+version = "0.1.0"
+edition.workspace = true
+description = "示例插件 cdylib: D12 边界载体 + 集成测试装载对象 (产物落 plugins/)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+service-core = { path = "../service-core" }
+service-plugin = { path = "../service-plugin" }
+contracts = { path = "../contracts" }
+kameo = "0.22.2"
+# ⚠ features 必须与另一侧 (service-manager / service-plugin / example-plugin) 完全一致:
+# tokio 须是 host 与 dylib 的**同一编译单元**, 否则 TypeId 分叉、
+# ServiceCtx::runtime_token downcast 失败 (D12 边界, 已踩)。
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+
+[build-dependencies]
+# 构建指纹嵌入 (一行调用, task 3.2)
+service-plugin = { path = "../service-plugin" }

@@ -21,6 +21,9 @@ pub type ServiceFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 /// ask future（executor-agnostic：只剩 oneshot await，D9）。
 pub type CallFuture = Pin<Box<dyn Future<Output = Result<Payload, RouteError>> + Send + 'static>>;
 
+/// 交给宿主 runtime 驱动的后台 future（[`Messaging::spawn_task`]）。
+pub type TaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
 /// 服务的出站消息能力：由宿主实现（manager 的 [`ServiceHandle`]），经
 /// [`ServiceCtx`] 注入——core 只定义 trait，实现留在 manager（D11 边）。
 pub trait Messaging: Send + Sync + 'static {
@@ -39,6 +42,30 @@ pub trait Messaging: Send + Sync + 'static {
         kind: &'static str,
         payload: Payload,
     ) -> Result<(), RouteError>;
+    /// 接收方 downcast 失败：拒收并落死信（`TypeMismatch`）——这是接收方
+    /// 契约 bug，不是路由错误（D5 / spec R1）。
+    fn reject(&self, env: &Envelope) -> Result<(), RouteError>;
+    /// 把后台 future 交给**宿主 runtime** 驱动（返回后不阻塞）。
+    ///
+    /// 跨 dylib 的关键约束（D12 边界发现）：tokio/kameo 的 ambient 上下文
+    /// 是**每份二进制副本各自的 thread-local**——插件里调 `tokio::spawn`
+    /// 看不到宿主 runtime。因此插件侧一切 spawn 经本方法由宿主代跑；
+    /// 宿主实现须在 panic 时按 crash 上报（supervisor 唯一恢复权威，D7）。
+    fn spawn_task(&self, fut: TaskFuture);
+}
+
+/// 运行时句柄载体：宿主实现、插件消费（core 不依赖 tokio——D9/D11）。
+///
+/// 为什么**不是** `Any` + TypeId downcast（D12 第三个边界发现）：tokio 依赖
+/// proc-macro 链（syn/quote），其 metadata 随 cargo **解析范围**变化（workspace
+/// vs `-p` 构建 syn feature 不同）→ tokio 编译两份 → TypeId 分叉 → downcast
+/// 静默失败。契约 crate 零依赖、metadata 确定，所以 `Ping`/`Pong` 这类契约
+/// 类型跨界 TypeId 稳定；**依赖链可变的类型不得跨边界作 TypeId 用途**。
+/// 故走裸指针：两侧同 rustc / 同 tokio 版本 / 同 target（= D12 路线甲的
+/// "一起编译"前提）⇒ `tokio::runtime::Handle` 布局一致。
+pub trait RuntimeToken: Send + Sync + 'static {
+    /// 指向宿主侧 `tokio::runtime::Handle` 的裸指针（不得为悬垂）。
+    fn handle_ptr(&self) -> *const ();
 }
 
 /// 工厂入参：服务构造时即拿到身份 + 出站能力（driver 持 ctx 驱动本实例）。
@@ -47,6 +74,10 @@ pub struct ServiceCtx {
     pub instance: InstanceId,
     pub service: ServiceName,
     pub messaging: Arc<dyn Messaging>,
+    /// 宿主运行时句柄载体（插件脚手架取 `Handle` 并逐 poll `enter`——
+    /// 跨 dylib 时 tokio ambient 上下文是**每份二进制副本各自的 thread-
+    /// local**，不 enter 就看不到宿主 runtime）。
+    pub runtime_token: Arc<dyn RuntimeToken>,
 }
 
 /// 每实例服务对象（内部 crate 与 DLL 服务同一契约，D1：仅符号来源不同）。
@@ -123,6 +154,15 @@ mod tests {
             self.sent.lock().unwrap().push(env);
             Ok(())
         }
+
+        fn reject(&self, env: &Envelope) -> Result<(), RouteError> {
+            self.sent.lock().unwrap().push(env.clone());
+            Ok(())
+        }
+
+        fn spawn_task(&self, _fut: TaskFuture) {
+            // 测试用出站能力不驱动后台任务
+        }
     }
 
     struct Echo {
@@ -149,6 +189,13 @@ mod tests {
         }
     }
 
+    struct NullToken;
+    impl RuntimeToken for NullToken {
+        fn handle_ptr(&self) -> *const () {
+            std::ptr::null()
+        }
+    }
+
     fn test_ctx(id: u64) -> (ServiceCtx, Arc<TestMessaging>) {
         let m = Arc::new(TestMessaging {
             sent: std::sync::Mutex::new(vec![]),
@@ -158,6 +205,7 @@ mod tests {
             instance: m.id,
             service: "echo".into(),
             messaging: m.clone(),
+            runtime_token: Arc::new(NullToken),
         };
         (ctx, m)
     }

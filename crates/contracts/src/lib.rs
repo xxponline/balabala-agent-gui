@@ -8,4 +8,5 @@
 //! 命名空间：`shared`（双向共享，中立）+ 按服务分目录（`agent`、`asset`
 //! …，服务落地时逐个加入，消息归调用方）。
 
+pub mod demo;
 pub mod shared;

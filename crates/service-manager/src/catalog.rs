@@ -168,12 +168,29 @@ mod tests {
             ) -> Result<(), service_core::RouteError> {
                 Ok(())
             }
+
+            fn reject(
+                &self,
+                _env: &service_core::Envelope,
+            ) -> Result<(), service_core::RouteError> {
+                Ok(())
+            }
+
+            fn spawn_task(&self, _fut: service_core::TaskFuture) {}
         }
         let ctx = service_core::ServiceCtx {
             instance: service_core::InstanceId(0),
             service: "fake".into(),
             messaging: std::sync::Arc::new(Noop),
+            runtime_token: std::sync::Arc::new(NullToken),
         };
+
+        struct NullToken;
+        impl service_core::RuntimeToken for NullToken {
+            fn handle_ptr(&self) -> *const () {
+                std::ptr::null()
+            }
+        }
         let desc = ServiceDescriptor::internal("fake", a_service as ServiceFactory);
         assert_eq!(desc.name.as_str(), "fake");
         match desc.origin {
