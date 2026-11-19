@@ -1,8 +1,11 @@
 [workspace]
-# service-management-framework task 1.1: 单 package → workspace (纯结构变化,
-# cargo build 行为不变)。现 package 原位为成员; crates/* 由 task 1.2 落位。
-members = ["."]
+# service-management-framework task 1.1/1.2: 单 package → workspace (纯结构变化,
+# cargo build 行为不变)。原 package 原位为成员, crates/* = 三件套 + contracts。
+members = [".", "crates/*"]
 resolver = "3"
+
+[workspace.package]
+edition = "2024"
 
 [package]
 name = "balabala-agent-gui"
@@ -19,7 +22,10 @@ crossterm = "0.29.0"
 # Cargo 需要 ssh:// 形式（scp 风格 git@host:path 不被 URL 解析器接受）
 pi-shell-rs = { git = "ssh://git@github.com/xxponline/pi-shell-rs.git" }
 directories = "6.0.0"
-kameo = "0.22.2"
+# GUI = 框架的普通参与者 (D11): 依赖 contracts + service-manager;
+# kameo 不在宿主侧 (中间层内部, 落 service-manager)
+contracts = { path = "crates/contracts" }
+service-manager = { path = "crates/service-manager" }
 
 [dev-dependencies]
 # 仅测试构建启用 (resolver 不会把 dev 特性并入 cargo build)：

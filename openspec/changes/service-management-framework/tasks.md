@@ -6,7 +6,7 @@
       原位保留），新增 `crates/`、`plugins/` 目录骨架（`plugins/` 产物
       gitignore）。验证：`cargo build` 与 `cargo test` 全绿，行为与改造前
       一致；单独一个提交。
-- [ ] 1.2 依赖边落位：GUI 成员依赖 `contracts` + `service-manager`；
+- [x] 1.2 依赖边落位：GUI 成员依赖 `contracts` + `service-manager`；
       `service-manager` 只依赖 `service-core`（不得依赖 contracts/GUI）；
       `libloading` 入 `service-manager`。验证：`cargo tree` 检查无反向边；
       workspace 全量构建通过。

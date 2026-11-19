@@ -607,14 +607,15 @@ dependencies = [
 name = "balabala-agent-gui"
 version = "0.1.0"
 dependencies = [
+ "contracts",
  "crossterm",
  "directories",
  "gpui-kit",
- "kameo",
  "pi-shell-rs",
  "rfd",
  "serde",
  "serde_json",
+ "service-manager",
  "vt100",
 ]
 
@@ -1180,6 +1181,10 @@ dependencies = [
  "once_cell",
  "tiny-keccak",
 ]
+
+[[package]]
+name = "contracts"
+version = "0.1.0"
 
 [[package]]
 name = "convert_case"
@@ -7222,6 +7227,21 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "service-core"
+version = "0.1.0"
+
+[[package]]
+name = "service-manager"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "kameo",
+ "libloading",
+ "service-core",
+ "tokio",
 ]
 
 [[package]]
