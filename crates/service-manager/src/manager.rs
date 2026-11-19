@@ -4,10 +4,12 @@
 use crate::catalog::{Catalog, ServiceDescriptor, ServiceOrigin};
 use crate::instance::Instances;
 use crate::scanner::{self, ScanError};
-use service_core::{InstanceId, ServiceFactory, ServiceName};
+use crate::supervisor::Supervisor;
+use service_core::{InstanceId, ServiceFactory, ServiceName, StateChange};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 /// 服务管理中间层门面（对宿主暴露，**不泄漏 tokio/kameo 类型**，D9）。
 pub struct ServiceManager {
@@ -18,7 +20,11 @@ pub struct ServiceManager {
     /// Catalog：唯一被 reload 改写的共享状态。
     catalog: RwLock<Catalog>,
     /// 实例/参与者表：与 Catalog **结构分离**，reload 不触碰（D8）。
-    pub(crate) instances: Mutex<Instances>,
+    pub(crate) instances: Arc<Mutex<Instances>>,
+    /// 每实例状态机（task 3.4）：唯一恢复权威，kameo 自动 restart 禁用（D7）。
+    pub(crate) supervisor: Arc<Supervisor>,
+    /// 状态事件流（供 Router 订阅转发用，task 4.x 接线；只取一次）。
+    state_events: Mutex<Option<UnboundedReceiver<StateChange>>>,
     /// 参与者 id 分配（服务实例与宿主参与者共用计数）。
     next_id: AtomicU64,
 }
@@ -26,12 +32,16 @@ pub struct ServiceManager {
 impl ServiceManager {
     /// 创建并执行启动扫描（D8：启动扫一遍建 Catalog）。
     pub fn new(scan_dir: impl Into<PathBuf>) -> Result<Self, ScanError> {
+        let instances = Arc::new(Mutex::new(Instances::new()));
+        let (supervisor, events_rx) = Supervisor::new(Arc::clone(&instances));
         let mgr = ServiceManager {
             scan_dir: scan_dir.into(),
             internals: Mutex::new(Vec::new()),
             catalog: RwLock::new(Catalog::new()),
-            instances: Mutex::new(Instances::new()),
+            instances,
+            state_events: Mutex::new(Some(events_rx)),
             next_id: AtomicU64::new(1),
+            supervisor: Arc::new(supervisor),
         };
         mgr.rebuild_catalog()?;
         Ok(mgr)
@@ -113,6 +123,16 @@ impl ServiceManager {
     /// 扫描目录。
     pub fn scan_dir(&self) -> &std::path::Path {
         &self.scan_dir
+    }
+
+    /// 每实例状态机（task 3.4）。
+    pub fn supervisor(&self) -> &Arc<Supervisor> {
+        &self.supervisor
+    }
+
+    /// 取出状态事件流（Router 订阅转发用，只取一次；task 4.x 接线）。
+    pub(crate) fn take_state_events(&self) -> Option<UnboundedReceiver<StateChange>> {
+        self.state_events.lock().expect("state_events poisoned").take()
     }
 }
 

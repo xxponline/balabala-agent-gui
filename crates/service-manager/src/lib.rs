@@ -14,10 +14,12 @@ pub mod catalog;
 pub mod instance;
 pub mod manager;
 pub mod scanner;
+pub mod supervisor;
 
 pub use catalog::{Catalog, ServiceDescriptor, ServiceMeta, ServiceOrigin};
 pub use instance::{Instances, Participant};
 pub use manager::{ServiceError, ServiceManager};
 pub use scanner::{scan, ScanError, PLUGIN_EXTENSIONS};
+pub use supervisor::{Action, Supervisor, TransitionError};
 
 pub use service_core::*;
