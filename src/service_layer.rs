@@ -69,6 +69,9 @@ pub struct ServiceLayer {
     pub listener: Listener,
     /// 核心假服务实例 id。
     pub core_id: InstanceId,
+    /// agent 会话薄服务实例 id（change agent-service task 1.3；控制/帧路由目标）。
+    #[allow(dead_code)] // task 3.1 watch/控制路由接线后读取
+    pub agent_id: InstanceId,
     /// 经泵消费到的事件数（测试观测面：证明 Listener 接入 gpui 泵）。
     pub events_seen: usize,
     /// 最近一次状态翻转（D10 本地快照；状态页 UX 属后续 change）。
@@ -86,13 +89,22 @@ impl ServiceLayer {
         let core_id = manager
             .load(&"core.fake".into())
             .map_err(|e| format!("load core.fake: {e}"))?;
+        // change agent-service task 1.3: 进程内会话薄服务 (design D1)
+        manager
+            .register_internal("agent", agent_service::agent_service_factory)
+            .map_err(|e| format!("register agent: {e}"))?;
+        let agent_id = manager
+            .load(&"agent".into())
+            .map_err(|e| format!("load agent: {e}"))?;
         // GUI = 普通参与者: 自己的 mailbox + 订阅 (= 往路由表加规则, D7/D9)
         let listener = manager.new_mailbox(64);
         manager.subscribe_state(core_id, &listener);
+        manager.subscribe_state(agent_id, &listener);
         Ok(ServiceLayer {
             manager,
             listener,
             core_id,
+            agent_id,
             events_seen: 0,
             last_state: None,
         })
@@ -187,7 +199,7 @@ mod tests {
         let dir = temp_scan("boot");
         let mut layer = ServiceLayer::bootstrap(&dir).expect("bootstrap");
         assert!(layer.manager.has_service(&"core.fake".into()), "Catalog 登记");
-        assert_eq!(layer.manager.instance_count(), 1, "已装载");
+        assert_eq!(layer.manager.instance_count(), 2, "core.fake + agent 均已装载");
 
         // init 完成 (loading → available 事件应达订阅者)
         assert!(
@@ -206,6 +218,31 @@ mod tests {
         // ask (GUI 用户操作约定): typed 一问一答
         let pong = futures::executor::block_on(layer.ask_core(41)).expect("ask ok");
         assert_eq!(pong, CorePong(41));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// change agent-service task 1.3: agent 薄服务注册/装载 + 状态事件到 pump。
+    #[test]
+    fn agent_service_loads_and_reports_state() {
+        let dir = temp_scan("agent-boot");
+        let mut layer = ServiceLayer::bootstrap(&dir).expect("bootstrap");
+        assert!(layer.manager.has_service(&"agent".into()), "Catalog 登记 agent");
+        assert_eq!(layer.manager.instance_count(), 2, "core.fake + agent");
+        assert_ne!(layer.agent_id, layer.core_id, "实例 id 独立分配");
+
+        // loading → available 翻转经订阅路由到达 GUI mailbox
+        assert!(
+            wait_until(
+                || {
+                    layer.pump();
+                    layer.last_state == Some(ServiceState::Available)
+                },
+                Duration::from_secs(3)
+            ),
+            "agent 状态翻转到 Available: {:?}",
+            layer.last_state
+        );
+        assert!(layer.events_seen >= 1, "状态事件被 pump 消费");
         std::fs::remove_dir_all(&dir).ok();
     }
 

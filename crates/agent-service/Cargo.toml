@@ -1,0 +1,14 @@
+[package]
+name = "agent-service"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+# design D7 依赖边: agent-service -> service-core (不含 service-manager);
+# gpui-kit/vt100/crossterm 为 AgentTerminal 渲染层 (4.1 迁入) 预置,
+# pi-shell-rs 为会话所有权 (SessionIo 实现) —— 与 GUI 侧同版本同特性。
+service-core = { path = "../service-core" }
+gpui-kit = { version = "0.9.0", features = ["syntect"] }
+vt100 = "0.18.1"
+crossterm = "0.29.0"
+pi-shell-rs = { git = "ssh://git@github.com/xxponline/pi-shell-rs.git" }

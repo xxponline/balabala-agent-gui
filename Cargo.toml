@@ -26,6 +26,8 @@ directories = "6.0.0"
 # kameo 不在宿主侧 (中间层内部, 落 service-manager)
 contracts = { path = "crates/contracts" }
 service-manager = { path = "crates/service-manager" }
+# change agent-service task 1.3: GUI -> agent-service -> service-core (design D7)
+agent-service = { path = "crates/agent-service" }
 
 [dev-dependencies]
 # 仅测试构建启用 (resolver 不会把 dev 特性并入 cargo build)：

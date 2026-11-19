@@ -511,9 +511,7 @@ mod tests {
     use gpui_kit::{
         AppContext, Bounds, Point, TestAppContext, WindowBounds, WindowOptions, px, size,
     };
-    use std::cell::Cell;
     use std::path::{Path, PathBuf};
-    use std::rc::Rc;
 
     /// 起完整 app（拿 weak 引用 + 真实右槽），返回 (窗口句柄, app 实体)。
     fn open_app(cx: &mut TestAppContext) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<TerminalApp>) {

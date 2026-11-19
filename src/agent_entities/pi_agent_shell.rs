@@ -253,6 +253,14 @@ mod tests {
     use std::io::Write as _;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// task 1.1 spike: 会话整体必须 Send+Sync (所有权进 `Service: Send + Sync`);
+    /// 与 agent-service crate 内 `EmbeddedApp` 断言互补 (构造件 + 包装体)。
+    #[test]
+    fn pi_agent_shell_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PiAgentShell>();
+    }
+
     /// 假 pi: 记录 cwd 并对每个 JSON 请求回 success
     /// (与 tests/embed_layout.rs 同款, 探活/事件循环可跑通)。
     fn write_stub(dir: &std::path::Path) -> PathBuf {

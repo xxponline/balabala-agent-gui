@@ -15,6 +15,7 @@ pub const HISTORY_VERSION: u32 = 1;
 /// 封顶条数 (design D4 建议 10)。
 pub const MAX_RECENT: usize = 10;
 /// 历史文件名。
+#[cfg_attr(test, allow(dead_code))] // 仅 cfg(not(test)) 分支引用 (default_path)
 pub const HISTORY_FILE: &str = "workspace_history.json";
 
 /// 全局历史文件路径。
