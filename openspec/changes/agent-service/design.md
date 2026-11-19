@@ -100,6 +100,7 @@ GUI (balabala-agent-gui)
 - GUI bootstrap 扩展：`register_internal("agent", agent_service_factory)` + `load` + 订阅状态 + 发 `watch`；
 - 控制台 tab 标签 "Console" 不变（spec 用词），仅类型/模块改名（`src/pane` → crate 内 `terminal` 模块，`TerminalPanel` → `AgentTerminal`）；
 - **出站接缝 `TerminalBus`**：`agent-service` 定义窄 trait（`ask(kind, payload)` / `tell(kind, payload)`，入参只用 `service-core` 词汇），GUI 在构造面板时注入 `Listener::submit` 包装实现——终端出站不触 `service-manager` 类型，依赖边保持 `GUI -> agent-service -> service-core`。入站（帧/镜像）由 GUI 泵以普通方法调用注入（`feed` / `set_view`），面板不需要知道 mailbox。
+- **tokio（task 2.6 补充）**：drain 循环需要 timer，`agent-service` 增加 tokio 依赖，features 与 `service-manager`/`service-plugin`/`example-plugin` **完全一致**（同一 workspace 编译单元，D12 教训）；本 crate 与宿主同二进制、非 dylib 边界，无 TypeId 分叉风险。
 
 ### D8 单 mailbox + 泵内路由
 GUI 仍**只有一个 `Listener`**（容量 64）：`ServiceLayer::pump` 按 kind 分流——`frame_bytes` → 转交 `Entity<AgentTerminal>`（`feed(session, bytes)`，UI 线程喂 parser）；`sessions_changed` → 更新 `SessionView` 镜像 + `notify_panels`；回复/`route_error` → 失败 notice（delta 场景）。

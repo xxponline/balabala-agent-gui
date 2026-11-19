@@ -117,6 +117,7 @@ dependencies = [
  "gpui-kit",
  "pi-shell-rs",
  "service-core",
+ "tokio",
  "vt100",
 ]
 

@@ -12,3 +12,7 @@ gpui-kit = { version = "0.9.0", features = ["syntect"] }
 vt100 = "0.18.1"
 crossterm = "0.29.0"
 pi-shell-rs = { git = "ssh://git@github.com/xxponline/pi-shell-rs.git" }
+# drain 循环的 timer (task 2.6, design D7 补充): 与 service-manager/
+# service-plugin/example-plugin **features 完全一致** (同一编译单元,
+# D12 已踩过的坑); agent-service 与宿主同二进制, 无 dylib 边界风险。
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }

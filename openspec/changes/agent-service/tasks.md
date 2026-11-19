@@ -8,12 +8,12 @@
 
 ## 2. AgentService 全功能（无 UI）
 
-- [ ] 2.1 会话注册表：`SessionId` 分配、服务侧 `SessionIo` 抽象（drain 字节/注入/status/shutdown）+ 测试 stub、状态观测三态导出（首帧字节非空 = Running，io 终止 = Exited，起始 = Starting）；**验证**：单测 `status_transitions_from_bytes_and_io_end` 三态迁移通过
-- [ ] 2.2 控制 handler：`select`/`create`/`close` 的 ask 回执（含 active 归服务、关闭 active 后退位剩余最后一个/无则 None、未知 id 与重复关的幂等 `Err`、create 失败回 `Err(String)`）；**验证**：`TestMessaging` 回执捕获单测覆盖：成功三支 + 退位 + 未知 id `Err`
-- [ ] 2.3 输入/尺寸/主题 handler：`input` 四种 tell 转发到 `SessionIo`、`resize` 服务侧 `(cols,rows)` 去重后再转、`theme` 广播转发；**验证**：单测 stub 捕获转发载荷 + 重复 resize 不二次转发的断言通过
-- [ ] 2.4 watch 握手 + 帧全推：`watch` 从 `from` 地址存 watcher、drain 变字节才推 `FrameBytes{session, Arc<Vec<u8>>}`（所有权移动）、全会话推、推失败丢帧并计数；**验证**：单测覆盖 watch 前零帧 / 变字节后到达 route=watcher / 无字节不推 / 出口满时丢帧计数递增
-- [ ] 2.5 投影事件：任何注册表/状态/active 变化推 `SessionsChanged{SessionView{Arc<[SessionInfo]>, active}}`（事件自带快照）；**验证**：单测断言 create/close/select/status 后事件负载为全量快照且 active 正确
-- [ ] 2.6 drain 接线 + 契约文档：`input` handler 内联 drain（输入即推帧）、drain 循环经 `messaging.spawn_task`（宿主 runtime 50ms interval）；D3 契约表落 crate 级 rustdoc；**验证**：内联路径单测（发 input 后 stub 字节立即成帧）通过 + `cargo doc -p agent-service --no-deps` 零警告
+- [x] 2.1 会话注册表：`SessionId` 分配、服务侧 `SessionIo` 抽象（drain 字节/注入/status/shutdown）+ 测试 stub、状态观测三态导出（首帧字节非空 = Running，io 终止 = Exited，起始 = Starting）；**验证**：单测 `status_transitions_from_bytes_and_io_end` 三态迁移通过
+- [x] 2.2 控制 handler：`select`/`create`/`close` 的 ask 回执（含 active 归服务、关闭 active 后退位剩余最后一个/无则 None、未知 id 与重复关的幂等 `Err`、create 失败回 `Err(String)`）；**验证**：`TestMessaging` 回执捕获单测覆盖：成功三支 + 退位 + 未知 id `Err`
+- [x] 2.3 输入/尺寸/主题 handler：`input` 四种 tell 转发到 `SessionIo`、`resize` 服务侧 `(cols,rows)` 去重后再转、`theme` 广播转发；**验证**：单测 stub 捕获转发载荷 + 重复 resize 不二次转发的断言通过
+- [x] 2.4 watch 握手 + 帧全推：`watch` 从 `from` 地址存 watcher、drain 变字节才推 `FrameBytes{session, Arc<Vec<u8>>}`（所有权移动）、全会话推、推失败丢帧并计数；**验证**：单测覆盖 watch 前零帧 / 变字节后到达 route=watcher / 无字节不推 / 出口满时丢帧计数递增
+- [x] 2.5 投影事件：任何注册表/状态/active 变化推 `SessionsChanged{SessionView{Arc<[SessionInfo]>, active}}`（事件自带快照）；**验证**：单测断言 create/close/select/status 后事件负载为全量快照且 active 正确
+- [x] 2.6 drain 接线 + 契约文档：`input` handler 内联 drain（输入即推帧）、drain 循环经 `messaging.spawn_task`（宿主 runtime 50ms interval）；D3 契约表落 crate 级 rustdoc；**验证**：内联路径单测（发 input 后 stub 字节立即成帧）通过 + `cargo doc -p agent-service --no-deps` 零警告
 
 ## 3. GUI 数据/消息面换底（pane 暂留 `src/pane`；组内按序执行，以 3.6 为全绿基线）
 
