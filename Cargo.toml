@@ -1,3 +1,9 @@
+[workspace]
+# service-management-framework task 1.1: 单 package → workspace (纯结构变化,
+# cargo build 行为不变)。现 package 原位为成员; crates/* 由 task 1.2 落位。
+members = ["."]
+resolver = "3"
+
 [package]
 name = "balabala-agent-gui"
 version = "0.1.0"

@@ -2,7 +2,7 @@
 
 ## 1. workspace 化（纯结构，可独立 revert）
 
-- [ ] 1.1 根 `Cargo.toml` 改为 workspace（含原 package 作为成员，`src/`
+- [x] 1.1 根 `Cargo.toml` 改为 workspace（含原 package 作为成员，`src/`
       原位保留），新增 `crates/`、`plugins/` 目录骨架（`plugins/` 产物
       gitignore）。验证：`cargo build` 与 `cargo test` 全绿，行为与改造前
       一致；单独一个提交。
