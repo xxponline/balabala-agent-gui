@@ -7232,6 +7232,9 @@ dependencies = [
 [[package]]
 name = "service-core"
 version = "0.1.0"
+dependencies = [
+ "futures",
+]
 
 [[package]]
 name = "service-manager"

@@ -16,11 +16,16 @@
 pub mod envelope;
 pub mod error;
 pub mod route;
+pub mod service;
 pub mod state;
 
 pub use envelope::{Envelope, Payload};
 pub use error::{DeadLetterReason, RouteError};
 pub use route::{Address, Corr, InstanceId, Route, SelectPolicy, ServiceName};
+pub use service::{
+    DllServiceFactory, Service, ServiceFactory, ServiceFuture, CREATE_SYMBOL,
+    FINGERPRINT_SYMBOL,
+};
 pub use state::{ServiceState, StateChange};
 
 /// 框架级 `kind`：状态翻转事件（payload = [`StateChange`]）。

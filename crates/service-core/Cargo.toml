@@ -5,3 +5,7 @@ edition.workspace = true
 description = "服务框架词汇表: Route/Envelope/Payload/ServiceState/RouteError — 对 GUI 与具体服务契约零依赖"
 
 [dependencies]
+
+[dev-dependencies]
+# 验证 Service::handle 返回的 future executor-agnostic (非 tokio await 可用)
+futures = "0.3"
