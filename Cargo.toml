@@ -13,6 +13,7 @@ crossterm = "0.29.0"
 # Cargo 需要 ssh:// 形式（scp 风格 git@host:path 不被 URL 解析器接受）
 pi-shell-rs = { git = "ssh://git@github.com/xxponline/pi-shell-rs.git" }
 directories = "6.0.0"
+kameo = "0.22.2"
 
 [dev-dependencies]
 # 仅测试构建启用 (resolver 不会把 dev 特性并入 cargo build)：
