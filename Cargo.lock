@@ -610,6 +610,7 @@ dependencies = [
  "contracts",
  "crossterm",
  "directories",
+ "futures",
  "gpui-kit",
  "pi-shell-rs",
  "rfd",

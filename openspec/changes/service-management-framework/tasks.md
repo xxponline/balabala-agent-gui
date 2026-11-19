@@ -74,16 +74,16 @@
 
 ## 6. GUI 接入（本 change 最后一步）
 
-- [ ] 6.1 GUI 注册为总线参与者（自己的 Route + mailbox），启动装载核心假
+- [x] 6.1 GUI 注册为总线参与者（自己的 Route + mailbox），启动装载核心假
       服务/示例服务并订阅状态翻转；Listener 接入 gpui 泵（并入现有
       drain/notify 循环，`cx.defer` 后 `entity.notify()`）。验证：手测——
       服务状态翻转驱动界面刷新；GUI 触发操作一律走 ask、错误可回显。
-- [ ] 6.2 验收边界守住：本 step 只保证订阅/mailbox poll 通路可用，不实现
+- [x] 6.2 验收边界守住：本 step 只保证订阅/mailbox poll 通路可用，不实现
       服务状态页 UX（留后续 GUI spec change）、不迁移任何现有模块。
       验证：现有测试全绿，GUI 行为无回归。
 
 ## 7. 文档与承诺收口
 
-- [ ] 7.1 API 文档写明三条承诺：unload 不 dlclose（真回收=进程重启）；
+- [x] 7.1 API 文档写明三条承诺：unload 不 dlclose（真回收=进程重启）；
       GUI poll 门为第一公民、无回调 API；tell 无同步反馈、用户操作走
       ask。验证：文档 review 对照 design D6/D8/D9 逐条核对。

@@ -10,6 +10,7 @@ mod app;
 mod asset_manager;
 mod pane;
 mod project_model;
+mod service_layer;
 mod property_detail_manager;
 mod shell;
 mod sidebar;

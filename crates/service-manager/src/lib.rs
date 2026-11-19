@@ -12,6 +12,18 @@
 //! - [`manager`]：宿主门面（双门 API）；loader → task 3.3 接入。
 //!
 //! 对外 `pub use service_core::*`：宿主侧只经本 crate 引用框架词汇（D11 边）。
+//!
+//! ## API 三条承诺（对照 design D6/D8/D9；task 7.1 收口）
+//!
+//! 1. **`unload()` 是停用，不是卸载回收**（D8）：停用并移出实例表，
+//!    **永不 dlclose**（`ManuallyDrop` 永驻缓存）——真回收 = 进程重启；
+//!    API 文档/命名不得暗示可回收动态库。
+//! 2. **GUI poll 门为第一公民，无回调 API**（D9，B 方案）：宿主参与者
+//!    （GUI）= 拉模式 actor，`Listener::{poll,drain,snapshot,submit}` 同步、
+//!    调用方线程执行；跨线程回调合同问题从结构上消除；future 门仅供
+//!    runtime 驱动的服务/测试。
+//! 3. **tell 无同步反馈，用户操作一律走 ask**（D6）：tell 失败只落死信
+//!    （观测面）；GUI 用户触发的操作走 ask，错误可回显给用户。
 
 pub mod catalog;
 pub mod instance;

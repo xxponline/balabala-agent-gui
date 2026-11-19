@@ -61,6 +61,9 @@ pub struct TerminalApp {
     /// 右槽数据服务层 (asset-manager-right-dock D1): 面板读视图/代数,
     /// app 钩子做注册与刷新
     pub asset_manager: Entity<AssetManager>,
+    /// 服务总线接入 (service-management-framework 6.1): GUI = 拉模式参与
+    /// 者 (自己的 Route + mailbox), 50ms 泵 poll; 无回调 (D9)
+    pub service_layer: crate::service_layer::ServiceLayer,
     /// 节流 drain 任务; drop 会取消循环 (design D3)
     _update_task: Option<Task<()>>,
     /// 输入触发的快速 drain burst (design D7): 8ms×4 拍取到帧即停,
@@ -133,7 +136,11 @@ impl TerminalApp {
                 eprintln!("workspace history save failed: {e}");
             }
         }
-        let restore = history.most_recent().map(Path::to_path_buf);
+        // 服务层启动接线 (task 6.1): 扫 plugins/ 建 Catalog + 装载核心假
+        // 服务 + GUI mailbox/订阅; 失败即启动失败 (扫描目录不存在 = 空, 不错)
+        let service_layer = crate::service_layer::ServiceLayer::bootstrap(Path::new("plugins"))?;
+
+                let restore = history.most_recent().map(Path::to_path_buf);
         // 装配 DockArea 三槽 (shell::build; panel_handle 包装见其文档)
         let weak_app = cx.weak_entity();
         let shell::ShellParts {
@@ -181,6 +188,7 @@ impl TerminalApp {
             terminal,
             tree,
             asset_manager,
+            service_layer,
         };
         // 有历史 → 异步恢复最近工作区; 无历史/失效 → 留空态 (不报错)
         if let Some(path) = restore {
@@ -838,6 +846,11 @@ impl TerminalApp {
                     changed = true;
                 }
             });
+        }
+        // 服务总线 (task 6.1): Listener poll 并入本泵 — 状态翻转等事件与
+        // 会话帧同路 notify (§7.2 显式 notify; 无回调, D9)
+        if self.service_layer.pump() {
+            changed = true;
         }
         if changed {
             self.notify_panels(cx);
@@ -1854,6 +1867,71 @@ mod tests {
             .expect("open test window")
         });
         (handle, app)
+    }
+
+    /// task 6.1: 服务总线接入 — 状态翻转经 50ms 主循环泵落到 GUI
+    /// (Listener 接入 poll 门; 无回调, D9)。事件不早产: 主循环未 advance
+    /// 时 pump 不跑, disable 事件必在 tick 时被消费 (确定性)。
+    #[gpui_kit::test]
+    fn service_state_flip_reaches_gui_via_update_loop(cx: &mut TestAppContext) {
+        use std::time::{Duration, Instant};
+        let (handle, app_entity) = open_app_with_history(cx, fresh_history_path());
+        let core_id = cx.update(|cx| app_entity.read(cx).service_layer.core_id);
+        assert!(
+            cx.update(|cx| app_entity.read(cx).service_layer.manager.has_service(&"core.fake".into())),
+            "启动已登记核心假服务"
+        );
+
+        // 装载完成: 直接读状态 (D10 拉最新快照; 事件另走订阅路由)
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = cx.update(|cx| {
+                app_entity
+                    .read(cx)
+                    .service_layer
+                    .manager
+                    .supervisor()
+                    .state_of(core_id)
+            });
+            if state == Some(service_manager::ServiceState::Available) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "core.fake 未达 available: {state:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // 启动 50ms 主循环 (生产在 main.rs 调; 测试显式启动)
+        cx.update(|cx| app_entity.update(cx, |app, cx| app.start_update_loop(cx)));
+
+        // 主动翻转 → 事件落 GUI mailbox → 下个 tick 消费
+        cx.update(|cx| {
+            app_entity
+                .read(cx)
+                .service_layer
+                .manager
+                .disable(core_id)
+                .expect("disable")
+        });
+        cx.executor().advance_clock(Duration::from_millis(50));
+        cx.run_until_parked();
+
+        let (seen, last) = cx.update(|cx| {
+            let app = app_entity.read(cx);
+            (app.service_layer.events_seen, app.service_layer.last_state)
+        });
+        assert!(
+            seen >= 1,
+            "状态事件经 50ms 泵消费 (Listener 接入): seen={seen}"
+        );
+        assert_eq!(
+            last,
+            Some(service_manager::ServiceState::Offline),
+            "本地快照随事件更新 (D10)"
+        );
+        let _ = handle;
     }
 
     /// 渲染一帧并收集全部文本 (空态/行存在性断言用)。

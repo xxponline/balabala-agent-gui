@@ -31,3 +31,5 @@ service-manager = { path = "crates/service-manager" }
 # 仅测试构建启用 (resolver 不会把 dev 特性并入 cargo build)：
 # gpui_kit::test 无头窗口 + ElementSnapshot bounds 断言 (pane 网格宽度契约)
 gpui-kit = { version = "0.9.0", features = ["test-support"] }
+# service_layer 测试: 非 tokio executor await ask future (task 6.1)
+futures = "0.3"
