@@ -46,19 +46,19 @@
 
 ## 4. Router / 运行时 / mailbox
 
-- [ ] 4.1 自建 tokio 运行时 + executor-agnostic 的 call()（内部急切 spawn
+- [x] 4.1 自建 tokio 运行时 + executor-agnostic 的 call()（内部急切 spawn
       + oneshot 收口）；对外 API 不暴露 tokio/kameo 类型（宿主侧）。
       验证：单测在非 tokio executor（block_on / 线程池）上 await call()
       得到结果。
-- [ ] 4.2 Router：统一信封转发、两级寻址（Direct 的服务名归属断言、Any
+- [x] 4.2 Router：统一信封转发、两级寻址（Direct 的服务名归属断言、Any
       挑 available）、per-outlet 有界通道（try_send，满即刻销账）。
       验证：单测——Instance 直投、Direct 错服务名被拒、Any 挑中 available、
       队列满即刻 `Err(DeadLetter(ChannelFull))`。
-- [ ] 4.3 ask/回复/超时：corr 销账（不按 from）、Router 持 deadline、超时
+- [x] 4.3 ask/回复/超时：corr 销账（不按 from）、Router 持 deadline、超时
       落死信并 `Err(Timeout)`；fail-fast（ask `Err(TargetNotAvailable)`、
       tell 落死信）。验证：单测——一问一答、超时、目标 loading/error 时
       即刻拒绝、全链路留痕可查。
-- [ ] 4.4 Listener（拉模式 actor mailbox）：`submit(corr)`/`poll()`/
+- [x] 4.4 Listener（拉模式 actor mailbox）：`submit(corr)`/`poll()`/
       `drain()`/`snapshot()`，同步、调用方线程执行；变更事件自带快照 Arc；
       无任何回调 API。验证：单测——poll 取件、snapshot() 零回程、连续 N 次
       状态翻转可合并为一次 changed、Reply 事件不合并。

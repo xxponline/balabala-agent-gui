@@ -10,13 +10,28 @@ pub struct ServiceMeta {
 }
 
 /// 符号来源——内部服务与 DLL 服务的**唯一区别**（D8：load 流程按 origin 分支）。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum ServiceOrigin {
     /// 内部 crate 服务：编译期工厂（启动时显式 register）。
     Internal(ServiceFactory),
     /// 外围 DLL：扫描目录得到的产物路径，load 时 dlopen 取符号。
     Dll(PathBuf),
 }
+
+// 手写: derive 会对裸 fn 指针做 `==` (unpredictable_function_pointer_comparisons);
+// `fn_addr_eq` 是官方认可的比较方式 (同编译单元内函数地址稳定)。
+impl PartialEq for ServiceOrigin {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ServiceOrigin::Internal(a), ServiceOrigin::Internal(b)) => {
+                std::ptr::fn_addr_eq(*a, *b)
+            }
+            (ServiceOrigin::Dll(a), ServiceOrigin::Dll(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for ServiceOrigin {}
 
 /// Catalog 条目。
 #[derive(Clone, Debug, PartialEq, Eq)]

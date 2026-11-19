@@ -30,3 +30,6 @@ pub use state::{ServiceState, StateChange};
 
 /// 框架级 `kind`：状态翻转事件（payload = [`StateChange`]）。
 pub const KIND_STATE_CHANGE: &str = "state_change";
+/// 框架级 `kind`：宿主 mailbox 收到的路由错误（payload = [`RouteError`]）——
+/// submit 门超时/失败对 poll 调用方的可见形式（D6/D9）。
+pub const KIND_ROUTE_ERROR: &str = "route_error";

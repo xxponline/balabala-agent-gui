@@ -2,14 +2,22 @@
 //! runtime/Router/Supervisor/Loader 由 task 3.4/4.x/3.3 逐个接入本结构）。
 
 use crate::catalog::{Catalog, ServiceDescriptor, ServiceOrigin};
-use crate::instance::Instances;
+use crate::instance::{Instances, Participant};
+use crate::listener::Listener;
+use crate::router::{DeadLetterRecord, Router, TraceEntry};
+use crate::runtime::LayerRuntime;
 use crate::scanner::{self, ScanError};
 use crate::supervisor::Supervisor;
-use service_core::{InstanceId, ServiceFactory, ServiceName, StateChange};
+use service_core::{
+    Address, Envelope, InstanceId, Payload, RouteError, ServiceFactory, ServiceName,
+};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use tokio::sync::mpsc::UnboundedReceiver;
+use std::time::Duration;
+
+/// ask 默认超时（Router 持 deadline，D6）。
+const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 服务管理中间层门面（对宿主暴露，**不泄漏 tokio/kameo 类型**，D9）。
 pub struct ServiceManager {
@@ -23,25 +31,43 @@ pub struct ServiceManager {
     pub(crate) instances: Arc<Mutex<Instances>>,
     /// 每实例状态机（task 3.4）：唯一恢复权威，kameo 自动 restart 禁用（D7）。
     pub(crate) supervisor: Arc<Supervisor>,
-    /// 状态事件流（供 Router 订阅转发用，task 4.x 接线；只取一次）。
-    state_events: Mutex<Option<UnboundedReceiver<StateChange>>>,
     /// 参与者 id 分配（服务实例与宿主参与者共用计数）。
     next_id: AtomicU64,
+    /// 中间层自建自持运行时（D9：对外不泄漏 tokio）。
+    /// loader（task 3.3）接入前仅构造期使用，属预期。
+    #[allow(dead_code)]
+    runtime: LayerRuntime,
+    /// 中心路由（全部消息过 Router，D3）。
+    router: Arc<Router>,
 }
 
 impl ServiceManager {
     /// 创建并执行启动扫描（D8：启动扫一遍建 Catalog）。
     pub fn new(scan_dir: impl Into<PathBuf>) -> Result<Self, ScanError> {
+        let runtime = LayerRuntime::new();
         let instances = Arc::new(Mutex::new(Instances::new()));
-        let (supervisor, events_rx) = Supervisor::new(Arc::clone(&instances));
+        let (supervisor, mut events_rx) = Supervisor::new(Arc::clone(&instances));
+        let router = Arc::new(Router::new(
+            Arc::clone(&instances),
+            runtime.handle().clone(),
+            DEFAULT_CALL_TIMEOUT,
+        ));
+        // 状态翻转 → 订阅者转发循环 (订阅塌缩成路由, D7/D9)
+        let fwd = router.clone();
+        runtime.spawn(async move {
+            while let Some(change) = events_rx.recv().await {
+                fwd.publish_state_change(change);
+            }
+        });
         let mgr = ServiceManager {
             scan_dir: scan_dir.into(),
             internals: Mutex::new(Vec::new()),
             catalog: RwLock::new(Catalog::new()),
             instances,
-            state_events: Mutex::new(Some(events_rx)),
             next_id: AtomicU64::new(1),
             supervisor: Arc::new(supervisor),
+            runtime,
+            router,
         };
         mgr.rebuild_catalog()?;
         Ok(mgr)
@@ -130,9 +156,89 @@ impl ServiceManager {
         &self.supervisor
     }
 
-    /// 取出状态事件流（Router 订阅转发用，只取一次；task 4.x 接线）。
-    pub(crate) fn take_state_events(&self) -> Option<UnboundedReceiver<StateChange>> {
-        self.state_events.lock().expect("state_events poisoned").take()
+    // ---------- 双门 API（D9）：future 门 + poll 门；**无回调门** ----------
+
+    /// ask（future 门，默认超时）：内部急切分发，返回 executor-agnostic
+    /// future（gpui executor / tokio / 测试 block_on 均可 await，D9）。
+    pub fn call(
+        &self,
+        env: Envelope,
+    ) -> impl Future<Output = Result<Payload, RouteError>> + Send + 'static {
+        self.call_with_timeout(env, self.router.default_timeout())
+    }
+
+    /// ask（future 门，显式超时）。
+    pub fn call_with_timeout(
+        &self,
+        env: Envelope,
+        timeout: Duration,
+    ) -> impl Future<Output = Result<Payload, RouteError>> + Send + 'static {
+        self.router
+            .call_future(env, self.router.self_address(), timeout)
+    }
+
+    /// tell：**无同步反馈**（失败落死信，只有观测面可见）。约定：
+    /// **GUI 用户触发的操作一律走 ask**（错误可回显），tell 只用于
+    /// fire-and-forget 内部流（D6）。
+    pub fn tell(&self, env: Envelope) -> Result<(), RouteError> {
+        self.router.send(env)
+    }
+
+    /// 订阅状态翻转（= 往路由表加一条投递规则，订阅塌缩成路由，D7/D9）。
+    pub fn subscribe_state(&self, target: InstanceId, listener: &Listener) {
+        self.router.subscribe_state(target, listener.id());
+    }
+
+    /// 注册一个宿主参与者（拉模式 actor mailbox）——GUI 就是普通参与者（D3）。
+    pub fn new_mailbox(&self, capacity: usize) -> Listener {
+        let id = self.allocate_id();
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+        self.instances
+            .lock()
+            .expect("instances poisoned")
+            .insert(Participant::host(id, tx.clone()));
+        Listener::new((*self.router).clone(), id, tx, rx)
+    }
+
+    /// 服务侧句柄（async 门）：给 driver/服务 actor 收发用。
+    pub fn handle_for(&self, self_id: InstanceId) -> ServiceHandle {
+        ServiceHandle {
+            router: self.router.clone(),
+            self_addr: Address::instance(self_id),
+        }
+    }
+
+    // ---------- 观测面 ----------
+
+    /// 中心路由（观测/测试用）。
+    pub fn router(&self) -> &Arc<Router> {
+        &self.router
+    }
+
+    /// 死信表（ask/tell 失败、超时、晚到回复——可观测，D6）。
+    pub fn dead_letters(&self) -> Vec<DeadLetterRecord> {
+        self.router.dead_letters()
+    }
+
+    /// 消息追踪（一问一答全程留痕，D6）。
+    pub fn trace_entries(&self) -> Vec<TraceEntry> {
+        self.router.trace_entries()
+    }
+
+    /// 未销账的 ask 数（测试/观测）。
+    pub fn pending_count(&self) -> usize {
+        self.router.pending_count()
+    }
+
+    /// 中间层后台任务（driver/测试响应者；crate 内部，不对外暴露 tokio 类型）。
+    /// loader（task 3.3）接入 driver 后为常规路径。
+    #[allow(dead_code)]
+    pub(crate) fn spawn_bg<F>(&self, fut: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.runtime.spawn(fut)
     }
 }
 
@@ -154,6 +260,68 @@ impl std::fmt::Display for ServiceError {
 }
 
 impl std::error::Error for ServiceError {}
+
+/// 服务侧句柄（**async 门**，D9）：服务 actor/driver 用它发 ask/tell/回复。
+/// 不含任何 tokio/kameo 类型（克隆随身携带）。
+#[derive(Clone)]
+pub struct ServiceHandle {
+    router: Arc<Router>,
+    self_addr: Address,
+}
+
+impl ServiceHandle {
+    /// 本服务的地址（作 `from` / 回复方）。
+    pub fn address(&self) -> &Address {
+        &self.self_addr
+    }
+
+    /// 本服务的实例 id。
+    pub fn instance_id(&self) -> InstanceId {
+        self.self_addr.instance_id()
+    }
+
+    /// ask（默认超时，急切分发，executor-agnostic future）。
+    pub fn call(
+        &self,
+        env: Envelope,
+    ) -> impl Future<Output = Result<Payload, RouteError>> + Send + 'static {
+        self.call_with_timeout(env, self.router.default_timeout())
+    }
+
+    /// ask（显式超时）。
+    pub fn call_with_timeout(
+        &self,
+        env: Envelope,
+        timeout: Duration,
+    ) -> impl Future<Output = Result<Payload, RouteError>> + Send + 'static {
+        self.router
+            .call_future(env, self.self_addr.clone(), timeout)
+    }
+
+    /// tell（无同步反馈，见 [`ServiceManager::tell`] 的约定）。
+    pub fn tell(&self, env: Envelope) -> Result<(), RouteError> {
+        self.router.send(env)
+    }
+
+    /// 回复一个 ask：回复信封带 corr 原路返回 Router 销账（D5/D6：**不按
+    /// from 寻址**）。`req` 必须是 ask（无 corr → `NoSuchRoute`）。
+    pub fn reply(
+        &self,
+        req: &Envelope,
+        kind: &'static str,
+        payload: Payload,
+    ) -> Result<(), RouteError> {
+        let corr = req.corr.ok_or(RouteError::NoSuchRoute)?;
+        let env = Envelope {
+            to: req.from.route().clone(),
+            from: self.self_addr.clone(),
+            corr: Some(corr),
+            kind,
+            payload,
+        };
+        self.router.send(env)
+    }
+}
 
 #[cfg(test)]
 mod tests {

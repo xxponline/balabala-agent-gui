@@ -30,6 +30,9 @@ pub type ServiceFactory = fn() -> Box<dyn Service>;
 /// # Safety
 /// 跨 cdylib 边界返回 `Box<dyn Service>` 依赖"同次编译 + 构建指纹校验"
 /// （D12 路线甲）；vtable/代码位于插件内，与"永不 dlclose"（D8）绑定。
+/// FFI-safety 警告是有意接受的：两侧同 rustc 同次构建（由 D8 指纹兑底），
+/// 胖指针（data + vtable）经 extern "C" sret 返回在同编译器下形状一致。
+#[allow(improper_ctypes_definitions)]
 pub type DllServiceFactory = unsafe extern "C" fn() -> Box<dyn Service>;
 
 /// 插件必须导出的工厂符号名。
