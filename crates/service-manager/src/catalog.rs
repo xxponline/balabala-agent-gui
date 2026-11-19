@@ -110,7 +110,7 @@ impl Catalog {
 mod tests {
     use super::*;
 
-    fn a_service() -> Box<dyn service_core::Service> {
+    fn a_service(_ctx: service_core::ServiceCtx) -> Box<dyn service_core::Service> {
         struct A;
         impl service_core::Service for A {
             fn start(&mut self) -> Result<(), String> {
@@ -143,11 +143,42 @@ mod tests {
 
     #[test]
     fn internal_descriptor_carries_factory() {
-        let desc = ServiceDescriptor::internal("fake", a_service as fn() -> Box<dyn service_core::Service>);
+        struct Noop;
+        impl service_core::Messaging for Noop {
+            fn instance_id(&self) -> service_core::InstanceId {
+                service_core::InstanceId(0)
+            }
+            fn self_address(&self) -> service_core::Address {
+                service_core::Address::instance(service_core::InstanceId(0))
+            }
+            fn tell(&self, _env: service_core::Envelope) -> Result<(), service_core::RouteError> {
+                Ok(())
+            }
+            fn call(
+                &self,
+                _env: service_core::Envelope,
+            ) -> service_core::CallFuture {
+                Box::pin(std::future::ready(Err(service_core::RouteError::NoSuchRoute)))
+            }
+            fn reply(
+                &self,
+                _req: &service_core::Envelope,
+                _kind: &'static str,
+                _payload: service_core::Payload,
+            ) -> Result<(), service_core::RouteError> {
+                Ok(())
+            }
+        }
+        let ctx = service_core::ServiceCtx {
+            instance: service_core::InstanceId(0),
+            service: "fake".into(),
+            messaging: std::sync::Arc::new(Noop),
+        };
+        let desc = ServiceDescriptor::internal("fake", a_service as ServiceFactory);
         assert_eq!(desc.name.as_str(), "fake");
         match desc.origin {
             ServiceOrigin::Internal(f) => {
-                let mut svc = f();
+                let mut svc = f(ctx);
                 assert!(svc.start().is_ok());
             }
             other => panic!("origin 不对: {other:?}"),
@@ -157,7 +188,7 @@ mod tests {
     #[test]
     fn remove_and_lookup() {
         let mut cat = Catalog::new();
-        cat.insert(ServiceDescriptor::internal("x", a_service as fn() -> Box<dyn service_core::Service>));
+        cat.insert(ServiceDescriptor::internal("x", a_service as ServiceFactory));
         assert!(cat.contains(&"x".into()));
         assert!(cat.remove(&"x".into()).is_some());
         assert!(cat.get(&"x".into()).is_none());

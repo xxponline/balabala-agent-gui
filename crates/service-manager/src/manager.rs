@@ -9,7 +9,7 @@ use crate::runtime::LayerRuntime;
 use crate::scanner::{self, ScanError};
 use crate::supervisor::Supervisor;
 use service_core::{
-    Address, Envelope, InstanceId, Payload, RouteError, ServiceFactory, ServiceName,
+    Address, Envelope, InstanceId, Messaging, Payload, RouteError, ServiceFactory, ServiceName,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -327,6 +327,35 @@ impl ServiceHandle {
     }
 }
 
+/// [`ServiceHandle`] 即宿主侧 [`Messaging`] 实现：经 `ServiceCtx` 注入服务
+/// 构造（core 定义 trait、manager 实现——D11 依赖边的兑现点）。
+impl Messaging for ServiceHandle {
+    fn instance_id(&self) -> InstanceId {
+        self.self_addr.instance_id()
+    }
+
+    fn self_address(&self) -> Address {
+        self.self_addr.clone()
+    }
+
+    fn tell(&self, env: Envelope) -> Result<(), RouteError> {
+        ServiceHandle::tell(self, env)
+    }
+
+    fn call(&self, env: Envelope) -> service_core::CallFuture {
+        Box::pin(self.call_with_timeout(env, self.router.default_timeout()))
+    }
+
+    fn reply(
+        &self,
+        req: &Envelope,
+        kind: &'static str,
+        payload: Payload,
+    ) -> Result<(), RouteError> {
+        ServiceHandle::reply(self, req, kind, payload)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,7 +373,7 @@ mod tests {
             Box::pin(std::future::ready(()))
         }
     }
-    fn fake_factory() -> Box<dyn service_core::Service> {
+    fn fake_factory(_ctx: service_core::ServiceCtx) -> Box<dyn service_core::Service> {
         Box::new(Fake)
     }
 
@@ -357,7 +386,7 @@ mod tests {
             Box::pin(std::future::ready(()))
         }
     }
-    fn other_factory() -> Box<dyn service_core::Service> {
+    fn other_factory(_ctx: service_core::ServiceCtx) -> Box<dyn service_core::Service> {
         Box::new(Other)
     }
 
