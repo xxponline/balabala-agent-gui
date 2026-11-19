@@ -13,13 +13,13 @@
 
 ## 2. service-core + contracts（词汇表）
 
-- [ ] 2.1 `service-core`：`Route`（Instance / Service(name, Direct(id)|Any)）、
+- [x] 2.1 `service-core`：`Route`（Instance / Service(name, Direct(id)|Any)）、
       `Envelope`（to/from/corr/kind/payload，from 仅实例/actor 地址）、
       `Payload::Typed(Arc<dyn Any + Send + Sync>)`、`ServiceState`
       （loading/available/offline/error）、`RouteError`（Timeout /
       TargetNotAvailable / DeadLetter / NoSuchRoute / TypeMismatch）。
       验证：单测覆盖各类型构造与语义断言（如 from 拒绝 Service(..)）。
-- [ ] 2.2 `contracts` crate（零依赖）：命名空间骨架 `contracts::shared`
+- [x] 2.2 `contracts` crate（零依赖）：命名空间骨架 `contracts::shared`
       （双向共享类型）+ 按服务分目录；归属规则注释写明"消息归调用方、
       双向归中立"。验证：`cargo build -p contracts` 零依赖通过。
 
