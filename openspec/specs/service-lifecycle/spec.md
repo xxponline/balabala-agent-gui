@@ -1,6 +1,10 @@
-# Spec Delta
+# service-lifecycle Specification
 
-## ADDED Requirements
+## Purpose
+
+管理可加载服务的完整生命周期：目录扫描建 Catalog、装载/停用/重载与同服务多实例、每实例标准状态机（loading/available/offline/error）及其事件语义——服务进出生死的唯一权威。
+
+## Requirements
 
 ### Requirement: Catalog construction and unified registration
 

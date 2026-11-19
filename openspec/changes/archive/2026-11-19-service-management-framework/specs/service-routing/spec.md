@@ -1,5 +1,9 @@
 # Spec Delta
 
+## Purpose
+
+中心路由承载一切消息的收发语义：统一信封与类型化 payload、两级寻址与实例挑选、请求/应答与 Router 持超时、fail-fast 零缓冲与死信观测，宿主/GUI/插件参与者一律对等。
+
 ## ADDED Requirements
 
 ### Requirement: Envelope and typed payload
