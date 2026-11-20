@@ -11,10 +11,10 @@
 
 ## 2. 边界收紧 Level 2（design D2–D4）
 
-- [ ] 2.1 `traits.rs`：改名 `EnumeratorOwner`/`Enumerator` + `root()` 访问器（中文 doc）；`impl root() for Project` 落 project 域；全量引用更新。验证：`cargo build` 通过；`rg "AssetEnumeratable|AssetEnumerator"` 全库归零
-- [ ] 2.2 manager 注册面 trait 化：持 `Vec<Box<dyn EnumeratorOwner + Send>>`；`register`/`register_project` 改收 owner（保 solution 序、身份 = `owner.root()`、重复 root 语义与旧实现逐字一致）；refresh 在主线程逐 owner 调 `enumerator()` 再把 `Box<dyn Enumerator>` 丢 spawn（**owner 不入 spawn**，design D2）；app.rs 注册点跟改。验证：`cargo build` 通过 + 既有 manager 测试全绿（调用点改收 owner）
-- [ ] 2.3 `Module.filters` 降私有：注入收敛到 `Project` 构建/`provision_filters` 内部；project_model 内测试改行为断言；`filter.rs` 可见性收紧 `pub(crate)`。验证：`cargo build` 通过；`rg -i "filter" src/assets/` 归零
-- [ ] 2.4 manager 测试补假 owner 用例（不改旧用例；新函数中文 doc）。验证：新增测试绿，旧测试数不变
+- [x] 2.1 `traits.rs`：改名 `EnumeratorOwner`/`Enumerator` + `root()` 访问器（中文 doc）；`impl root() for Project` 落 project 域；全量引用更新。验证：`cargo build` 通过；`rg "AssetEnumeratable|AssetEnumerator"` 全库归零
+- [x] 2.2 manager 注册面 trait 化：持 `Vec<Box<dyn EnumeratorOwner + Send>>`；`register`/`register_project` 改收 owner（保 solution 序、身份 = `owner.root()`、重复 root 语义与旧实现逐字一致）；refresh 在主线程逐 owner 调 `enumerator()` 再把 `Box<dyn Enumerator>` 丢 spawn（**owner 不入 spawn**，design D2）；app.rs 注册点跟改。验证：`cargo build` 通过 + 既有 manager 测试全绿（调用点改收 owner）
+- [x] 2.3 `Module.filters` 降私有：注入收敛到 `Project` 构建/`provision_filters` 内部；project_model 内测试改行为断言；`filter.rs` 可见性收紧 `pub(crate)`。验证：`cargo build` 通过；`rg -i "filter" src/assets/` 归零
+- [x] 2.4 manager 测试补假 owner 用例（不改旧用例；新函数中文 doc）。验证：新增测试绿，旧测试数不变
 - [ ] 2.5 组 2 验收：`cargo test --workspace` 全绿（268 + 新增）/ 0 warnings 逐数对账；`cargo clippy --all-targets` 干净；asset-manager 10 需求 + file-tree 7 需求映射用例原绿。验证：命令输出对账 + 组 2 独立 commit
 
 ## 3. 构造注入（design D7）

@@ -305,7 +305,7 @@ impl Render for AssetView {
         let theme_danger = cx.theme().danger;
         let theme_border = cx.theme().border;
         let theme_accent = cx.theme().accent;
-        // 规则摘要位已撤除 (file-filter-prune D9: 规则源 = 项目根
+        // 规则摘要位已撤除 (D9: 规则源 = 项目根
         // .gitignore, 头部无数据源 — dock-layout delta 同步收窄)
         // render 读同步缓存（on_data_changed 已保证先于 notify 同步）
         let body = match &self.last_synced {

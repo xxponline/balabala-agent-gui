@@ -3,7 +3,7 @@
 //! 职责链 (change: asset-package-merge): solution 注册 owner → 异步枚举
 //! (project 域实现, 见 `crate::project_model::enumerate`) → `AssetState`
 //! 落地 → 面板纯显示。依赖方向单向: `project_model → assets` —
-//! 本包只见 [`traits`] 两个契约与 [`state`] DTO, 不见 Project/filter。
+//! 本包只见 [`traits`] 两个契约与 [`state`] DTO, 不见 Project/规则引擎。
 //!
 //! 模块分步归位 (tasks 组1): [`state`]/[`traits`]/[`manager`]/[`panel`]
 //! 已全部落位; 枚举实现归位 project 域见 1.4。

@@ -25,7 +25,9 @@ pub struct Module {
     pub children: Vec<Module>,
     /// 过滤集 (design D2 注入点): Project 枚举时构建 — 默认
     /// [`DotFilter`] + 项目根 git 时的 [`GitIgnoreFilter`] (D8)。
-    pub filters: Vec<Arc<dyn FileFilter>>,
+    /// `pub(super)`: project_model 子树内可见 (enumerate 消费),
+    /// 资产侧 (`crate::assets`) 不可见 — 注入只发生在构建期。
+    pub(super) filters: Vec<Arc<dyn FileFilter>>,
 }
 
 impl Module {
@@ -99,7 +101,7 @@ impl Project {
     /// project root): 恒含默认 [`DotFilter`];仅当 `root/.git` 存在时
     /// 读 `root/.gitignore` 追加 [`GitIgnoreFilter`] — 非 git 根不
     /// 探测任何 ignore 文件, 读失败 best-effort 跳过。
-    pub fn provision_filters(&self) -> Vec<Arc<dyn FileFilter>> {
+    fn provision_filters(&self) -> Vec<Arc<dyn FileFilter>> {
         let mut filters: Vec<Arc<dyn FileFilter>> = vec![Arc::new(DotFilter)];
         if self.root.join(".git").exists() {
             if let Ok(text) = std::fs::read_to_string(self.root.join(".gitignore")) {
@@ -112,7 +114,7 @@ impl Project {
     /// 枚举时调用 (design D2): 判定 git、读 `.gitignore`、构建 filter
     /// 集并**注入现建的 Module 副本**。IO 在调用方的 bg task 内;
     /// 每次枚举重建 → 刷新天然重读 (spec: Refresh re-reads filter rules)。
-    pub fn modules_for_enumeration(&self) -> Vec<Module> {
+    pub(super) fn modules_for_enumeration(&self) -> Vec<Module> {
         let filters = self.provision_filters();
         self.modules
             .iter()
@@ -187,7 +189,8 @@ mod tests {
 
         let p = Project::from_root(root.clone());
         let filters = p.provision_filters();
-        assert_eq!(filters.len(), 2, "Dot + GitIgnore 各一");
+        // 行为对 (替代计数断言): Dot 命中 .env + gitignore 命中 cache.tmp
+        // → 两种规则都在且都生效。
         assert!(
             filters.iter().any(|f| f.is_ignored(".env", false)),
             "默认 Dot 在列"
@@ -199,7 +202,6 @@ mod tests {
 
         let modules = p.modules_for_enumeration();
         assert_eq!(modules.len(), 1, "现建 Module");
-        assert_eq!(modules[0].filters.len(), 2, "Module 收到注入");
         assert!(
             modules[0].filters.iter().any(|f| f.is_ignored("cache.tmp", false)),
             "注入的 filter 对条目生效"
@@ -217,7 +219,7 @@ mod tests {
 
         let p = Project::from_root(root.clone());
         let filters = p.provision_filters();
-        assert_eq!(filters.len(), 1, "仅默认 Dot");
+        // 行为对 (替代计数断言): Dot 命中 + gitignore 规则不命中 → 仅 Dot。
         assert!(
             filters.iter().any(|f| f.is_ignored(".env", false)),
             "默认 Dot 在列"
@@ -234,11 +236,16 @@ mod tests {
     fn git_project_without_gitignore_only_dot() {
         let root = temp_root("git-empty");
         std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("notes.log"), "x").unwrap();
 
         let p = Project::from_root(root.clone());
         let filters = p.provision_filters();
-        assert_eq!(filters.len(), 1, "无 .gitignore → 仅默认 Dot");
+        // 行为对 (替代计数断言): Dot 命中 .env + 无 gitignore 规则命中。
         assert!(filters.iter().any(|f| f.is_ignored(".env", false)));
+        assert!(
+            !filters.iter().any(|f| f.is_ignored("notes.log", false)),
+            "无 .gitignore → 无 gitignore 规则命中 (仅默认 Dot)"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

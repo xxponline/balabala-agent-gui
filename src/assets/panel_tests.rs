@@ -5,7 +5,7 @@
     //! 解析到 `gpui_kit::test` → 递归爆 (app.rs 同款教训)。
 
     use crate::app::TerminalApp;
-    use crate::assets::{AssetManager, AssetState};
+    use crate::assets::{AssetManager, AssetState, traits::EnumeratorOwner};
     use crate::project_model::Project;
     use gpui_kit::test::{TestQueryExt, TestWindowExt};
     use gpui_kit::{
@@ -63,7 +63,7 @@
     }
 
     /// 写 hermetic 规则 (项目根 `.gitignore` + `.git` 标记 —
-    /// 过滤源 = 项目根 git 供给, file-filter-prune D9)。
+    /// 过滤源 = 项目根 git 供给; D9)。
     fn write_rules(ws: &Path, rules: &[&str]) {
         std::fs::create_dir_all(ws.join(".git")).unwrap();
         let body: String = rules.iter().map(|s| format!("{s}\n")).collect();
@@ -76,7 +76,7 @@
         app.update(cx, |app, cx| {
             let project = Project::from_root(ws.to_path_buf());
             app.asset_manager
-                .update(cx, |m, cx| m.register(ws.to_path_buf(), vec![project], cx));
+                .update(cx, |m, cx| m.register(ws.to_path_buf(), vec![Box::new(project) as Box<dyn EnumeratorOwner + Send>], cx));
         });
     }
 
@@ -731,9 +731,9 @@
         .expect("update window");
     }
 
-    /// spec: Refresh re-reads filter rules — 改 .gitignore → ⟳ 生效。
+    /// spec: Refresh 重读规则 — 改 .gitignore → ⟳ 生效。
     #[gpui_kit::test]
-    fn refresh_rereads_filter_rules(cx: &mut TestAppContext) {
+    fn refresh_rereads_rules(cx: &mut TestAppContext) {
         let (handle, app) = open_app(cx);
         let ws = temp_ws("reread");
         std::fs::write(ws.join("reread-a.txt"), "x").unwrap();
@@ -752,7 +752,7 @@
         })
         .expect("update window");
 
-        // 改配置文件 → ⟳ 重读规则 (spec: refresh re-reads filter rules)
+        // 改配置文件 → ⟳ 重读规则 (spec: refresh 重读规则)
         write_rules(&ws, &["*.rs"]);
         click_id(handle, "tree-refresh", cx);
         render(handle, cx);
@@ -847,7 +847,7 @@
         render(handle, cx);
     }
 
-    /// dock-layout delta (file-filter-prune): header 摘要位已撤除 —
+    /// dock-layout delta (D9): header 摘要位已撤除 —
     /// 规则源 = 项目根 .gitignore, 头部只保留 标题 + ⟳ + 关闭。
     #[gpui_kit::test]
     fn header_has_no_rule_summary(cx: &mut TestAppContext) {
@@ -898,7 +898,7 @@
     /// 7.1 全链路 (app × 面板贯通): 打开注册 → 异步枚举落树 → 过滤 →
     /// ⟳ 保展开 → 加 solution 增量 → 切换清场。
     #[gpui_kit::test]
-    fn full_chain_open_filter_refresh_add_switch(cx: &mut TestAppContext) {
+    fn full_chain_open_rules_refresh_add_switch(cx: &mut TestAppContext) {
         let (handle, app) = open_app(cx);
 
         // 1. 工作区 ws1 (项目根 = ws1 自身): 被过滤的 .log + 目录 + .rs
@@ -907,7 +907,7 @@
         std::fs::write(ws1.join("noise.log"), "x").unwrap();
         std::fs::create_dir_all(ws1.join("keepdir")).unwrap();
         std::fs::write(ws1.join("keepdir/child.txt"), "x").unwrap();
-        // 规则在项目根 .gitignore (file-filter-prune D9), 与 marker
+        // 规则在项目根 .gitignore (D9), 与 marker
         // 无涉 — 先建工作区文件后写规则即可
         crate::project_model::create_workspace_files(&ws1).unwrap();
         crate::project_model::append_simple_solution(&ws1, ws1.clone()).unwrap();

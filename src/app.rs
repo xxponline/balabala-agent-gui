@@ -24,7 +24,7 @@ use crate::service_layer::CtrlOp;
 use agent_service::terminal::{AgentTerminal, TerminalCopy, TerminalTab};
 use crate::property_detail_manager::{OpenObject, active_center_panel_id, handler_for};
 use crate::shell;
-use crate::assets::{AssetManager, AssetView};
+use crate::assets::{AssetManager, AssetView, traits::EnumeratorOwner};
 use crate::project_model::{self, MarkerStatus, WorkspaceModel};
 use crate::sidebar::{SidebarEvent, SidebarPanel};
 use crate::workspace::history::History;
@@ -584,8 +584,13 @@ impl TerminalApp {
                 self.workspace = Some(Workspace::new(path.clone(), model));
                 // 注册进 asset_manager (design D6: 打开 = 全量替换;
                 // 过滤规则由 Project 供给 — file-filter-prune D9)
+                let owners: Vec<Box<dyn EnumeratorOwner + Send>> =
+                    projects
+                        .into_iter()
+                        .map(|p| Box::new(p) as Box<dyn EnumeratorOwner + Send>)
+                        .collect();
                 self.asset_manager
-                    .update(cx, |m, cx| m.register(path, projects, cx));
+                    .update(cx, |m, cx| m.register(path, owners, cx));
             }
         }
         cx.notify();
@@ -654,7 +659,7 @@ impl TerminalApp {
         // 增量注册 (design D6): add-solution → 新项目无重启入右树
         if let Some(project) = added {
             self.asset_manager
-                .update(cx, |m, cx| m.register_project(project, cx));
+                .update(cx, |m, cx| m.register_project(Box::new(project), cx));
         }
         cx.notify();
         self.notify_panels(cx);

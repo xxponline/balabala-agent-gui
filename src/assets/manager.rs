@@ -18,11 +18,10 @@ use gpui_kit::*;
 
 use crate::app::TerminalApp;
 use crate::assets::state::{AssetEffect, AssetKind, AssetMenu, find_kind};
-use crate::project_model::Project;
 use crate::property_detail_manager::OpenObject;
 
 use crate::assets::state::AssetState;
-use super::traits::AssetEnumeratable;
+use super::traits::{Enumerator, EnumeratorOwner};
 
 /// 右键功能 id (spec: Right-click context menu)。
 pub const FUNC_COPY_PATH: &str = "copy-path";
@@ -34,8 +33,9 @@ pub struct AssetManager {
     /// 工作区配置目录 — 规则读取点 (spec: re-read on refresh);
     /// None = 从未注册。
     ws_dir: Option<PathBuf>,
-    /// 注册集 (保持 solution 序; 身份 = project root)。
-    projects: Vec<Project>,
+    /// 注册集 (保持 solution 序; 身份 = `owner.root()`) —
+    /// 资产侧只见 trait, 不见 Project (design D3: Level 2)。
+    owners: Vec<Box<dyn EnumeratorOwner + Send>>,
     /// 三态视图 (design D5)。
     view: AssetState,
     /// 视图代数: 每次失效 (注册/刷新入口) 与每次落地各 +1 —
@@ -56,7 +56,7 @@ impl AssetManager {
         Self {
             app,
             ws_dir: None,
-            projects: Vec::new(),
+            owners: Vec::new(),
             view: AssetState::Empty,
             generation: 0,
             in_flight: None,
@@ -133,14 +133,14 @@ impl AssetManager {
     pub fn register(
         &mut self,
         ws_dir: PathBuf,
-        projects: Vec<Project>,
+        owners: Vec<Box<dyn EnumeratorOwner + Send>>,
         cx: &mut Context<Self>,
     ) {
         self.ws_dir = Some(ws_dir);
-        self.projects = projects;
+        self.owners = owners;
         self.in_flight = None; // supersede 旧在途
         self.set_view(AssetState::Empty);
-        if self.projects.is_empty() {
+        if self.owners.is_empty() {
             return;
         }
         self.spawn_enumerate(cx);
@@ -148,11 +148,11 @@ impl AssetManager {
 
     /// 增量注册 (add-solution): 保留旧视图直到新枚举落地
     /// (spec: … previous content … until the enumeration lands)。
-    pub fn register_project(&mut self, project: Project, cx: &mut Context<Self>) {
-        if self.projects.iter().any(|p| p.root == project.root) {
-            return; // 幂等: 同 root 不重复注册
+    pub fn register_project(&mut self, owner: Box<dyn EnumeratorOwner + Send>, cx: &mut Context<Self>) {
+        if self.owners.iter().any(|o| o.root() == owner.root()) {
+            return; // 幂等: 同 `owner.root()` 不重复注册 (语义逐字冻结)
         }
-        self.projects.push(project);
+        self.owners.push(owner);
         if self.ws_dir.is_some() {
             self.spawn_enumerate(cx);
         }
@@ -161,7 +161,7 @@ impl AssetManager {
     /// 显式刷新 (⟳): 重读规则 + supersede 在途; 代数入口 +1
     /// (spec: explicit refresh 是缓存失效输入之一)。
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.projects.is_empty() {
+        if self.owners.is_empty() {
             return; // 零注册无物可枚举
         }
         self.generation += 1;
@@ -179,7 +179,10 @@ impl AssetManager {
         if self.ws_dir.is_none() {
             return; // 从未注册 (defensive)
         }
-        let projects = self.projects.clone();
+        // 过滤供给在 owner 侧 (design D2/D8): 主线程同步构造枚举执行体
+        // — owner 不入 spawn (design D2), 执行体 (Send) 丢后台执行。
+        let enumerators: Vec<Box<dyn Enumerator>> =
+            self.owners.iter().map(|o| o.enumerator()).collect();
         let app = self.app.clone();
         #[cfg(test)]
         self.enumerate_starts.set(self.enumerate_starts.get() + 1);
@@ -189,11 +192,11 @@ impl AssetManager {
             let outcome = bg.spawn({
                 let bg = bg.clone();
                 async move {
-                    // 过滤供给在 Project 侧 (design D2/D8): 枚举时判
-                    // git、读 .gitignore、注入 Module — manager 只消费。
-                    let mut nodes = Vec::with_capacity(projects.len());
-                    for project in &projects {
-                        let node = project.enumerator().enumerate(bg.clone()).await?;
+                    // 单一求值权威在扫描期 (design D1): 枚举产物即视图,
+                    // land 前不再有后处理 pass。
+                    let mut nodes = Vec::with_capacity(enumerators.len());
+                    for en in enumerators {
+                        let node = en.enumerate(bg.clone()).await?;
                         nodes.push(node);
                     }
                     // 单一求值权威在扫描期 (design D1): 枚举产物即视图,

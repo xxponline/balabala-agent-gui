@@ -1,7 +1,7 @@
 //! 资产枚举契约与标准实现 (design D2; spec: Asynchronous asset
 //! enumeration / Module file enumeration with default exclusions)。
 //!
-//! - `AssetEnumeratable` → `AssetEnumerator`: 异步产出一棵资产子树;
+//! - `EnumeratorOwner` → `Enumerator`: 异步产出一棵资产子树;
 //!   `BoxFuture` 承载对象安全的异步 (零新依赖, `Send` 边界保证可入后台)。
 //! - Project 的枚举器 = 自身 → 异步枚举出所有 Module (其子节点)。
 //! - Module 的枚举器 = 标准文件枚举器 (从 `module.root` 递归扫文件)。
@@ -21,7 +21,7 @@ use super::filter::FileFilter;
 use super::{Module, Project};
 
 use crate::assets::state::{AssetKind, AssetNode, project_id};
-use crate::assets::traits::{AssetEnumeratable, AssetEnumerator, BoxFuture};
+use crate::assets::traits::{EnumeratorOwner, Enumerator, BoxFuture};
 
 /// 标准文件资产枚举器 (单独实现): 保存注入的 filter 列表
 /// (design D2), 从根目录递归枚举、逐条目过滤减支。
@@ -47,7 +47,7 @@ impl FileEnumerator {
     }
 }
 
-impl AssetEnumerator for FileEnumerator {
+impl Enumerator for FileEnumerator {
     fn enumerate(
         self: Box<Self>,
         bg: BackgroundExecutor,
@@ -151,7 +151,7 @@ fn module_row(module: &Module, scanned: AssetNode) -> AssetNode {
     }
 }
 
-impl AssetEnumerator for ModuleEnumerator {
+impl Enumerator for ModuleEnumerator {
     fn enumerate(
         self: Box<Self>,
         bg: BackgroundExecutor,
@@ -170,8 +170,12 @@ impl AssetEnumerator for ModuleEnumerator {
     }
 }
 
-impl AssetEnumeratable for Module {
-    fn enumerator(&self) -> Box<dyn AssetEnumerator> {
+impl EnumeratorOwner for Module {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn enumerator(&self) -> Box<dyn Enumerator> {
         Box::new(ModuleEnumerator {
             module: self.clone(),
         })
@@ -197,7 +201,7 @@ fn project_row(project: &Project, module_nodes: Vec<AssetNode>) -> AssetNode {
     }
 }
 
-impl AssetEnumerator for ProjectEnumerator {
+impl Enumerator for ProjectEnumerator {
     fn enumerate(
         self: Box<Self>,
         bg: BackgroundExecutor,
@@ -218,8 +222,12 @@ impl AssetEnumerator for ProjectEnumerator {
     }
 }
 
-impl AssetEnumeratable for Project {
-    fn enumerator(&self) -> Box<dyn AssetEnumerator> {
+impl EnumeratorOwner for Project {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn enumerator(&self) -> Box<dyn Enumerator> {
         Box::new(ProjectEnumerator {
             project: self.clone(),
         })

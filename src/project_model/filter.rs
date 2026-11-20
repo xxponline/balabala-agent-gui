@@ -21,7 +21,7 @@
 /// 过滤契约(design D3):`rel_path` 用 `/` 分隔、相对枚举根;
 /// `is_dir` 来自 lstat(符号链接 = 文件)。对象安全、`Send + Sync`
 /// (经 `Arc` 随 Project 克隆进 bg spawn),无状态、可注入多个。
-pub trait FileFilter: Send + Sync {
+pub(crate) trait FileFilter: Send + Sync {
     fn is_ignored(&self, rel_path: &str, is_dir: bool) -> bool;
 }
 
@@ -137,7 +137,7 @@ impl Rule {
 }
 
 /// 编译好的 gitignore 规则集(design D4):编译一次、逐条目复用。
-pub struct GitIgnoreFilter {
+pub(crate) struct GitIgnoreFilter {
     rules: Vec<Rule>,
 }
 
@@ -185,7 +185,7 @@ impl FileFilter for GitIgnoreFilter {
 /// 默认硬排除 filter(design D5):rel 末段 label 以 `.` 开头 → 忽略
 /// (文件/目录同判、任意深度)。六项名单已撤销;独立 filter、OR 组合、
 /// **无跨层反悔** — `.gitignore` 的 `!.env` 救不回。
-pub struct DotFilter;
+pub(crate) struct DotFilter;
 
 impl FileFilter for DotFilter {
     fn is_ignored(&self, rel_path: &str, _is_dir: bool) -> bool {

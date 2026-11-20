@@ -6,11 +6,18 @@
     use super::{AssetManager, FUNC_COPY_PATH, FUNC_REVEAL};
     use crate::app::TerminalApp;
     use crate::assets::state::{AssetKind, AssetNode, AssetState, project_id};
+    use crate::assets::traits::{BoxFuture, Enumerator, EnumeratorOwner};
     use crate::project_model::Project;
     use gpui_kit::{
-        AppContext, Bounds, Point, TestAppContext, WindowBounds, WindowOptions, px, size,
+        AppContext, BackgroundExecutor, Bounds, Point, TestAppContext, WindowBounds,
+        WindowOptions, px, size,
     };
     use std::path::{Path, PathBuf};
+
+    /// Level 2 注册面装箱 (测试夹具): Project -> owner。
+    fn own(p: Project) -> Box<dyn EnumeratorOwner + Send> {
+        Box::new(p)
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -96,7 +103,7 @@
         assert_eq!(gen_before, 0);
         assert_eq!(starts, 0);
 
-        manager.update(cx, |m, cx| m.register(ws.clone(), vec![project], cx));
+        manager.update(cx, |m, cx| m.register(ws.clone(), vec![own(project)], cx));
         // 注册即清场: 落地前视图 Empty (异步性 + 不闪旧树), 枚举已启动
         cx.update(|cx| {
             let m = manager.read(cx);
@@ -168,7 +175,7 @@
         let ghost = ws.join("ghost"); // 不创建
         let project = Project::from_root(ghost.clone());
 
-        manager.update(cx, |m, cx| m.register(ws, vec![project], cx));
+        manager.update(cx, |m, cx| m.register(ws, vec![own(project)], cx));
         cx.run_until_parked();
         cx.update(|cx| {
             let m = manager.read(cx);
@@ -187,10 +194,10 @@
     /// `.gitignore` (供给链: git 判定 + 读取 + 注入), land 时逐
     /// Project 各自根求值。
     #[gpui_kit::test]
-    fn filtering_applies_to_every_project_at_land(cx: &mut TestAppContext) {
+    fn per_project_rules_apply_at_land(cx: &mut TestAppContext) {
         let app = open_app(cx);
         let manager = manager_of(cx, &app);
-        let ws = temp_dir("filter-ws");
+        let ws = temp_dir("rules-ws");
         let p1 = ws.join("one");
         let p2 = ws.join("two");
         // 供给前提: 两个项目各自 git 管理 + 项目根 .gitignore 隐藏 *.log
@@ -207,7 +214,10 @@
         let projects = vec![
             Project::from_root(p1.clone()),
             Project::from_root(p2.clone()),
-        ];
+        ]
+        .into_iter()
+        .map(own)
+        .collect();
 
         manager.update(cx, |m, cx| m.register(ws, projects, cx));
         cx.run_until_parked();
@@ -256,7 +266,7 @@
         touch(&p.join("target/debug/bin"));
         let project = Project::from_root(p.clone());
 
-        manager.update(cx, |m, cx| m.register(ws, vec![project], cx));
+        manager.update(cx, |m, cx| m.register(ws, vec![own(project)], cx));
         cx.run_until_parked();
         cx.update(|cx| {
             let view = manager.read(cx).state();
@@ -301,7 +311,7 @@
         touch(&p.join("main.rs"));
         let project = Project::from_root(p);
 
-        manager.update(cx, |m, cx| m.register(ws, vec![project], cx));
+        manager.update(cx, |m, cx| m.register(ws, vec![own(project)], cx));
         cx.run_until_parked();
         cx.update(|cx| {
             let view = manager.read(cx).state();
@@ -338,7 +348,7 @@
         touch(&project_dir.join("a.rs"));
         let project = Project::from_root(project_dir);
 
-        manager.update(cx, |m, cx| m.register(ws, vec![project], cx));
+        manager.update(cx, |m, cx| m.register(ws, vec![own(project)], cx));
         // 在途期间连发数据变更通知 (面板路径, 不经 manager)
         for _ in 0..3 {
             app.update(cx, |app, cx| app.notify_panels(cx));
@@ -365,7 +375,7 @@
         touch(&project_dir.join("a.rs"));
         let project = Project::from_root(project_dir);
 
-        manager.update(cx, |m, cx| m.register(ws, vec![project], cx));
+        manager.update(cx, |m, cx| m.register(ws, vec![own(project)], cx));
         // 不 park: 在途中显式刷新
         manager.update(cx, |m, cx| m.refresh(cx));
         let starts_after_refresh =
@@ -392,7 +402,7 @@
         let ws = temp_dir("o1");
         touch(&ws.join("p/a.rs"));
         let project = Project::from_root(ws.join("p"));
-        manager.update(cx, |m, cx| m.register(ws, vec![project], cx));
+        manager.update(cx, |m, cx| m.register(ws, vec![own(project)], cx));
         cx.run_until_parked();
 
         let (gen0, view0) = cx.update(|cx| {
@@ -495,3 +505,106 @@
         });
     }
 
+
+    /// 假资产源 (Level 2 测试缝, design D2): 不碰文件系统, 直接产出
+    /// 固定子树 — manager 只见 `EnumeratorOwner` 契约, 无需真实 Project。
+    struct FakeOwner {
+        /// 身份根 (增量注册幂等判据)。
+        root: PathBuf,
+        /// 固定行 (枚举直接产出)。
+        node: AssetNode,
+    }
+
+    impl EnumeratorOwner for FakeOwner {
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        fn enumerator(&self) -> Box<dyn Enumerator> {
+            // 快照在主线程 (owner 不入 spawn 的契约同款)
+            let node = self.node.clone();
+            Box::new(FakeEnumerator { node })
+        }
+    }
+
+    /// 假枚举执行体: 直接返回固定节点 (无后台 IO)。
+    struct FakeEnumerator {
+        node: AssetNode,
+    }
+
+    impl Enumerator for FakeEnumerator {
+        fn enumerate(
+            self: Box<Self>,
+            _bg: BackgroundExecutor,
+        ) -> BoxFuture<'static, Result<AssetNode, String>> {
+            let node = self.node;
+            Box::pin(async move { Ok(node) })
+        }
+    }
+
+    /// 构造假源: 身份根 = `root`, 单行 id/label 由 `label` 派生。
+    fn fake(root: &Path, label: &str) -> FakeOwner {
+        FakeOwner {
+            root: root.to_path_buf(),
+            node: AssetNode {
+                id: root.join(label).display().to_string(),
+                label: label.to_string(),
+                kind: AssetKind::Dir,
+                children: Vec::new(),
+            },
+        }
+    }
+
+    /// 2.4: 假源批量注册 — 保 solution 序落地, 全程不触文件系统。
+    #[gpui_kit::test]
+    fn fake_owners_land_in_order_without_fs(cx: &mut TestAppContext) {
+        let app = open_app(cx);
+        let manager = manager_of(cx, &app);
+        let ws = temp_dir("fake-ws");
+
+        manager.update(cx, |m, cx| {
+            m.register(
+                ws,
+                vec![
+                    Box::new(fake(Path::new("/fake-a"), "alpha"))
+                        as Box<dyn EnumeratorOwner + Send>,
+                    Box::new(fake(Path::new("/fake-b"), "beta"))
+                        as Box<dyn EnumeratorOwner + Send>,
+                ],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let view = manager.read(cx).state();
+            let AssetState::Forest { nodes } = &view else {
+                panic!("应落地 Forest, got {view:?}")
+            };
+            let labels: Vec<&str> = nodes.iter().map(|n| n.label.as_str()).collect();
+            assert_eq!(labels, ["alpha", "beta"], "保 solution 序");
+        });
+    }
+
+    /// 2.4: 增量注册按 `owner.root()` 幂等 — 同根二次注册被拒,
+    /// 首个源的行保留 (Level 2 记账走 trait 访问器)。
+    #[gpui_kit::test]
+    fn fake_owner_root_dedups_incremental_register(cx: &mut TestAppContext) {
+        let app = open_app(cx);
+        let manager = manager_of(cx, &app);
+        let ws = temp_dir("fake-dedup-ws");
+
+        // 先置 ws_dir (空注册) — register_project 仅在有 ws_dir 时启动枚举
+        manager.update(cx, |m, cx| m.register(ws, Vec::new(), cx));
+        let root = PathBuf::from("/fake-root");
+        manager.update(cx, |m, cx| m.register_project(Box::new(fake(&root, "first")), cx));
+        manager.update(cx, |m, cx| m.register_project(Box::new(fake(&root, "second")), cx));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let view = manager.read(cx).state();
+            let AssetState::Forest { nodes } = &view else {
+                panic!("应落地 Forest, got {view:?}")
+            };
+            assert_eq!(nodes.len(), 1, "同 root 幂等: 只留首个");
+            assert_eq!(nodes[0].label, "first");
+        });
+    }
