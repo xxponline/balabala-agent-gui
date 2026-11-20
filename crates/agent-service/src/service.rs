@@ -214,10 +214,12 @@ impl AgentService {
         self.ctx.messaging.spawn_task(fut);
     }
 
-    /// 输入后的补采拍距 (design D5 回改): 本地回显帧在输入后 ~1-2ms 就绪,
-    /// 主 tick 50ms 相位会把"输入→帧"拖到 ~50ms (实测 48-52ms) — 与 GUI
-    /// 旧 burst (8ms×4) 同款三拍补采压回 burst 档 (实测见 design D5)。
-    const INPUT_BURST_STEPS: usize = 3;
+    /// 输入后的补采窗 (design D5 二次回改, 手动验收数据驱动): 本地回显
+    /// 通常 ~1-2ms 就绪 (8ms 首拍即中), 但 embed 空闲后单键/积压帧的
+    /// 重绘可晚至 ~40-50ms — 3 拍窗 (24ms) 关闭后落 50ms 主 tick,
+    /// 与 GUI 相位叠加成 60-81ms 长尾 (手动验收实测 n=163, max=81)。
+    /// 6 拍 = 8..48ms 无缝衔接主 tick; GUI 侧快泵窗同步扩到 80ms (app.rs)。
+    const INPUT_BURST_STEPS: usize = 6;
     const INPUT_BURST_STEP_MS: u64 = 8;
 
     /// 输入后快采: 三拍 (8/16/24ms 真实时钟) 自寻址 `drain.tick`。
@@ -1144,14 +1146,18 @@ mod tests {
                 text: "x".into(),
             }),
         ));
-        // 真实时钟推进: 补采在 8/16/24ms 发, 主 tick 首拍 >40ms
-        rt.block_on(async { tokio::time::sleep(Duration::from_millis(40)).await });
+        // 真实时钟推进: 补采在 8..48ms 六拍发, 主 tick 首拍 >60ms
+        rt.block_on(async { tokio::time::sleep(Duration::from_millis(60)).await });
         let ticks = msg
             .sent()
             .iter()
             .filter(|e| e.kind == KIND_DRAIN_TICK)
             .count();
-        assert_eq!(ticks, AgentService::INPUT_BURST_STEPS, "输入后三拍补采");
+        assert_eq!(
+            ticks,
+            AgentService::INPUT_BURST_STEPS,
+            "输入后六拍补采 (8..48ms)"
+        );
     }
 
     #[test]

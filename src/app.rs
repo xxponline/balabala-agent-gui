@@ -834,7 +834,11 @@ impl TerminalApp {
     fn kick_input_drain(&mut self, cx: &mut Context<Self>) {
         let weak = cx.entity().downgrade();
         self._input_drain_task = Some(cx.spawn(async move |_this, cx: &mut AsyncApp| {
-            for _ in 0..4 {
+            // 8ms×10 = 80ms 快泵窗 (二次回改, 手动验收长尾实测驱动):
+            // 旧 4 拍 (32ms) 关窗后, 服务 50ms 主 tick 推来的积压帧只能
+            // 等 GUI 主循环再叠一个 50ms 相位 (实测长尾 60-81ms);
+            // 泵轮询空转成本 µs 级, 扩窗换长尾消除。
+            for _ in 0..10 {
                 cx.background_executor()
                     .timer(Duration::from_millis(8))
                     .await;

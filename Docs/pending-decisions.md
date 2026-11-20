@@ -13,8 +13,8 @@
 `AnsiBuffer` 共享无界注入不变), 但**所有权与帧 drain 归 AgentService**:
 - 会话本体 (`EmbeddedApp`) 由服务持有; 服务 50ms 自 tick drain (take_ansi
   所有权取走 → `FrameBytes` 全推 GUI mailbox), 输入后另有 8/16/24ms 三拍
-  补采 (回显帧压回 burst 档, 实测输入→屏幕 31-34ms / 首键冷 ~52ms,
-  见 change design D5);
+  补采 6 拍 (8..48ms) + GUI 快泵窗 80ms (手动验收长尾回改, 见 change
+  design D5);终版实测: 打字回显 9-18ms, 喂帧 process ≤0.5ms;
 - GUI `start_update_loop` 不再 drain 会话, 只消费 ServiceLayer mailbox
   (kick_input_drain 语义 = 消费侧快泵); 自发输出为 50ms+50ms 双相位
   (结构上 ≤100ms, 连续输出有帧合并红利);
@@ -33,7 +33,11 @@ burst 消除了输入后的相位抖动。
 - 狂喷输出 (例如粘贴巨量文本) 时 `AnsiBuffer` 在两个 drain 之间无界堆积,
   vt100 单次解析洪峰
 - 空闲帧显示延迟上限: 双相位 ≤100ms (服务 50ms + GUI 泵 50ms;
-  change agent-service 后), 输入路径 31-34ms
+  change agent-service 后), 输入路径 9-18ms (打字)
+- **长会话滚动随会话长度变慢 (新信号, 2026-11-20 手动验收)**: 滚动回显
+  52-77ms, 分段计数证明帧 ≤4.3KB + 解析 ≤0.5ms + 链路无损 — 时间在
+  pi 侧重绘 O(transcript) (旧架构同付); 若继续恶化, 方向是 pi 渲染
+  增量化/虚拟滚动, 不在 GUI 管线
 - mio / epoll 选项已作废 — 不再有 pty master fd
 
 **备选方案**:

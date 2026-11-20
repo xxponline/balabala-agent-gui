@@ -1768,19 +1768,26 @@ impl AgentTerminal {
 
     /// 注入投影镜像 (GUI 泵/测试在 render 前调; design D7 入站)。
     pub fn set_view(&mut self, view: Option<SessionView>, cx: &mut Context<Self>) {
-        if self.view.as_ref().map(|v| v.sessions.len()) != view.as_ref().map(|v| v.sessions.len())
-            || self.view.as_ref().and_then(|v| v.active) != view.as_ref().and_then(|v| v.active)
-            || self
-                .view
-                .as_ref()
-                .map(|v| v.sessions.iter().map(|s| s.status).collect::<Vec<_>>())
-                != view
-                    .as_ref()
-                    .map(|v| v.sessions.iter().map(|s| s.status).collect::<Vec<_>>())
-        {
-            self.view = view;
-            cx.notify();
+        // 快路径: 同一份投影快照 (Arc 指针同) + active 同 → 零比较零通知。
+        // 泵每秒调 20+ 次, 深比较 (旧实现逐状态 collect Vec) 是纯浪费。
+        if let (Some(cur), Some(new)) = (&self.view, &view) {
+            if Arc::ptr_eq(&cur.sessions, &new.sessions) && cur.active == new.active {
+                return;
+            }
+            // 内容等 (不同 Arc, 罕见): 逐字段等价 → 仍不通知, 但换持新 Arc
+            let equal = cur.active == new.active
+                && cur.sessions.len() == new.sessions.len()
+                && cur.sessions.iter().zip(new.sessions.iter()).all(|(a, b)| {
+                    a.id == b.id && a.status == b.status && a.name == b.name
+                        && a.project_root == b.project_root
+                });
+            if equal {
+                self.view = view;
+                return;
+            }
         }
+        self.view = view;
+        cx.notify();
     }
 
     /// 喂入一个会话的新帧字节 (change agent-service 3.4; app 泵从
