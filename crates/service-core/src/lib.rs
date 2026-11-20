@@ -3,7 +3,7 @@
 //! 依赖约束（design D11）：**零上层依赖**——不依赖 contracts、GUI 或具体服务。
 //!
 //! 内容：
-//! - [`route`]：两级寻址 `Route::Instance(..)` / `Route::Service(name, policy)`，
+//! - [`route`]：两级寻址 `Route::Instance(..)` / `Route::Service(name)`，
 //!   以及 `from` 专用的受限地址 [`Address`]（拒绝歧义的 `Service(..)`）。
 //! - [`envelope`]：统一信封 [`Envelope`] 与类型化 payload（`Arc` 透传，零序列化）。
 //! - [`state`]：每实例标准状态 [`ServiceState`] 与状态翻转事件 [`StateChange`]。
@@ -26,7 +26,7 @@ pub mod state;
 pub use contract_id::ContractId;
 pub use envelope::{Envelope, Payload};
 pub use error::{DeadLetterReason, RouteError};
-pub use route::{Address, Corr, InstanceId, Route, SelectPolicy, ServiceName};
+pub use route::{Address, Corr, InstanceId, Route, ServiceName};
 pub use service::{
     CallFuture, DllServiceFactory, Messaging, RuntimeToken, Service, ServiceCtx, ServiceFactory,
     ServiceFuture, TaskFuture, CONTRACT_NAME_SYMBOL, CREATE_SYMBOL, FINGERPRINT_SYMBOL,

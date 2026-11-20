@@ -2,8 +2,8 @@
 //! 走统一信封过此——路由表里没有特权参与者。
 //!
 //! 关键语义：
-//! - **两级寻址**：`Route::Instance(..)` 直投；`Service(name, Direct(id))`
-//!   带"实例属于该服务"断言；`Service(name, Any)` 挑 `available` 实例。
+//! - **两级寻址**：`Route::Instance(..)` 直投；`Route::Service(name)`
+//!   直呼该契约唯一实例（每契约恰一实例，无挑选；change singleton-per-contract）。
 //! - **fail-fast 零缓冲**：目标非 `available` 立即拒绝；per-outlet 有界通道
 //!   满 = 即刻失败（try_send，调用方不干等超时）；Router 无隐藏队列。
 //! - **ask**：`corr` 进 pending 表，回复按 `corr` 销账（**不按 from 寻址**），
@@ -13,7 +13,7 @@
 use crate::instance::Instances;
 use service_core::{
     Address, Corr, DeadLetterReason, Envelope, InstanceId, Payload, Route, RouteError,
-    SelectPolicy, ServiceState, StateChange, KIND_STATE_CHANGE, KIND_ROUTE_ERROR,
+    ServiceState, StateChange, KIND_STATE_CHANGE, KIND_ROUTE_ERROR,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -179,23 +179,11 @@ impl Router {
                 }
                 *id
             }
-            Route::Service(name, SelectPolicy::Direct(id)) => {
-                // 断言: 实例必须属于该服务 (D4 防误投, spec R2)
-                if !table.is_instance_of(*id, name) {
-                    return Err((RouteError::NoSuchRoute, env));
-                }
-                *id
-            }
-            Route::Service(name, SelectPolicy::Any) => match table.pick_available(name) {
+            Route::Service(name) => match table.instance_of(name) {
+                // 单实例: 名解析即唯一实例; 非 available 由下方统 state 检查
+                // 报 TargetNotAvailable, 未装载 → NoSuchRoute (fail-fast, spec R2)
                 Some(id) => id,
-                None => {
-                    // 有实例但全不可用 → TargetNotAvailable; 无实例 → NoSuchRoute
-                    let existing = table.instances_of(name).into_iter().next().and_then(|id| table.get(id).map(|p| p.state));
-                    match existing {
-                        Some(state) => return Err((RouteError::TargetNotAvailable(state), env)),
-                        None => return Err((RouteError::NoSuchRoute, env)),
-                    }
-                }
+                None => return Err((RouteError::NoSuchRoute, env)),
             },
         };
         let p = table.get(id).expect("resolved");

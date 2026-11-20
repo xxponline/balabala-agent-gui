@@ -105,37 +105,18 @@ impl Instances {
         self.map.get_mut(&id)
     }
 
-    /// 某服务的全部实例 id（仅服务实例）。
-    pub fn instances_of(&self, service: &ServiceName) -> Vec<InstanceId> {
-        let mut ids: Vec<_> = self
-            .map
+    /// 服务名 → 唯一实例（change `singleton-per-contract` design D5：
+    /// 单实例强制下 name 与实例 1:1，"挑选"词汇随之删除）。
+    ///
+    /// 功能：按服务名解析唯一实例 id（任意状态都解析，fail-fast 由路由层判）。
+    /// 输入：`service` — 服务名。
+    /// 输出：已装载实例 id；未装载返回 `None`。
+    pub fn instance_of(&self, service: &ServiceName) -> Option<InstanceId> {
+        self.map
             .values()
             .filter(|p| belongs(p, service))
             .map(|p| p.id)
-            .collect();
-        ids.sort();
-        ids
-    }
-
-    /// `Any` 策略：挑一个 `available` 实例（D4）。
-    pub fn pick_available(&self, service: &ServiceName) -> Option<InstanceId> {
-        let mut candidates: Vec<_> = self
-            .map
-            .values()
-            .filter(|p| {
-                belongs(p, service) && p.state == ServiceState::Available
-            })
-            .map(|p| p.id)
-            .collect();
-        candidates.sort();
-        candidates.into_iter().next()
-    }
-
-    /// `Direct(id)` 断言：实例 id 必须属于该服务（D4 防误投）。
-    pub fn is_instance_of(&self, id: InstanceId, service: &ServiceName) -> bool {
-        self.map
-            .get(&id)
-            .is_some_and(|p| belongs(p, service))
+            .min()
     }
 
     /// 服务实例数（不含宿主参与者）。
@@ -182,38 +163,17 @@ mod tests {
 
         assert_eq!(t.service_count(), 1, "宿主参与者不入实例表口径");
         assert_eq!(t.len(), 2, "但都在路由参与者表");
-        assert!(t.is_instance_of(InstanceId(1), &"demo".into()));
-        assert!(!t.is_instance_of(InstanceId(2), &"demo".into()), "宿主不是服务实例");
+        assert_eq!(t.instance_of(&"demo".into()), Some(InstanceId(1)), "服务实例按名解析");
+        assert_ne!(t.instance_of(&"demo".into()), Some(InstanceId(2)), "宿主参与者不占服务名");
     }
 
+    /// 3.3: `instance_of` 按名解析——未装载/未注册名返回 `None`。
+    ///
+    /// 功能：断言按名解析的命中与未命中口径。
+    /// 输入：无。
+    /// 输出：断言通过。
     #[test]
-    fn pick_available_filters_by_state() {
-        let mut t = Instances::new();
-        t.insert(Participant::service_instance(
-            InstanceId(1),
-            "demo".into(),
-            None,
-            ServiceState::Loading,
-            outlet(),
-        ));
-        assert_eq!(t.pick_available(&"demo".into()), None, "loading 不可选");
-
-        // 状态翻转后可选/不可选（单实例口径, change singleton-per-contract）
-        t.get_mut(InstanceId(1)).unwrap().state = ServiceState::Available;
-        assert_eq!(t.pick_available(&"demo".into()), Some(InstanceId(1)), "available 可选");
-
-        t.get_mut(InstanceId(1)).unwrap().state = ServiceState::Error;
-        assert_eq!(t.pick_available(&"demo".into()), None, "error 不可选");
-
-        assert_eq!(
-            t.instances_of(&"demo".into()),
-            vec![InstanceId(1)],
-            "按名索引单实例口径"
-        );
-    }
-
-    #[test]
-    fn direct_policy_membership_check() {
+    fn instance_of_returns_none_for_unknown_service() {
         let mut t = Instances::new();
         t.insert(Participant::service_instance(
             InstanceId(7),
@@ -222,9 +182,8 @@ mod tests {
             ServiceState::Available,
             outlet(),
         ));
-        assert!(t.is_instance_of(InstanceId(7), &"demo".into()));
-        assert!(!t.is_instance_of(InstanceId(7), &"other".into()), "服务名不符");
-        assert!(!t.is_instance_of(InstanceId(99), &"demo".into()), "实例不存在");
+        assert_eq!(t.instance_of(&"other".into()), None, "未装载服务名无解析");
+        assert_eq!(t.instance_of(&"demo".into()), Some(InstanceId(7)), "已装载名命中");
     }
 
     /// 测试 marker：契约 A。

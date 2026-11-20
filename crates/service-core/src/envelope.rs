@@ -89,7 +89,7 @@ impl Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::route::{InstanceId, SelectPolicy, ServiceName};
+    use crate::route::{InstanceId, ServiceName};
 
     #[derive(Debug, PartialEq, Eq)]
     struct Ping(u64);
@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn typed_payload_passes_without_serialization() {
         let env = Envelope::new(
-            Route::Service(ServiceName::from("demo"), SelectPolicy::Any),
+            Route::Service(ServiceName::from("demo")),
             addr(),
             "ping",
             Payload::new(Ping(42)),

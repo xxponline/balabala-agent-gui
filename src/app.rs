@@ -18,7 +18,7 @@ use agent_service::contract::{
     SessionId, SessionStatus, ThemeReq, KIND_CLOSE, KIND_CREATE, KIND_INPUT_CLICK, KIND_INPUT_KEY,
     KIND_INPUT_TEXT, KIND_INPUT_WHEEL, KIND_RESIZE, KIND_SELECT, KIND_THEME,
 };
-use service_manager::{Envelope, Payload, Route, SelectPolicy};
+use service_manager::{Envelope, Payload, Route};
 
 use crate::service_layer::CtrlOp;
 use agent_service::terminal::{AgentTerminal, TerminalCopy, TerminalTab};
@@ -225,7 +225,7 @@ impl TerminalApp {
             return; // 无工作区 (按钮本不该渲染)
         }
         let result = self.service_layer.submit_control(
-            Route::Service("agent".into(), SelectPolicy::Any),
+            Route::Service("agent".into()),
             CtrlOp::Create,
             KIND_CREATE,
             Payload::new(CreateReq {
@@ -243,7 +243,7 @@ impl TerminalApp {
     /// — spec: next remaining session; 失败 notice, spec delta 场景 1)。
     pub fn close_agent(&mut self, id: SessionId, cx: &mut Context<Self>) {
         let result = self.service_layer.submit_control(
-            Route::Service("agent".into(), SelectPolicy::Any),
+            Route::Service("agent".into()),
             CtrlOp::Close,
             KIND_CLOSE,
             Payload::new(CloseReq(id)),
@@ -260,7 +260,7 @@ impl TerminalApp {
     fn push_tui_theme(&self, cx: &mut Context<Self>) {
         let theme = crate::ui::tui_theme(cx.theme().mode);
         let _ = self.service_layer.manager.tell(Envelope::new(
-            Route::Service("agent".into(), SelectPolicy::Any),
+            Route::Service("agent".into()),
             self.service_layer.listener.address().clone(),
             KIND_THEME,
             Payload::new(ThemeReq { theme }),
@@ -276,7 +276,7 @@ impl TerminalApp {
             return;
         };
         let _ = self.service_layer.manager.tell(Envelope::new(
-            Route::Service("agent".into(), SelectPolicy::Any),
+            Route::Service("agent".into()),
             self.service_layer.listener.address().clone(),
             KIND_INPUT_KEY,
             Payload::new(InputKey {
@@ -293,7 +293,7 @@ impl TerminalApp {
             return;
         };
         let _ = self.service_layer.manager.tell(Envelope::new(
-            Route::Service("agent".into(), SelectPolicy::Any),
+            Route::Service("agent".into()),
             self.service_layer.listener.address().clone(),
             KIND_INPUT_TEXT,
             Payload::new(InputText {
@@ -312,7 +312,7 @@ impl TerminalApp {
         };
         self.wheel_forwards += 1;
         let _ = self.service_layer.manager.tell(Envelope::new(
-            Route::Service("agent".into(), SelectPolicy::Any),
+            Route::Service("agent".into()),
             self.service_layer.listener.address().clone(),
             KIND_INPUT_WHEEL,
             Payload::new(InputWheel {
@@ -331,7 +331,7 @@ impl TerminalApp {
         };
         self.click_forwards += 1;
         let _ = self.service_layer.manager.tell(Envelope::new(
-            Route::Service("agent".into(), SelectPolicy::Any),
+            Route::Service("agent".into()),
             self.service_layer.listener.address().clone(),
             KIND_INPUT_CLICK,
             Payload::new(InputClick {
@@ -375,7 +375,7 @@ impl TerminalApp {
         }
         for session in ids {
             let _ = self.service_layer.manager.tell(Envelope::new(
-                Route::Service("agent".into(), SelectPolicy::Any),
+                Route::Service("agent".into()),
                 self.service_layer.listener.address().clone(),
                 KIND_RESIZE,
                 Payload::new(ResizeReq {
@@ -566,7 +566,7 @@ impl TerminalApp {
                     // 会话本体归服务: 逐 id tell 关闭 (切换清场, D6 静默)
                     for sid in old.agents.clone() {
                         let _ = self.service_layer.manager.tell(Envelope::new(
-                            Route::Service("agent".into(), SelectPolicy::Any),
+                            Route::Service("agent".into()),
                             self.service_layer.listener.address().clone(),
                             KIND_CLOSE,
                             Payload::new(CloseReq(sid)),
@@ -785,7 +785,7 @@ impl TerminalApp {
                 // ask 经服务 (D6): 成功回执切 console + active 镜像由投影
                 // 驱动; 失败 notice 点名 (spec delta 场景 2)
                 let result = self.service_layer.submit_control(
-                    Route::Service("agent".into(), SelectPolicy::Any),
+                    Route::Service("agent".into()),
                     CtrlOp::Select,
                     KIND_SELECT,
                     Payload::new(SelectReq(id)),

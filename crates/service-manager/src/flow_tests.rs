@@ -7,8 +7,8 @@ use crate::instance::Participant;
 use crate::manager::ServiceManager;
 use crate::router::Router;
 use service_core::{
-    Address, Envelope, InstanceId, Payload, Route, RouteError, SelectPolicy, ServiceState,
-    StateChange, KIND_ROUTE_ERROR, KIND_STATE_CHANGE,
+    Address, Envelope, InstanceId, Payload, Route, RouteError, ServiceState, StateChange,
+    KIND_ROUTE_ERROR, KIND_STATE_CHANGE,
 };
 use std::time::{Duration, Instant};
 
@@ -123,40 +123,66 @@ fn task_4_2_instance_direct_delivery_reaches_listener() {
     assert!(!listener.poll(), "队列空后 poll 归 false");
 }
 
+/// 3.3/spec 场景 "Service name resolves to the unique instance":
+/// 名寻址解析到唯一实例并投达。
+///
+/// 功能：断言 `Route::Service(name)` 解析唯一实例并投递成功。
+/// 输入：无。
+/// 输出：断言通过。
 #[test]
-fn task_4_2_direct_with_wrong_service_name_is_refused() {
+fn service_name_resolves_to_unique_instance() {
     let mgr = test_manager();
-    let (id, _rx) = silent_instance(&mgr, "demo", ServiceState::Available, 4);
+    let (_id, mut rx) = silent_instance(&mgr, "demo", ServiceState::Available, 4);
 
     let env = Envelope::new(
-        Route::Service("other".into(), SelectPolicy::Direct(id)),
-        caller_addr(&mgr),
-        "x",
-        Payload::new(()),
-    );
-    let err = mgr.router().send(env).expect_err("服务名不符必须拒绝");
-    assert_eq!(err, RouteError::NoSuchRoute, "Direct 断言失败 = 拒绝 (spec R2)");
-    // 拒绝也留观测
-    assert_eq!(mgr.dead_letters().len(), 1);
-}
-
-#[test]
-fn task_4_2_any_picks_only_an_available_instance() {
-    let mgr = test_manager();
-    let (loading_id, mut loading_rx) = silent_instance(&mgr, "demo", ServiceState::Loading, 4);
-    let (avail_id, mut avail_rx) = silent_instance(&mgr, "demo", ServiceState::Available, 4);
-
-    let env = Envelope::new(
-        Route::Service("demo".into(), SelectPolicy::Any),
+        Route::Service("demo".into()),
         caller_addr(&mgr),
         "work",
         Payload::new(()),
     );
-    mgr.router().send(env).expect("Any 有 available 即成功");
+    mgr.router().send(env).expect("名寻址解析到唯一实例");
+    assert!(rx.try_recv().is_ok(), "投给该名唯一实例");
+}
 
-    assert!(avail_rx.try_recv().is_ok(), "投给 available 实例");
-    assert!(loading_rx.try_recv().is_err(), "loading 实例不收件");
-    let _ = (loading_id, avail_id);
+/// 3.3/spec 场景 "Service name with no loaded instance fails fast":
+/// 未装载服务名立即路由错误，不缓冲、留死信观测。
+///
+/// 功能：断言未装载名的 fail-fast 与观测面。
+/// 输入：无。
+/// 输出：断言通过。
+#[test]
+fn service_name_without_instance_fails_fast() {
+    let mgr = test_manager();
+    let env = Envelope::new(
+        Route::Service("ghost".into()),
+        caller_addr(&mgr),
+        "x",
+        Payload::new(()),
+    );
+    let err = mgr.router().send(env).expect_err("未装载服务名必须 fail-fast");
+    assert_eq!(err, RouteError::NoSuchRoute);
+    assert_eq!(mgr.dead_letters().len(), 1, "拒绝也留观测");
+}
+
+/// 3.3: 已装载但非 available 的唯一实例 → TargetNotAvailable 立即拒绝
+/// （fail-fast 语义在单实例解析下保持不变）。
+///
+/// 功能：断言 loading 目标的立即拒绝与不投递。
+/// 输入：无。
+/// 输出：断言通过。
+#[test]
+fn service_name_target_not_available_fails_fast() {
+    let mgr = test_manager();
+    let (_id, mut rx) = silent_instance(&mgr, "demo", ServiceState::Loading, 4);
+    let env = Envelope::new(
+        Route::Service("demo".into()),
+        caller_addr(&mgr),
+        "work",
+        Payload::new(()),
+    );
+    let err = mgr.router().send(env).expect_err("loading 目标立即拒绝");
+    assert_eq!(err, RouteError::TargetNotAvailable(ServiceState::Loading));
+    assert!(rx.try_recv().is_err(), "loading 实例不收件");
 }
 
 #[test]

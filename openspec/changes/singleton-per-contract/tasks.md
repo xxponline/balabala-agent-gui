@@ -17,10 +17,10 @@
 
 ## 3. 寻址契约面收敛（D3 决策门）
 
-- [ ] 3.1 ⚠ 决策门：向用户确认 design D3（删除 `SelectPolicy`，`Route::Service(name)` 单形态）——验证：获得用户明确答复；若改回"保留策略"，本组 3.2–3.4 替换为轻改版（语义退化 + req2 delta 回退为 MODIFIED 轻改），其余组不受影响
-- [ ] 3.2 `service-core::route` 删除 `SelectPolicy`、`Route::Service(ServiceName)` 单形态，`route.rs` 单测改写——验证：`cargo test -p service-core` 通过
-- [ ] 3.3 `router` 名寻址分支收敛（删 `Direct` 归属断言与 `Any` 挑选 → 按名取唯一实例，fail-fast 语义保持）——验证：新单测覆盖 spec 场景 "Service name resolves to the unique instance" 与 "Service name with no loaded instance fails fast"，`cargo test -p service-manager` 通过
-- [ ] 3.4 调用点机械改写：`src/app.rs` 10 处、`src/service_layer*`、其余测试——验证：`rg "SelectPolicy" src/ crates/` 零命中，`cargo build --workspace` 通过
+- [x] 3.1 ⚠ 决策门：向用户确认 design D3（删除 `SelectPolicy`，`Route::Service(name)` 单形态）——验证：获得用户明确答复；若改回"保留策略"，本组 3.2–3.4 替换为轻改版（语义退化 + req2 delta 回退为 MODIFIED 轻改），其余组不受影响
+- [x] 3.2 `service-core::route` 删除 `SelectPolicy`、`Route::Service(ServiceName)` 单形态，`route.rs` 单测改写——验证：`cargo test -p service-core` 通过
+- [x] 3.3 `router` 名寻址分支收敛（删 `Direct` 归属断言与 `Any` 挑选 → 按名取唯一实例，fail-fast 语义保持）——验证：新单测覆盖 spec 场景 "Service name resolves to the unique instance" 与 "Service name with no loaded instance fails fast"，`cargo test -p service-manager` 通过
+- [x] 3.4 调用点机械改写：`src/app.rs` 10 处、`src/service_layer*`、其余测试——验证：`rg "SelectPolicy" src/ crates/` 零命中，`cargo build --workspace` 通过
 
 ## 4. 集成验证
 

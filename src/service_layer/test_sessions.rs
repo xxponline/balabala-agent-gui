@@ -204,9 +204,9 @@ pub fn inject_view(
         let target = ids[ix];
         app.update(cx, |app, _cx| {
             use agent_service::contract::{KIND_SELECT, SelectReq};
-            use service_manager::{Payload, Route, SelectPolicy};
+            use service_manager::{Payload, Route};
             let _ = app.service_layer.submit_control(
-                Route::Service("agent".into(), SelectPolicy::Any),
+                Route::Service("agent".into()),
                 crate::service_layer::CtrlOp::Select,
                 KIND_SELECT,
                 Payload::new(SelectReq(target)),

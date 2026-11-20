@@ -592,7 +592,11 @@ mod tests {
 
         let instances = mgr.instances.lock().unwrap();
         assert_eq!(instances.service_count(), 1, "在跑实例不受 reload 影响");
-        assert!(instances.is_instance_of(id, &"gamma".into()), "实例仍归属原服务");
+        assert_eq!(
+            instances.instance_of(&"gamma".into()),
+            Some(id),
+            "实例仍归属原服务"
+        );
         drop(instances);
 
         std::fs::remove_dir_all(&dir).ok();

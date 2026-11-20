@@ -1,4 +1,5 @@
-//! 两级寻址（design D4）：`Route::Instance(..)` 与 `Route::Service(name, policy)`。
+//! 两级寻址（design D4；change `singleton-per-contract`：`Direct`/`Any`
+//! 选择策略已随"每契约单实例"删除——不存在可挑选的候选实例）。
 
 use crate::error::RouteError;
 use std::fmt;
@@ -45,22 +46,13 @@ impl fmt::Debug for ServiceName {
     }
 }
 
-/// 服务名寻址策略（v1 只有 Direct 与 Any，round-robin 等真有负载需求再加）。
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum SelectPolicy {
-    /// 携带实例 id 的精确指定 + "该实例必须属于该服务"的断言（防误投，D4）。
-    Direct(InstanceId),
-    /// 挑一个 `available` 实例——唯一"不知道目标是谁"的入口。
-    Any,
-}
-
-/// 消息目标（两级寻址）。
+/// 消息目标（两级寻址；选择策略已删——骨架内每契约恰一实例）。
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Route {
     /// 实例直呼：调用方拿着 `load()` 返回的实例 id 精确投递。
     Instance(InstanceId),
-    /// 服务名寻址：Router 挑实例。
-    Service(ServiceName, SelectPolicy),
+    /// 服务名寻址：直呼该契约唯一实例（未装载 → `NoSuchRoute`）。
+    Service(ServiceName),
 }
 
 /// `from` / 观测用的**受限地址**：只允许实例/actor 地址。
@@ -113,15 +105,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn instance_route_and_service_policy_construct() {
+    fn instance_route_and_service_route_construct() {
         let id = InstanceId(7);
-        let direct = Route::Service("demo".into(), SelectPolicy::Direct(id));
-        let any = Route::Service("demo".into(), SelectPolicy::Any);
-        assert_eq!(
-            direct,
-            Route::Service("demo".into(), SelectPolicy::Direct(InstanceId(7)))
-        );
-        assert_ne!(direct, any);
+        let svc = Route::Service("demo".into());
+        assert_eq!(svc, Route::Service("demo".into()), "同名同路");
+        assert_ne!(svc, Route::Service("other".into()), "异名异路");
         assert_eq!(Route::Instance(id), Route::Instance(InstanceId(7)));
     }
 
@@ -137,14 +125,8 @@ mod tests {
     #[test]
     fn address_rejects_service_route() {
         // "from 拒绝 Service(..)" —— 语义断言 (task 2.1 验证点)
-        let err = Address::try_from(Route::Service("demo".into(), SelectPolicy::Any))
+        let err = Address::try_from(Route::Service("demo".into()))
             .expect_err("歧义地址不得作为 from");
-        assert_eq!(err, RouteError::AmbiguousAddress);
-        let err = Address::try_from(Route::Service(
-            "demo".into(),
-            SelectPolicy::Direct(InstanceId(1)),
-        ))
-        .expect_err("Direct 同样不得作为 from");
         assert_eq!(err, RouteError::AmbiguousAddress);
     }
 
