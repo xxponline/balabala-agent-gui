@@ -83,7 +83,21 @@ spec delta 要求"选择失败 → 原 active 不变"，且切换由消息触发
 - 服务侧 drain 循环经 `ctx.messaging.spawn_task`（宿主 runtime，D12 既有约束）跑 50ms interval；
 - **输入内联 drain**：`handle(input)` 转发完毕后立即 drain 一次（输入即突发，替代 `kick_input_drain` 的 8ms×4 在服务侧的等价物）；
 - **GUI 侧快泵保留**：帧入 mailbox 无法跨线程碰 gpui，唤醒仍是 GUI 自己的事——输入是 UI 线程发起的，submit 后自踢快泵（既有 burst 逻辑改挂到"发出 input 消息"上）；服务自发帧走既有 50ms 泵相位。
-延迟预算（不劣于现状）：输入 → 内联 drain ≈ µs → mailbox → 快泵 ≤8ms（现状 burst 同档）；agent 自发输出 → drain tick ≤50ms → 泵 ≤50ms（= 现状轮询相位，零回归）。
+延迟预算与实测（task 5.2，2026-11-19，全链路探针 = tell → embed 本地回显 → 服务 drain → 推帧 → GUI 泵消费，墙钟采样 ×5）：
+
+- **回改记录**：初版（仅输入内联 drain + 主 tick）实测 **48–52ms**，被服务
+  50ms tick 相位主导——超"既有 burst 档"（GUI 快泵 8ms×4 = 32ms 窗口）。
+  按任务要求回改方案（未放宽预算）：**服务侧输入后三拍补采**
+  （8/16/24ms 真实时钟自寻址 `drain.tick`，与 GUI burst 同款语义，
+  ChannelFull 丢拍/实例死亡自退出），单测 `input_spawns_followup_burst_ticks` 锁行为。
+- **回改后实测**：稳态 **31–34ms**（≤32ms burst 档 ✓，回显 ~1-2ms → 8ms
+  补采捕获 → GUI 快泵窗口内消费）；冷启动首键 ~52ms（embed 首键初始化
+  延迟，落主 tick 兜底，仅首轮）。
+- **自发输出（无输入触发）**：双相位 = 服务 drain tick ≤50ms + GUI 泵 ≤50ms
+  → 结构上 ≤100ms（旧为 GUI 单相位 ≤50ms）——task 5.2 明示的"50ms 双相位
+  说明"即此；连续输出有帧合并红利（下一相位一并消费，ServiceListener 合并
+  语义），TUI 交互场景可接受。
+- 探针为临时测试（量完即删），方法与数值以本段为准。
 替代：监听线程 `cx.notify` 直唤醒（gpui 跨线程 notify 需 executor hop，收益仅覆盖自发输出档，复杂度不值——记入 Open Questions 可后评）。
 
 ### D6 输入/渲染线程模型：解析仍在 UI 线程（零回归）

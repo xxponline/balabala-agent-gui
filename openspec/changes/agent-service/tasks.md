@@ -32,6 +32,6 @@
 
 ## 5. 收口
 
-- [ ] 5.1 终验：`cargo test --workspace` 全绿 0 warnings + `openspec validate agent-service` 通过；**验证**：两条命令输出
-- [ ] 5.2 输入延迟实测对照（输入 → 内联 drain → 快泵帧达 ≤ 既有 burst 档；自发输出 = 50ms 双相位说明）；**验证**：实测数值写回 design.md D5，与预算不符则回改方案而非放宽
-- [ ] 5.3 文档写回：`Docs/pending-decisions.md` IO 调度条目（会话所有权与 drain 归属已迁移）、design.md Risks/D5 结论（Send spike 结论、延迟实测）、proposal 与最终实现对账；**验证**：逐文件 diff 审阅，文档日期更新为实施当日
+- [x] 5.1 终验：`cargo test --workspace` 全绿 0 warnings + `openspec validate agent-service` 通过；**验证**：两条命令输出
+- [x] 5.2 输入延迟实测对照（输入 → 内联 drain → 快泵帧达 ≤ 既有 burst 档；自发输出 = 50ms 双相位说明）；**验证**：实测数值写回 design.md D5，与预算不符则回改方案而非放宽
+- [x] 5.3 文档写回：`Docs/pending-decisions.md` IO 调度条目（会话所有权与 drain 归属已迁移）、design.md Risks/D5 结论（Send spike 结论、延迟实测）、proposal 与最终实现对账；**验证**：逐文件 diff 审阅，文档日期更新为实施当日

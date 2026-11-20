@@ -2,16 +2,28 @@
 
 记录当前 demo 阶段先简化、但未来需要重新评估的设计权衡。
 
-最近一次对齐: 2026-11-15, 对照 `openspec/specs/` 五份主 spec
-(agent-shell / center-tabs / dock-layout / file-tree / workspace-management)。
+最近一次对齐: 2026-11-19 (change `agent-service` 落地后), 对照
+`openspec/specs/` 七份主 spec (原五份 + service-lifecycle / service-routing)。
+上一次: 2026-11-15 (embed-pi-shell 换代)。
 
 ## 多 agent 的 IO 调度
 
-**当前选择 (2026-11-15 更新, 随 `embed-pi-shell` 换代)**: PTY 路径已删除,
-改为每 session 一条 embed 事件循环线程 + RPC 泵/读写线程 (约 5 线程/session);
-输出帧写入共享 `AnsiBuffer` (无界 `Mutex<Vec<u8>>`), 宿主 50ms 轮询
-(`start_update_loop`) 统一 drain, 输入后追加 8ms×4 快速 burst
-(`kick_input_drain`); 键盘/滚轮/点击/文本经无界 std mpsc `UiEvent` 通道注入。
+**当前选择 (2026-11-19 更新, 随 `agent-service` 换底)**: embed 线程模型不变
+(每 session 一条 embed 事件循环线程 + RPC 泵/读写线程, 约 5 线程/session;
+`AnsiBuffer` 共享无界注入不变), 但**所有权与帧 drain 归 AgentService**:
+- 会话本体 (`EmbeddedApp`) 由服务持有; 服务 50ms 自 tick drain (take_ansi
+  所有权取走 → `FrameBytes` 全推 GUI mailbox), 输入后另有 8/16/24ms 三拍
+  补采 (回显帧压回 burst 档, 实测输入→屏幕 31-34ms / 首键冷 ~52ms,
+  见 change design D5);
+- GUI `start_update_loop` 不再 drain 会话, 只消费 ServiceLayer mailbox
+  (kick_input_drain 语义 = 消费侧快泵); 自发输出为 50ms+50ms 双相位
+  (结构上 ≤100ms, 连续输出有帧合并红利);
+- 输入 (键/滚轮/点击/文本) 改经 Router tell → 服务转发 embed `UiEvent`
+  (embed 侧通道与注入语义不变); vt100 渲染 parser 迁 AgentTerminal 本地
+  (每会话一个, 全推喂养, 切换零成本)。
+
+**上一版 (2026-11-15, embed-pi-shell)**: PTY 路径已删除; 宿主 50ms 轮询
+统一 drain + 输入后 8ms×4 burst。
 
 **为什么这样选**: 与 embed 架构一致, 实现最简; 50ms 轮询对 TUI 帧粒度够用,
 burst 消除了输入后的相位抖动。
@@ -20,7 +32,8 @@ burst 消除了输入后的相位抖动。
 - session 数到 30+ 时 ~5 线程/session (≈150 线程) 是否成为问题
 - 狂喷输出 (例如粘贴巨量文本) 时 `AnsiBuffer` 在两个 drain 之间无界堆积,
   vt100 单次解析洪峰
-- 空闲帧显示延迟上限仍是 50ms (轮询相位)
+- 空闲帧显示延迟上限: 双相位 ≤100ms (服务 50ms + GUI 泵 50ms;
+  change agent-service 后), 输入路径 31-34ms
 - mio / epoll 选项已作废 — 不再有 pty master fd
 
 **备选方案**:

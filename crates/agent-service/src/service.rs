@@ -214,6 +214,36 @@ impl AgentService {
         self.ctx.messaging.spawn_task(fut);
     }
 
+    /// 输入后的补采拍距 (design D5 回改): 本地回显帧在输入后 ~1-2ms 就绪,
+    /// 主 tick 50ms 相位会把"输入→帧"拖到 ~50ms (实测 48-52ms) — 与 GUI
+    /// 旧 burst (8ms×4) 同款三拍补采压回 burst 档 (实测见 design D5)。
+    const INPUT_BURST_STEPS: usize = 3;
+    const INPUT_BURST_STEP_MS: u64 = 8;
+
+    /// 输入后快采: 三拍 (8/16/24ms 真实时钟) 自寻址 `drain.tick`。
+    /// 与主 tick 同款退出语义: 出口满 → 丢拍继续; 实例不可达 → 自退出。
+    fn spawn_input_burst(&self) {
+        let messaging = Arc::clone(&self.ctx.messaging);
+        let id = self.ctx.instance;
+        let fut: TaskFuture = Box::pin(async move {
+            for _ in 0..Self::INPUT_BURST_STEPS {
+                tokio::time::sleep(Duration::from_millis(Self::INPUT_BURST_STEP_MS)).await;
+                let env = Envelope::new(
+                    service_core::Route::Instance(id),
+                    Address::instance(id),
+                    KIND_DRAIN_TICK,
+                    Payload::new(DrainTick),
+                );
+                match messaging.tell(env) {
+                    Ok(()) => {}
+                    Err(RouteError::DeadLetter(DeadLetterReason::ChannelFull)) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+        self.ctx.messaging.spawn_task(fut);
+    }
+
     /// `watch` 握手：订阅身份取信封 `from`（D5 受限地址恰为此设，D3）。
     fn on_watch(&mut self, env: &Envelope) {
         let Ok(_) = env.downcast::<WatchReq>() else {
@@ -295,7 +325,8 @@ impl AgentService {
             }
         }
         if inline_drain {
-            self.tick();
+            self.tick(); // 输入即推帧 (已有字节)
+            self.spawn_input_burst(); // 回显帧快采 (design D5 回改)
         }
     }
 
@@ -1082,6 +1113,45 @@ mod tests {
 
         // 已 Exited → 稳定
         assert!(!svc.tick().changed, "Exited 稳态不再翻转");
+    }
+
+    /// design D5 回改: 输入后 8/16/24ms 三拍补采自寻址 (40ms 窗口内
+    /// 恰 3 拍 — 主 tick 首拍被跳过立即拍后落在 ~50ms, 不入窗)。
+    #[test]
+    fn input_spawns_followup_burst_ticks() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+        let script = Arc::new(Mutex::new(StubScript::default()));
+        let msg = Arc::new(TestMessaging::new(InstanceId(12)));
+        msg.set_runtime(rt.handle().clone());
+        let mut svc = AgentService::with_factory(
+            test_ctx_with(Arc::clone(&msg)),
+            stub_factory(Arc::clone(&script)),
+        );
+        let id = svc.insert_session(
+            "pi-1".into(),
+            PathBuf::from("/p"),
+            Box::new(StubSession::new(Arc::clone(&script))),
+        );
+        assert!(svc.start().is_ok());
+
+        svc.dispatch(tell_env(
+            KIND_INPUT_TEXT,
+            Payload::new(InputText {
+                session: id,
+                text: "x".into(),
+            }),
+        ));
+        // 真实时钟推进: 补采在 8/16/24ms 发, 主 tick 首拍 >40ms
+        rt.block_on(async { tokio::time::sleep(Duration::from_millis(40)).await });
+        let ticks = msg
+            .sent()
+            .iter()
+            .filter(|e| e.kind == KIND_DRAIN_TICK)
+            .count();
+        assert_eq!(ticks, AgentService::INPUT_BURST_STEPS, "输入后三拍补采");
     }
 
     #[test]
