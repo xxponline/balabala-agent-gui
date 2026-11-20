@@ -12,6 +12,12 @@ use std::sync::Arc;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct SessionId(pub u64);
 
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// 会话语义状态（与旧 GUI `SessionStatus` 同义，随 change 移入服务侧）：
 /// `Starting`（已创建无输出）→ `Running`（已有输出）→ `Exited`（io 终止）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

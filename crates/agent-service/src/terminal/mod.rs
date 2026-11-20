@@ -1,7 +1,7 @@
-//! 终端面板 (TerminalPanel): main pane 渲染 + 键盘/IME 桥。
+//! 终端面板 (AgentTerminal): main pane 渲染 + 键盘/IME 桥。
 //!
 //! change `split-ui-modules-dockarea` 4.1-4.3: 原 `ui/pane.rs` 自由函数 +
-//! `app.rs` 的 `#terminal-pane` 整块收为 **TerminalPanel entity**
+//! `app.rs` 的 `#terminal-pane` 整块收为 **AgentTerminal entity**
 //! (`Panel` trait 面板; 当前先作为普通 child 挂回现有布局, 步骤 5 进
 //! DockArea 中心)。焦点 (原 `TerminalApp::pane_focus`) 迁入本面板 —
 //! 一步切焦点 (spec) 的目标; 键盘转发 (design D5) 的 listener 挂在此处,
@@ -14,17 +14,27 @@ use gpui_kit::base::TestTextExt;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::dock::{BasePanel, Panel, PanelEvent};
 use gpui_kit::*;
-use std::cell::Cell;
-use std::rc::Rc;
-use std::sync::Mutex;
-use vt100::Screen;
 
-use crate::agent_entities::SessionStatus;
-use crate::app::{TerminalApp, TerminalCopy, TerminalTab};
-use crate::ui::{TerminalTheme, bg_to_gpui, fg_to_gpui, terminal_theme};
+// 终端上下文动作 (change task 4.1: 自 app.rs 迁入 — 键位绑定仍在 GUI 侧注册)
+actions!(terminal, [TerminalTab, TerminalCopy]);
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::num::NonZeroU16;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
+use vt100::{Color, Parser, Screen};
+use gpui_kit::{Rgba, rgb};
+
+use crate::contract::{SessionId, SessionStatus, SessionView};
 
 /// 网格最小尺寸 (spec: Tiny pane clamps to minimum size; design D2)
 pub const MIN_GRID_COLS: u16 = 20;
+/// 本地 parser 回退网格 (首帧量测/建 parser 前; 与旧 PiAgentShell 回退同值)。
+const PANEL_FALLBACK_COLS: u16 = 100;
+const PANEL_FALLBACK_ROWS: u16 = 30;
+/// 本地 parser scrollback 行数 (与 PiAgentShell 一致)。
+const PARSER_SCROLLBACK: usize = 1000;
 pub const MIN_GRID_ROWS: u16 = 5;
 
 /// 把按键映射为终端字节 (与 spike 同一张表):
@@ -151,6 +161,24 @@ pub fn render_empty(cx: &App, font: &str) -> Div {
 
 /// 顶部状态条: `● <abs path> — <name>   [Status]`
 /// (agent-shell spec: 状态条显示完整路径 + 前缀名 + 状态)
+/// 本地 parser 网格同步 (纯函数, 便于直测): 跳过 Exited 会话 —
+/// spec: Grid resize propagation — exited 会话不 reflow, 保留最后画面。
+fn apply_grid_size(
+    parsers: &mut HashMap<SessionId, Parser>,
+    exited: &std::collections::HashSet<SessionId>,
+    cols: u16,
+    rows: u16,
+) {
+    if let (Some(r), Some(c)) = (NonZeroU16::new(rows.max(1)), NonZeroU16::new(cols.max(1))) {
+        for (id, parser) in parsers.iter_mut() {
+            if exited.contains(id) {
+                continue; // Exited: 最后画面逐字节保留
+            }
+            parser.set_size(r, c);
+        }
+    }
+}
+
 pub fn status_bar(data: &PaneData, cx: &App) -> Div {
     div()
         .w_full()
@@ -544,7 +572,7 @@ mod tests {
     use super::{
         GRID_FONT_SIZE_PX, build_grid, cell_width, grid_font_family, grid_metrics, terminal_grid,
     };
-    use crate::ui::{THEME_DARK, THEME_LIGHT, bg_to_gpui, fg_to_gpui, terminal_theme};
+    use super::{THEME_DARK, THEME_LIGHT, bg_to_gpui, fg_to_gpui, terminal_theme};
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
         AnyWindowHandle, AppContext, Bounds, Context, InteractiveElement, IntoElement,
@@ -905,6 +933,37 @@ mod tests {
         })
     }
 
+    /// change agent-service task 3.5 (spec: Grid resize propagation —
+    /// exited 会话不 reflow 以保留最后画面): 渲染面溶解后该 spec 半边
+    /// 落在面板本地 parser — Exited 跳过 set_size, 存活会话正常 reflow。
+    #[test]
+    fn exited_session_parser_not_resized() {
+        use super::apply_grid_size;
+        use crate::contract::SessionId;
+        use std::collections::HashMap;
+        use vt100::Parser;
+        let mut parsers: HashMap<SessionId, Parser> = HashMap::new();
+        parsers.insert(SessionId(1), parser_with(FIXTURE));
+        parsers.insert(SessionId(2), parser_with(FIXTURE));
+        let exited: std::collections::HashSet<SessionId> =
+            [SessionId(1)].into_iter().collect();
+
+        apply_grid_size(&mut parsers, &exited, 60, 20);
+
+        let (rows1, cols1) = parsers[&SessionId(1)].screen().size();
+        assert_eq!(
+            (rows1.get(), cols1.get()),
+            (ROWS, COLS),
+            "Exited 会话不 reflow, 最后画面保留 (行/列数不变)"
+        );
+        let (rows2, cols2) = parsers[&SessionId(2)].screen().size();
+        assert_eq!(
+            (rows2.get(), cols2.get()),
+            (20, 60),
+            "存活会话 reflow 到新网格"
+        );
+    }
+
     // ---------- mock 文本系统下的 cell-width 契约 (task 3.2) ----------
     // 以下测试跑在 NoopTextSystem (无头测试默认: 全 BMP 字形均匀
     // 0.6em = 7.8px) 上 — 锁定的是 div 宽度契约/同帧稳定性/行高等
@@ -988,7 +1047,7 @@ mod tests {
         // (2) 索引色格两主题不同 (同一 screen, 仅换调色板)
         let mut parser = parser_with("");
         parser.process(b"\x1b[32mgreen\x1b[0m"); // 绿 = ANSI idx 2
-        let seg_under = |theme: &crate::ui::TerminalTheme| -> u32 {
+        let seg_under = |theme: &super::TerminalTheme| -> u32 {
             let rows = build_grid(parser.screen(), theme);
             let seg = rows[0]
                 .iter()
@@ -1459,8 +1518,8 @@ mod tests {
         let c = '"';
         let font_lit = format!("font({c}");
         let family_lit = format!(".font_family({c}");
-        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/pane/mod.rs"))
-            .expect("读取 pane 源码");
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/terminal/mod.rs"))
+            .expect("读取 terminal 源码");
         assert!(
             !src.contains(&font_lit),
             "font() 不得接字体族字面量 (唯一来源应为 grid_font_family): {font_lit}"
@@ -1633,8 +1692,37 @@ mod tests {
 }
 
 /// 中心终端面板: `#terminal-pane` 整块 + 焦点 + 键盘/IME 桥。
-pub struct TerminalPanel {
-    app: WeakEntity<TerminalApp>,
+
+/// AgentTerminal 出站窄缝 (change agent-service design D7): GUI 实现并
+/// 注入 — 面板只表达语义, 不触 `service-manager` / `TerminalApp` 类型。
+/// 入站 (帧/投影) 走 [`AgentTerminal::feed`] / [`AgentTerminal::set_view`]。
+pub trait TerminalBus: Send + Sync + 'static {
+    /// 输入注入 (tell, D6 静默)。
+    fn send_key(&self, cx: &mut App, key: crossterm::event::KeyEvent);
+    /// IME commit 文本 (preedit 不走此路)。
+    fn send_text(&self, cx: &mut App, text: &str);
+    /// 滚轮行数 (负=上滚看更早)。
+    fn send_wheel(&self, cx: &mut App, lines: i16);
+    /// 左键 0-based 单元格坐标 (命中在会话内部)。
+    fn send_click(&self, cx: &mut App, x: u16, y: u16);
+    /// 网格量测分发 (GUI 侧去重/日志/服务 tell)。
+    fn propagate_grid_size(
+        &self,
+        cx: &mut App,
+        cols: u16,
+        rows: u16,
+        w: f32,
+        h: f32,
+        cell_w: Pixels,
+        line_h: Pixels,
+    );
+}
+
+pub struct AgentTerminal {
+    /// 出站窄缝 (GUI 实现注入, design D7)。
+    bus: Arc<dyn TerminalBus>,
+    /// 投影镜像 (GUI 泵 `set_view` 注入): 渲染/选区/Exited 集读它。
+    view: Option<SessionView>,
     /// 面板焦点 (原 TerminalApp::pane_focus 迁入; 4.1):
     /// `track_focus` 挂在 `#terminal-pane`, 一步切焦点/IME handler 均用它。
     focus: FocusHandle,
@@ -1642,31 +1730,112 @@ pub struct TerminalPanel {
     /// origin 作点击换算减项, size 作越界判定 (spec: Clicks outside the
     /// grid area)。prepaint 期直写 (render 中不得 update 实体 → Rc<Cell>
     /// 裸闭包, gpui-component 库测试同款)。pub(crate): 测试/点击读。
-    pub(crate) grid_bounds: Rc<Cell<Bounds<Pixels>>>,
+    pub grid_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// 滚轮像素/行混合累积器 (task 3.2, spec: Wheel deltas accumulate to
     /// whole lines — 慢滚不丢、余数跨事件携带、line_h 变化清零)。
     wheel: WheelAccumulator,
     /// 文本选区 (terminal-text-selection task 2.1): 锚点/焦点 cell,
     /// overlay 与哨兵/复制共用。
-    pub(crate) selection: Option<CellRange>,
+    pub selection: Option<CellRange>,
     /// 当前左键按选手势 (task 2.1; on_click 消费 moved 后复位)。
     press: Option<Press>,
     /// 选区文本快照 (task 3.1, spec 哨兵): 定界时建立 (Some), 清选区时
     /// 一并清 (None = 未建立守卫, 拖动中不定界不比对)。
     selection_snapshot: Option<String>,
+    /// 每会话本地渲染 parser (change agent-service 3.4): 帧字节经
+    /// `feed` 喂入, 切换零成本 (全推让每会话 parser 连续存活)。
+    parsers: HashMap<SessionId, Parser>,
+    /// 当前目标网格 (cols, rows) — 新建 parser 的初值 + resize 同步基准
+    /// (与服务侧 embed resize 同拍; 首帧量测前用回退值)。
+    grid_size: (u16, u16),
 }
 
-impl TerminalPanel {
-    pub fn new(app: WeakEntity<TerminalApp>, cx: &mut Context<Self>) -> Self {
+impl AgentTerminal {
+    pub fn new(bus: Arc<dyn TerminalBus>, cx: &mut Context<Self>) -> Self {
         Self {
-            app,
+            bus,
+            view: None,
             focus: cx.focus_handle(),
             grid_bounds: Rc::new(Cell::new(Bounds::default())),
             wheel: WheelAccumulator::default(),
             selection: None,
             press: None,
             selection_snapshot: None,
+            parsers: HashMap::new(),
+            grid_size: (PANEL_FALLBACK_COLS, PANEL_FALLBACK_ROWS),
         }
+    }
+
+    /// 注入投影镜像 (GUI 泵/测试在 render 前调; design D7 入站)。
+    pub fn set_view(&mut self, view: Option<SessionView>, cx: &mut Context<Self>) {
+        if self.view.as_ref().map(|v| v.sessions.len()) != view.as_ref().map(|v| v.sessions.len())
+            || self.view.as_ref().and_then(|v| v.active) != view.as_ref().and_then(|v| v.active)
+            || self
+                .view
+                .as_ref()
+                .map(|v| v.sessions.iter().map(|s| s.status).collect::<Vec<_>>())
+                != view
+                    .as_ref()
+                    .map(|v| v.sessions.iter().map(|s| s.status).collect::<Vec<_>>())
+        {
+            self.view = view;
+            cx.notify();
+        }
+    }
+
+    /// 喂入一个会话的新帧字节 (change agent-service 3.4; app 泵从
+    /// `frame_bytes` 事件调入)。parser 按需创建 (初值 = 当前网格),
+    /// 有新字节即 notify (帧到必 render)。
+    pub fn feed(&mut self, session: SessionId, bytes: &[u8], cx: &mut Context<Self>) {
+        if bytes.is_empty() {
+            return;
+        }
+        let (cols, rows) = self.grid_size;
+        let parser = self.parsers.entry(session).or_insert_with(|| {
+            Parser::new(
+                NonZeroU16::new(rows.max(1)).unwrap(),
+                NonZeroU16::new(cols.max(1)).unwrap(),
+                PARSER_SCROLLBACK,
+            )
+        });
+        parser.process(bytes);
+        cx.notify();
+    }
+
+    /// 记录目标网格并同步本地 parser (与服务侧 resize 同拍; task 3.4)。
+    /// `exited` = 状态为 Exited 的会话 — 不 reflow, 保留最后画面
+    /// (spec: Grid resize propagation — exited 会话不 resize)。
+    pub fn set_grid_size(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        exited: &std::collections::HashSet<SessionId>,
+    ) {
+        if self.grid_size == (cols, rows) {
+            return;
+        }
+        self.grid_size = (cols, rows);
+        apply_grid_size(&mut self.parsers, exited, cols, rows);
+    }
+
+    /// 当前 active 会话的本地 parser (渲染/选区读取口)。
+    fn active_parser(&self, active: Option<SessionId>) -> Option<&Parser> {
+        self.parsers.get(&active?)
+    }
+
+    /// 测试口: active 会话屏幕全文 (无 parser → None)。
+    /// 跨 crate 可见 (GUI 测试消费): `cfg(test)` 只在本 crate 测试构建生效,
+    /// 对消费方的测试构建不可见 — 常编译 + allow。
+    #[allow(dead_code)]
+    pub fn active_screen_text(&self, active: Option<SessionId>) -> Option<String> {
+        Some(self.active_parser(active)?.screen().contents())
+    }
+
+    /// 测试口: active 会话 parser 尺寸 (rows, cols) (跨 crate 可见同上)。
+    #[allow(dead_code)]
+    pub fn active_parser_size(&self, active: Option<SessionId>) -> Option<(u16, u16)> {
+        let (r, c) = self.active_parser(active)?.screen().size();
+        Some((r.get(), c.get()))
     }
 
     /// 键盘转发 (design D5, spike 已验证的机制):
@@ -1688,13 +1857,9 @@ impl TerminalPanel {
         }
         let keys = keystroke_to_keyevents(&ks.key, ks.key_char.as_deref());
         if !keys.is_empty() {
-            let app = self.app.clone();
-            app.update(cx, |app, cx| {
-                for key in keys {
-                    app.send_key(key, cx);
-                }
-            })
-            .ok();
+            for key in keys {
+                self.bus.send_key(cx, key);
+            }
             cx.stop_propagation(); // 防双发 (见上)
         }
     }
@@ -1715,8 +1880,7 @@ impl TerminalPanel {
         else {
             return; // 未凑满一行 (余数已携带)
         };
-        let app = self.app.clone();
-        app.update(cx, |app, cx| app.send_wheel(lines, cx)).ok();
+        self.bus.send_wheel(cx, lines);
     }
 
     /// Cmd+C 复制 (task 4.1, spec: Copy selection with Cmd+C): 先内联
@@ -1736,31 +1900,27 @@ impl TerminalPanel {
         cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(live));
     }
 
-    /// 当前选区的实时文本 (active session screen + selection_text;
-    /// 无会话/无选区 → None)。哨兵比对与 Cmd+C 复制共用同一读取路径。
-    pub(crate) fn selection_text_now(&self, cx: &App) -> Option<String> {
+    /// 当前选区的实时文本 (active 会话本地 parser + selection_text;
+    /// 无会话/无 parser/无选区 → None)。哨兵比对与 Cmd+C 复制共用同一读取路径。
+    pub fn selection_text_now(&self, _cx: &App) -> Option<String> {
         let range = self.selection?;
-        let app = self.app.upgrade()?;
-        let app = app.read(cx);
-        let session = app.active_session()?;
-        Some(selection_text(session.read(cx).0.screen(), range))
+        let active = self.view.as_ref()?.active;
+        let parser = self.active_parser(active)?;
+        Some(selection_text(parser.screen(), range))
     }
 
     /// 窗口坐标 → 选区 cell (task 2.1): grid_bounds 换算 + screen 行列
     /// 上限 clamp (spec: clamps to the grid edge)。无 active session 时
     /// 退化到 80×24 上限 (仍可选, 只是 clamp 边界保守)。
-    fn cell_of(&self, pos: Point<Pixels>, window: &Window, cx: &App) -> CellPos {
+    fn cell_of(&self, pos: Point<Pixels>, window: &Window, _cx: &App) -> CellPos {
         let grid = self.grid_bounds.get();
         let (cell_w, line_h) = grid_metrics(window);
+        let active = self.view.as_ref().and_then(|v| v.active);
         let (cols, rows) = self
-            .app
-            .upgrade()
-            .and_then(|app| {
-                let app = app.read(cx);
-                app.active_session().map(|s| {
-                    let (r, c) = s.read(cx).0.screen().size();
-                    (c.get(), r.get())
-                })
+            .active_parser(active)
+            .map(|p| {
+                let (r, c) = p.screen().size();
+                (c.get(), r.get())
             })
             .unwrap_or((80, 24));
         cell_at(pos, grid, f32::from(cell_w), f32::from(line_h), cols, rows)
@@ -1802,22 +1962,21 @@ impl TerminalPanel {
         {
             return;
         }
-        let app = self.app.clone();
-        app.update(cx, |app, cx| app.send_click(col, row, cx)).ok();
+        self.bus.send_click(cx, col, row);
     }
 }
 
 /// 选区单元格位置 (row, col — 行优先, 与 overlay 分行一致;
 /// terminal-text-selection task 1.1)。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct CellPos {
+pub struct CellPos {
     pub row: u16,
     pub col: u16,
 }
 
 /// 选区范围: anchor = 按下锚点, focus = 拖动当前点。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct CellRange {
+pub struct CellRange {
     pub anchor: CellPos,
     pub focus: CellPos,
 }
@@ -1958,7 +2117,7 @@ fn wheel_lines_for(
     })
 }
 
-impl BasePanel for TerminalPanel {
+impl BasePanel for AgentTerminal {
     fn panel_name(&self) -> &'static str {
         "terminal"
     }
@@ -1970,7 +2129,7 @@ impl BasePanel for TerminalPanel {
     }
 }
 
-impl Panel for TerminalPanel {
+impl Panel for AgentTerminal {
     fn title(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         // 顶栏/多签 tab 的 console 标题 (tasks 2.1)。固定字面量而非
         // 随 session 名抖动; 未来要展示活动 session 名在此扩展。
@@ -1990,19 +2149,18 @@ impl Panel for TerminalPanel {
     }
 }
 
-impl EventEmitter<PanelEvent> for TerminalPanel {}
+impl EventEmitter<PanelEvent> for AgentTerminal {}
 
-impl Focusable for TerminalPanel {
+impl Focusable for AgentTerminal {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
     }
 }
 
-impl Render for TerminalPanel {
+impl Render for AgentTerminal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(app) = self.app.upgrade() else {
-            return div().into_any_element();
-        };
+        // 面板实体句柄: 量测 defer 同步本地 parser + IME 输入挂载 (task 3.4/4.1)
+        let panel_entity = cx.entity();
         // 哨兵 (task 3.1, spec: Selection cleared when its content changes):
         // render = 帧到达路径 (帧到必 render); 实时选区文本 ≠ 快照 →
         // 内容被顶走/重排 → 本帧即清。无会话 (切走/空态) 同样失效。
@@ -2017,23 +2175,38 @@ impl Render for TerminalPanel {
                 self.selection_snapshot = None;
             }
         }
-        // 快照先行 (每帧现读 active session — design §7.2; 拥有值进元素树)
+        // 快照先行 (每帧现读投影镜像 + 本地 parser — design §7.2;
+        // 拥有值进元素树; change agent-service 3.4: 会话归服务, 屏幕
+        // 在面板本地 parser — 无帧前走 starting 占位, spec 对齐)
         let selection = self.selection;
         let theme = terminal_theme(cx);
-        let pane_data = app.read(cx).active_session().map(|session| {
-            let s = session.read(cx);
-            PaneData {
-                // 用 session 自己的 project_root (AgentEntity 契约 = cwd;
-                // spec: Console status bar content 显示 project root 路径)
-                path: s.0.project_root().to_string_lossy().to_string(),
-                name: s.0.name().to_string(),
-                status: s.0.status(),
-                grid: terminal_grid(s.0.screen(), window, selection, theme),
-            }
-        });
+        let pane_data = {
+            let view = self.view.as_ref();
+            let info = view
+                .and_then(|v| v.active)
+                .and_then(|id| view.and_then(|v| v.sessions.iter().find(|s| s.id == id)));
+            info.map(|info| {
+                // 有本地 parser → 网格; 尚无帧 → 空格子 (状态栏照出 —
+                // 旧行为: 会话在场即出状态栏, 空屏也渲染空网格)
+                let grid = match self.active_parser(Some(info.id)) {
+                    Some(parser) => terminal_grid(parser.screen(), window, selection, theme),
+                    None => div(),
+                };
+                PaneData {
+                    // 用会话自己的 project_root (spec: Console status bar
+                    // content 显示 project root 路径)
+                    path: info.project_root.to_string_lossy().to_string(),
+                    name: info.name.clone(),
+                    status: info.status,
+                    grid,
+                }
+            })
+        };
         let grid_font = grid_font_family(window);
         let focus = self.focus.clone();
-        let app_weak = self.app.clone();
+        // defer 用快照: render 期已新鲜, paint 后不再碰实体状态 (除 panel 自身)
+        let view_snapshot = self.view.clone();
+        let bus = Arc::clone(&self.bus);
         div()
             .id("terminal-pane")
             .test_support() // 观测锚点 (无 test-support 特性时为 no-op)
@@ -2060,17 +2233,13 @@ impl Render for TerminalPanel {
             .on_action(cx.listener(|this, _: &TerminalTab, _window, cx| {
                 // Tab 被 Terminal context 的绑定截获 (原始 key
                 // event 不再派发), 在动作里转发 — 单路径 (D5)
-                let app = this.app.clone();
-                app.update(cx, |app, cx| {
-                    app.send_key(
-                        crossterm::event::KeyEvent::new(
-                            crossterm::event::KeyCode::Tab,
-                            crossterm::event::KeyModifiers::NONE,
-                        ),
-                        cx,
-                    );
-                })
-                .ok();
+                this.bus.send_key(
+                    cx,
+                    crossterm::event::KeyEvent::new(
+                        crossterm::event::KeyCode::Tab,
+                        crossterm::event::KeyModifiers::NONE,
+                    ),
+                );
                 cx.stop_propagation();
             }))
             // ---- 选区手势 (terminal-text-selection task 2.1, design D2) ----
@@ -2204,17 +2373,19 @@ impl Render for TerminalPanel {
                                 .child(
                                     // IME 挂载点: paint 阶段注册
                                     // InputHandler (spike 同款);
-                                    // EntityInputHandler 留 TerminalApp (4.3)
+                                    // change task 4.1: 实现迁 AgentTerminal
+                                    // (EntityInputHandler → bus.send_text)
                                     canvas(
                                         move |bounds, _window, _cx| bounds,
                                         move |_bounds, pane_bounds, window, cx| {
-                                            if let Some(app) = app_weak.upgrade() {
-                                                window.handle_input(
-                                                    &focus,
-                                                    ElementInputHandler::new(pane_bounds, app),
-                                                    cx,
-                                                );
-                                            }
+                                            window.handle_input(
+                                                &focus,
+                                                ElementInputHandler::new(
+                                                    pane_bounds,
+                                                    panel_entity.clone(),
+                                                ),
+                                                cx,
+                                            );
                                             // 自适应 (spec: Adaptive terminal
                                             // grid sizing): 量网格区域 -> 换算
                                             // 列/行 (floor + 下限夹取) ->
@@ -2234,16 +2405,32 @@ impl Render for TerminalPanel {
                                                 clamp(w / f32::from(cell_w), MIN_GRID_COLS);
                                             let rows =
                                                 clamp(h / f32::from(line_h), MIN_GRID_ROWS);
-                                            let weak = app_weak.clone();
+                                            let view_snapshot = view_snapshot.clone();
+                                            let bus = bus.clone();
                                             cx.defer(move |cx| {
-                                                if let Some(app) = weak.upgrade() {
-                                                    app.update(cx, |app, cx| {
-                                                        app.propagate_grid_size(
-                                                            cols, rows, w, h, cell_w, line_h,
-                                                            cx,
-                                                        );
-                                                    });
-                                                }
+                                                // Exited 集合取自 render 期投影快照
+                                                // (spec: exited 不 reflow)
+                                                let exited: std::collections::HashSet<SessionId> =
+                                                    view_snapshot
+                                                        .as_ref()
+                                                        .map(|v| {
+                                                            v.sessions
+                                                                .iter()
+                                                                .filter(|s| {
+                                                                    s.status
+                                                                        == SessionStatus::Exited
+                                                                })
+                                                                .map(|s| s.id)
+                                                                .collect()
+                                                        })
+                                                        .unwrap_or_default();
+                                                // 本地 parser 与 embed 同拍 resize (task 3.4)
+                                                panel_entity.update(cx, |p, _| {
+                                                    p.set_grid_size(cols, rows, &exited)
+                                                });
+                                                bus.propagate_grid_size(
+                                                    cx, cols, rows, w, h, cell_w, line_h,
+                                                );
                                             });
                                         },
                                     )
@@ -2257,3 +2444,333 @@ impl Render for TerminalPanel {
     }
 }
 
+
+// ---- 主题调色板/映射 (change agent-service task 4.1: 自 GUI ui 模块迁入 —
+// 终端渲染专属, 面板迁 crate 后颜色映射随行) ----
+
+/// ANSI 0-15 调色板 (浅色主题, design D9): 比暗色版整体
+/// 加深以保白底可读; "white" (7/15) 取灰阶 — 纯白在白底上不可见。
+const PALETTE_LIGHT: [u32; 16] = [
+    0x000000, // 0  black
+    0xcd3131, // 1  red        (与原版一致)
+    0x1a7f2e, // 2  green      (比原版的 0dbc79 深, 白底可读)
+    0x8a7f00, // 3  yellow     (橄榄色; 原版 e5e510 白底不可读)
+    0x2472c8, // 4  blue       (与原版一致)
+    0xa94db0, // 5  magenta
+    0x0f7fa8, // 6  cyan
+    0x9e9e9e, // 7  white → 中灰 (可读性适配)
+    0x5c5c5c, // 8  bright black
+    0xe05252, // 9  bright red
+    0x2fa043, // 10 bright green
+    0x9a8f00, // 11 bright yellow
+    0x4a8fe0, // 12 bright blue
+    0xc066cc, // 13 bright magenta
+    0x2f9fc0, // 14 bright cyan
+    0xbfbfbf, // 15 bright white → 浅灰
+];
+
+/// ANSI 0-15 调色板 (深色主题, add-light-dark-theme D2): 0-7 为原版
+/// 暗色值 (pre-port git history, 即 VS Code dark+ ANSI 色板); 8-15 按
+/// 同源亮色系补全 — 旧实现 8-15 全 fallback 灰、256+ 白的行为已随
+/// 完整立方转换废弃, 此处不恢复。
+const PALETTE_DARK: [u32; 16] = [
+    0x000000, // 0  black
+    0xcd3131, // 1  red        (原版)
+    0x0dbc79, // 2  green      (原版)
+    0xe5e510, // 3  yellow     (原版)
+    0x2472c8, // 4  blue       (原版)
+    0xbc4bad, // 5  magenta    (原版)
+    0x11a8cd, // 6  cyan       (原版)
+    0xe5e5e5, // 7  white      (原版)
+    0x6c6c6c, // 8  bright black
+    0xf14c4c, // 9  bright red
+    0x23d18b, // 10 bright green
+    0xf5f543, // 11 bright yellow
+    0x3b8eea, // 12 bright blue
+    0xd670d6, // 13 bright magenta
+    0x29b8db, // 14 bright cyan
+    0xffffff, // 15 bright white
+];
+
+/// 主题相关的终端颜色快照: 0-15 调色板 + 默认前景/背景。
+/// 纯数据 — fg/bg 映射函数按它转换, 保持函数纯净可单测 (design D2)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalTheme {
+    pub palette: [u32; 16],
+    pub default_fg: u32,
+    pub default_bg: u32,
+}
+
+/// 浅色主题终端配色 (白底深字; 现值不变)。
+pub const THEME_LIGHT: TerminalTheme = TerminalTheme {
+    palette: PALETTE_LIGHT,
+    default_fg: 0x2b2b2b,
+    default_bg: 0xffffff,
+};
+
+/// 深色主题终端配色 (原版恢复: 底 0x0a0a0a / 字 0xe5e5e5)。
+/// 底色对齐 gpui-component 深色 `background` token (而非历史值 0x1e1e1e):
+/// pane 面板底走该 token (design D3), 两者必须同值否则网格四周出现
+/// 接缝 (spec: "no visible seam against the pane frame"); design 风险
+/// 条款允许调常量。
+pub const THEME_DARK: TerminalTheme = TerminalTheme {
+    palette: PALETTE_DARK,
+    default_fg: 0xe5e5e5,
+    default_bg: 0x0a0a0a,
+};
+
+/// xterm 256 色索引 → RGB:
+/// 0-15 查当前主题调色板, 16-231 为 6x6x6 立方, 232-255 为灰阶。
+/// (原实现对 16+ 回退白/默认色, 这里是完整转换 — 更符合
+///  agent-shell spec 的 "preserve colors" 要求)
+fn idx_to_rgb(i: u8, theme: &TerminalTheme) -> u32 {
+    match i {
+        0..=15 => theme.palette[i as usize],
+        16..=231 => {
+            let n = u32::from(i - 16);
+            let (r, g, b) = (n / 36, (n / 6) % 6, n % 6);
+            let c = |v: u32| if v == 0 { 0 } else { 55 + 40 * v };
+            (c(r) << 16) | (c(g) << 8) | c(b)
+        }
+        _ => {
+            let v = 8 + 10 * u32::from(i - 232);
+            (v << 16) | (v << 8) | v
+        }
+    }
+}
+
+/// 当前主题的终端配色快照 (供渲染路径从 cx 取; 纯函数仍收显式
+/// theme 参数 — design D2)。
+pub fn terminal_theme(cx: &gpui_kit::App) -> &'static TerminalTheme {
+    match gpui_kit::component::theme::Theme::global(cx).mode {
+        gpui_kit::component::theme::ThemeMode::Light => &THEME_LIGHT,
+        gpui_kit::component::theme::ThemeMode::Dark => &THEME_DARK,
+    }
+}
+
+/// vt100 前景色 → gpui (默认前景随主题)。
+pub fn fg_to_gpui(color: Color, theme: &TerminalTheme) -> Rgba {
+    match color {
+        Color::Default => rgb(theme.default_fg),
+        Color::Idx(i) => rgb(idx_to_rgb(i, theme)),
+        Color::Rgb(r, g, b) => rgb((u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)),
+    }
+}
+
+/// vt100 背景色 → gpui (默认背景随主题)。
+pub fn bg_to_gpui(color: Color, theme: &TerminalTheme) -> Rgba {
+    match color {
+        Color::Default => rgb(theme.default_bg),
+        Color::Idx(i) => rgb(idx_to_rgb(i, theme)),
+        Color::Rgb(r, g, b) => rgb((u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)),
+    }
+}
+
+
+#[cfg(test)]
+mod theme_tests {
+    //! add-light-dark-theme task 2.1: 双调色板表 + 共享 256 色转换的锁定。
+    //!
+    //! 显式导入, 不用 glob — 防 `gpui_kit::*` 把 `#[test]` 宏遮蔽掉
+    //! (terminal 自身 tests 的同款教训, recursion-limit 爆炸实测)。
+
+    use super::{PALETTE_DARK, PALETTE_LIGHT, THEME_DARK, THEME_LIGHT, bg_to_gpui, fg_to_gpui, idx_to_rgb};
+    use gpui_kit::rgb;
+    use vt100::Color;
+
+
+    #[test]
+    fn both_palettes_are_16_entries_and_distinct() {
+        assert_eq!(PALETTE_LIGHT.len(), 16);
+        assert_eq!(PALETTE_DARK.len(), 16);
+        assert_ne!(
+            PALETTE_LIGHT, PALETTE_DARK,
+            "深色表必须与浅色表不同"
+        );
+        // 原版恢复锚点: 深色绿/黄/白为 pre-port 暗色值
+        assert_eq!(PALETTE_DARK[2], 0x0dbc79);
+        assert_eq!(PALETTE_DARK[3], 0xe5e510);
+        assert_eq!(PALETTE_DARK[7], 0xe5e5e5);
+        // 两主题默认底/字不同
+        assert_ne!(THEME_LIGHT.default_bg, THEME_DARK.default_bg);
+        assert_ne!(THEME_LIGHT.default_fg, THEME_DARK.default_fg);
+    }
+
+    /// 16-255 共享转换 (立方 + 灰阶) 锁定: 与 xterm 标准公式逐项比对 —
+    /// 该段不查表, 两主题共用, 任何回归两主题同时受影响。
+
+    #[test]
+    fn shared_256_color_conversion_matches_xterm_formula() {
+        let reference = |i: u8| -> u32 {
+            match i {
+                16..=231 => {
+                    let n = u32::from(i - 16);
+                    let (r, g, b) = (n / 36, (n / 6) % 6, n % 6);
+                    let c = |v: u32| if v == 0 { 0 } else { 55 + 40 * v };
+                    (c(r) << 16) | (c(g) << 8) | c(b)
+                }
+                _ => {
+                    let v = 8 + 10 * u32::from(i - 232);
+                    (v << 16) | (v << 8) | v
+                }
+            }
+        };
+        for i in 16..=255u8 {
+            assert_eq!(
+                idx_to_rgb(i, &THEME_LIGHT),
+                reference(i),
+                "idx {i} 的转换偏离 xterm 标准公式"
+            );
+            // 两主题共享同一立方/灰阶转换
+            assert_eq!(
+                idx_to_rgb(i, &THEME_DARK),
+                reference(i),
+                "idx {i} 深色主题下偏离 xterm 标准公式"
+            );
+        }
+        // 关锚点: 立方黑/立方白/灰阶首/灰阶尾
+        assert_eq!(idx_to_rgb(16, &THEME_LIGHT), 0x000000);
+        assert_eq!(idx_to_rgb(231, &THEME_LIGHT), 0xffffff);
+        assert_eq!(idx_to_rgb(232, &THEME_LIGHT), 0x080808);
+        assert_eq!(idx_to_rgb(255, &THEME_LIGHT), 0xeeeeee);
+    }
+
+    /// add-light-dark-theme task 4.2/4.3: 注入配色构造 —
+    /// 深色 ≡ pi-shell-rs 默认 (其 R2: 默认路径字节级不变, 注入默认值
+    /// ≡ 不注入); 浅色为自有值且语法主题名必须有效 (无效名会回退)。
+
+    #[test]
+    fn default_colors_follow_theme_and_rgb_passes_through() {
+        // Default: 浅色 = 深字白底, 深色 = 亮字暗底
+        assert_eq!(fg_to_gpui(Color::Default, &THEME_LIGHT), rgb(0x2b2b2b));
+        assert_eq!(bg_to_gpui(Color::Default, &THEME_LIGHT), rgb(0xffffff));
+        assert_eq!(fg_to_gpui(Color::Default, &THEME_DARK), rgb(0xe5e5e5));
+        assert_eq!(bg_to_gpui(Color::Default, &THEME_DARK), rgb(0x0a0a0a));
+
+        // 显式 RGB: 双主题逐字节相同 (spec: Explicit session colors pass through)
+        let sample = Color::Rgb(0x12, 0x34, 0x56);
+        assert_eq!(
+            fg_to_gpui(sample, &THEME_LIGHT),
+            fg_to_gpui(sample, &THEME_DARK)
+        );
+        assert_eq!(fg_to_gpui(sample, &THEME_LIGHT), rgb(0x123456));
+        assert_eq!(
+            bg_to_gpui(sample, &THEME_LIGHT),
+            bg_to_gpui(sample, &THEME_DARK)
+        );
+
+        // 索引色: 双主题走各自调色板 (深浅不同)
+        let idx = Color::Idx(2); // green
+        assert_ne!(
+            fg_to_gpui(idx, &THEME_LIGHT),
+            fg_to_gpui(idx, &THEME_DARK)
+        );
+        assert_eq!(fg_to_gpui(idx, &THEME_LIGHT), rgb(0x1a7f2e));
+        assert_eq!(fg_to_gpui(idx, &THEME_DARK), rgb(0x0dbc79));
+    }
+}
+
+
+/// change agent-service task 4.1: IME 输入路径随面板迁入 —
+/// commit 文本经窄缝送服务 (原 TerminalApp 实现随之删除)。
+impl EntityInputHandler for AgentTerminal {
+    fn replace_text_in_range(
+        &mut self,
+        _replacement_range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !text.is_empty() {
+            self.bus.send_text(cx, text);
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range_utf16: Option<std::ops::Range<usize>>,
+        _new_text: &str,
+        _new_selected_range: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        // preedit: spec 明确不转发
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
+    }
+
+    fn text_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        _adjusted_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(element_bounds) // IME 候选框定位在面板区域
+    }
+
+    fn selection_bounds_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Vec<Bounds<Pixels>> {
+        Vec::new()
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+
+    fn set_selected_text_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn text_length_utf16(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(0)
+    }
+}

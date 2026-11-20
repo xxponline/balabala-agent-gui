@@ -26,13 +26,17 @@
 //!   帧全推与投影事件；
 //! - [`contract`]：GUI ↔ 服务消息契约（design D3）；
 //! - [`session`]：`SessionIo` 会话句柄抽象；
-//! - `terminal`（task 4.1 迁入）：`AgentTerminal` —— vt100 parser × N、网格渲染。
+//! - [`shell`]：`PiAgentShell` — 真实嵌入会话（生产 spawn，task 3.5 迁入）；
+
 
 pub mod contract;
 pub mod service;
 pub mod session;
+pub mod shell;
+pub mod terminal;
 
 pub use service::{agent_service_factory, AgentService};
+pub use shell::PiAgentShell;
 
 #[cfg(test)]
 pub(crate) mod testkit;

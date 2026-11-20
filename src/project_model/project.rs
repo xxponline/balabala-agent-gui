@@ -85,6 +85,10 @@ impl Project {
 
     /// 领取下一个会话显示名 `<project>/pi-N` 并自增 (spec: Project
     /// session creation — N 起 1, 同项目内不复用)。
+    ///
+    /// change agent-service 3.2: 命名真值已移入 AgentService (服务侧
+    /// counters); 本方法保留为 model 层遗留单测锚 (生产不再调用)。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn next_agent_name(&mut self) -> String {
         let name = format!("{}/pi-{}", self.name, self.next_agent_idx);
         self.next_agent_idx += 1;

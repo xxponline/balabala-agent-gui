@@ -338,7 +338,14 @@ impl AgentService {
         let root = req.root.clone();
         let n = self.counters.entry(root.clone()).or_insert(0);
         *n += 1;
-        let name = format!("pi-{n}");
+        // 显示名 = `<project>/pi-N` (project name = root 末段 — spec:
+        // Project session creation: 行显示 `foo/pi-1`)
+        let proj = root
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/".to_string());
+        let name = format!("{proj}/pi-{n}");
         match (self.factory)(name.clone(), root.clone(), self.theme.clone()) {
             Ok(io) => {
                 let id = self.insert_session(name, root, io);
@@ -576,8 +583,8 @@ mod tests {
         assert_eq!(svc.active(), Some(created), "新建即 active");
         assert_eq!(svc.session_view().sessions.len(), 3, "新行入清单");
         assert_eq!(
-            svc.session_view().sessions[2].name, "pi-1",
-            "/p3 首个名额 pi-1"
+            svc.session_view().sessions[2].name, "p3/pi-1",
+            "/p3 首个名额 `<project>/pi-1` (spec)"
         );
 
         // close 非 active → 不动 active; io 必须 shutdown
@@ -602,6 +609,20 @@ mod tests {
             last_reply::<CloseOk>(&msg, 7),
             Err(e) if e.0.contains("no such")
         ));
+
+        // 全部关完再建同 root → p3/pi-2: 名额计数不随关闭回退
+        // (N 每项目起 1, 同项目内不复用 — spec)
+        svc.dispatch(ctrl_env(
+            KIND_CREATE,
+            Payload::new(CreateReq {
+                root: PathBuf::from("/p3"),
+            }),
+            8,
+        ));
+        last_reply::<CreateOk>(&msg, 8).expect("second create ok");
+        let view = svc.session_view();
+        assert_eq!(view.sessions.len(), 1, "只剩新会话");
+        assert_eq!(view.sessions[0].name, "p3/pi-2", "名额递增不复用 (spec)");
     }
 
     /// task 2.2 验证: create 失败 → Err(String)、无新行、active 不动。

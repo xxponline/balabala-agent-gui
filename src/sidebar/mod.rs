@@ -4,8 +4,9 @@
 //! `[switch entry] → [project 行 (▾ + [+ agent])] → [空态/加 solution 动作]`。
 //! 事件仍经 **SidebarEvent 漏斗**进 `TerminalApp::on_sidebar_event` 单一
 //! 入口 (design D3); 载荷只带稳定身份 (project root = PathBuf,
-//! session = EntityId)。行数据每帧快照成拥有值, listener 在调用点
-//! 预构建后以值传入 (design D7 — RPIT 生命周期纪律不变)。
+//! session = SessionId — 服务分配, change agent-service 3.2)。行数据每帧
+//! 快照成拥有值, listener 在调用点预构建后以值传入 (design D7 — RPIT
+//! 生命周期纪律不变)。
 
 use gpui_kit::base::TestTextExt;
 use gpui_kit::component::ActiveTheme;
@@ -13,7 +14,7 @@ use gpui_kit::component::dock::{BasePanel, Panel, PanelEvent};
 use gpui_kit::{InteractiveElement, *};
 use std::path::PathBuf;
 
-use crate::agent_entities::SessionStatus;
+use agent_service::contract::{SessionId, SessionStatus};
 use crate::app::TerminalApp;
 use crate::ui::widgets::TextTooltip;
 
@@ -21,7 +22,7 @@ use crate::ui::widgets::TextTooltip;
 type ClickListener = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
 /// sidebar → TerminalApp 事件漏斗（design D3）。
-/// 载荷只携带稳定身份：project = root PathBuf，session = EntityId。
+/// 载荷只携带稳定身份：project = root PathBuf，session = SessionId。
 #[derive(Debug)]
 pub enum SidebarEvent {
     /// 空态选择器: 无门控, 直接走打开流程 (spec: picker at startup)。
@@ -34,8 +35,8 @@ pub enum SidebarEvent {
     ToggleProjectCollapse(PathBuf),
     /// 点某 project 行下的 "[+ agent]" (载荷 = project root = cwd)。
     NewAgent(PathBuf),
-    SelectAgent(EntityId),
-    CloseAgent(EntityId),
+    SelectAgent(SessionId),
+    CloseAgent(SessionId),
 }
 
 /// 左 dock 面板。
@@ -98,8 +99,8 @@ pub struct ProjectRow {
 
 /// 一个 agent 行的渲染数据 (拥有值)。
 pub struct AgentRow {
-    /// 稳定身份 (D4: EntityId; active 比较/选中/关闭用)
-    pub id: EntityId,
+    /// 稳定身份 (服务分配 SessionId; active 比较/选中/关闭用)。
+    pub id: SessionId,
     /// 显示名 (如 "foo/pi-1")
     pub name: String,
     pub status: SessionStatus,
@@ -124,10 +125,11 @@ pub struct SidebarSnapshot {
     pub ws: Option<WsView>,
 }
 
-/// 从 model 快照 (render 内调用; 穿透读 session, 每帧现读)。
-/// agent 归属 project = cwd == project root (AgentEntity 契约)。
-fn snapshot(app: &TerminalApp, cx: &App) -> SidebarSnapshot {
+/// 从 model + 服务投影镜像快照 (render 内调用; 会话归 AgentService,
+/// GUI 读 `sessions_view` 镜像 — change agent-service 3.2, D4)。
+fn snapshot(app: &TerminalApp, _cx: &App) -> SidebarSnapshot {
     let ws = app.workspace.as_ref().map(|ws| {
+        let view = app.service_layer.sessions_view();
         let projects = ws
             .model
             .projects
@@ -137,19 +139,19 @@ fn snapshot(app: &TerminalApp, cx: &App) -> SidebarSnapshot {
                 let agents = if collapsed {
                     Vec::new()
                 } else {
-                    ws.agents
-                        .iter()
-                        .filter(|e| e.read(cx).0.project_root() == p.root)
-                        .map(|e| {
-                            let s = e.read(cx);
-                            AgentRow {
-                                id: e.entity_id(),
-                                name: s.0.name().to_string(),
-                                status: s.0.status(),
-                                is_active: app.active == Some(e.entity_id()),
-                            }
-                        })
-                        .collect()
+                    view.map(|v| {
+                        v.sessions
+                            .iter()
+                            .filter(|s| s.project_root == p.root)
+                            .map(|s| AgentRow {
+                                id: s.id,
+                                name: s.name.clone(),
+                                status: s.status,
+                                is_active: app.active == Some(s.id),
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
                 };
                 ProjectRow {
                     root: p.root.to_string_lossy().into_owned(),

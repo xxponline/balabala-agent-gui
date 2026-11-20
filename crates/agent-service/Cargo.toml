@@ -16,3 +16,7 @@ pi-shell-rs = { git = "ssh://git@github.com/xxponline/pi-shell-rs.git" }
 # service-plugin/example-plugin **features 完全一致** (同一编译单元,
 # D12 已踩过的坑); agent-service 与宿主同二进制, 无 dylib 边界风险。
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+
+[dev-dependencies]
+# 终端测试随迁 (task 4.1): 无头窗口 + ElementSnapshot (与 GUI dev-dep 同款)
+gpui-kit = { version = "0.9.0", features = ["test-support"] }

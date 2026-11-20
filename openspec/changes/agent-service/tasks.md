@@ -17,18 +17,18 @@
 
 ## 3. GUI 数据/消息面换底（pane 暂留 `src/pane`；组内按序执行，以 3.6 为全绿基线）
 
-- [ ] 3.1 ServiceLayer 扩展：发 `watch` 握手、`pump` 按 kind 分流（`frame_bytes` → pane.feed 入口、`sessions_changed` → `SessionView` 镜像、回复/`route_error` → `app.notice` 失败文案）；**验证**：新测试 `watch_receives_frame_bytes` 与 `failed_control_reply_shows_notice`（delta 场景 1：失败回执 → 状态不变 + notice 点名操作）绿
-- [ ] 3.2 Entity 消亡 + active 归服务：`Workspace::agents: Vec<Entity<AgentSession>>` → `Vec<SessionId>`、`app.active: Option<SessionId>` 改镜像驱动、sidebar 行载荷/列表渲染改读 `SessionView`、select/create/close 改 `submit` ask + 回执处理（成功切 console tab，失败留 notice）；**验证**：delta 三个场景（失败关/失败选/失败建）全测绿 + sidebar 既有断言（列表/计数/徽章/焦点模型）改注入点后语义不改地绿
-- [ ] 3.3 输入链换底：`send_key`/`send_text`/轮滚/点击 → `tell(input)` + submit 后自踢快泵（`kick_input_drain` 语义重挂）；**验证**：既有 Tab 转发与输入注入测试绿 + 新增 envelope 断言（kind/payload/active id）+ "输入后一帧必达泵"时序断言通过
-- [ ] 3.4 pane 渲染源切换：本地 parser ×N 落 `src/pane`（pump 把 `frame_bytes` 喂 `feed`），`screen()` 对 `AgentSession` 的依赖断除，active/状态栏改读 `SessionView` 镜像；**验证**：pane 渲染测试改 feed 驱动后绿（cell/选区/字体断言不改），`rg "active_session|AgentSession" src/pane` 零命中
-- [ ] 3.5 主题/resize 改 tell + `src/agent_entities` 溶解：`push_tui_theme`/网格 resize → tell 经服务转发（服务侧去重），删除 `AgentSession`/`AgentEntity`/`SessionStatus`（状态移入 agent-service 的 `SessionInfo`）；**验证**：ThemeRecorder 与 resize/门控系列测试绿，`rg "AgentSession|agent_entities" src/` 零命中
-- [ ] 3.6 阶段基线：全量 `cargo test --workspace` 绿、0 warnings；**验证**：命令输出对账（≥234 测，与基线计数无缺失）
+- [x] 3.1 ServiceLayer 扩展：发 `watch` 握手、`pump` 按 kind 分流（`frame_bytes` → pane.feed 入口、`sessions_changed` → `SessionView` 镜像、回复/`route_error` → `app.notice` 失败文案）；**验证**：新测试 `watch_receives_frame_bytes` 与 `failed_control_reply_shows_notice`（delta 场景 1：失败回执 → 状态不变 + notice 点名操作）绿
+- [x] 3.2 Entity 消亡 + active 归服务：`Workspace::agents: Vec<Entity<AgentSession>>` → `Vec<SessionId>`、`app.active: Option<SessionId>` 改镜像驱动、sidebar 行载荷/列表渲染改读 `SessionView`、select/create/close 改 `submit` ask + 回执处理（成功切 console tab，失败留 notice）；**验证**：delta 三个场景（失败关/失败选/失败建）全测绿 + sidebar 既有断言（列表/计数/徽章/焦点模型）改注入点后语义不改地绿
+- [x] 3.3 输入链换底：`send_key`/`send_text`/轮滚/点击 → `tell(input)` + submit 后自踢快泵（`kick_input_drain` 语义重挂）；**验证**：既有 Tab 转发与输入注入测试绿 + 新增 envelope 断言（kind/payload/active id）+ "输入后一帧必达泵"时序断言通过
+- [x] 3.4 pane 渲染源切换：本地 parser ×N 落 `src/pane`（pump 把 `frame_bytes` 喂 `feed`），`screen()` 对 `AgentSession` 的依赖断除，active/状态栏改读 `SessionView` 镜像；**验证**：pane 渲染测试改 feed 驱动后绿（cell/选区/字体断言不改），`rg "active_session|AgentSession" src/pane` 零命中
+- [x] 3.5 主题/resize 改 tell + `src/agent_entities` 溶解：`push_tui_theme`/网格 resize → tell 经服务转发（服务侧去重），删除 `AgentSession`/`AgentEntity`/`SessionStatus`（状态移入 agent-service 的 `SessionInfo`）；**验证**：ThemeRecorder 与 resize/门控系列测试绿，`rg "AgentSession|agent_entities" src/` 零命中
+- [x] 3.6 阶段基线：全量 `cargo test --workspace` 绿、0 warnings；**验证**：命令输出对账（≥234 测，与基线计数无缺失）
 
 ## 4. AgentTerminal 迁 crate 改名
 
-- [ ] 4.1 `git mv src/pane` → `crates/agent-service/src/terminal`，`TerminalPanel` → `AgentTerminal`，`TerminalBus` trait（`ask`/`tell`，只用 service-core 词汇）落 agent-service、GUI 以 `Listener::submit` 包装注入；**验证**：`cargo build` 全仓通过 + `cargo test -p agent-service` 迁入测试全绿（纯渲染断言随迁）
-- [ ] 4.2 GUI 构造与 console tab 接线改 import（`property_detail_manager`/`shell`/`app`），残留引用清零；**验证**：`rg "crate::pane|TerminalPanel" src/` 零命中 + `cargo build` 通过 + console 面板测试（焦点/渲染占位）绿
-- [ ] 4.3 测试归属分家核查：纯渲染/度量测试在 `agent-service`，泵接线/门控/失败 notice 留 GUI；**验证**：`cargo test --workspace` 全绿且测试总数与阶段 3.6 基线对账（只增不减、无 `#[ignore]` 偷渡）
+- [x] 4.1 `git mv src/pane` → `crates/agent-service/src/terminal`，`TerminalPanel` → `AgentTerminal`，`TerminalBus` trait（`ask`/`tell`，只用 service-core 词汇）落 agent-service、GUI 以 `Listener::submit` 包装注入；**验证**：`cargo build` 全仓通过 + `cargo test -p agent-service` 迁入测试全绿（纯渲染断言随迁）
+- [x] 4.2 GUI 构造与 console tab 接线改 import（`property_detail_manager`/`shell`/`app`），残留引用清零；**验证**：`rg "crate::pane|TerminalPanel" src/` 零命中 + `cargo build` 通过 + console 面板测试（焦点/渲染占位）绿
+- [x] 4.3 测试归属分家核查：纯渲染/度量测试在 `agent-service`，泵接线/门控/失败 notice 留 GUI；**验证**：`cargo test --workspace` 全绿且测试总数与阶段 3.6 基线对账（只增不减、无 `#[ignore]` 偷渡）
 
 ## 5. 收口
 

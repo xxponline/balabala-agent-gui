@@ -13,8 +13,15 @@ use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::dock::{DockArea, DockPlacement};
 use gpui_kit::base::dock::PanelId;
 
-use crate::agent_entities::{AgentSession, PiAgentShell};
-use crate::pane::TerminalPanel;
+use agent_service::contract::{
+    CloseReq, CreateReq, InputClick, InputKey, InputText, InputWheel, ResizeReq, SelectReq,
+    SessionId, SessionStatus, ThemeReq, KIND_CLOSE, KIND_CREATE, KIND_INPUT_CLICK, KIND_INPUT_KEY,
+    KIND_INPUT_TEXT, KIND_INPUT_WHEEL, KIND_RESIZE, KIND_SELECT, KIND_THEME,
+};
+use service_manager::{Envelope, Payload, Route, SelectPolicy};
+
+use crate::service_layer::CtrlOp;
+use agent_service::terminal::{AgentTerminal, TerminalCopy, TerminalTab};
 use crate::property_detail_manager::{OpenObject, active_center_panel_id, handler_for};
 use crate::shell;
 use crate::asset_manager::AssetManager;
@@ -28,7 +35,6 @@ use crate::workspace::Workspace;
 // `tab` → 焦点遍历会吞掉 Tab (原始 key event 不再派发), 更深的
 // Terminal context 绑定胜出 (design D5, spike 已验证)。
 use crate::property_detail_manager::md_panel::ToggleMdView;
-actions!(terminal, [TerminalTab, TerminalCopy]);
 
 pub struct TerminalApp {
     /// 当前打开的工作区 (单实例, spec: Startup workspace restore;
@@ -42,8 +48,9 @@ pub struct TerminalApp {
     pub open_failure: Option<String>,
     /// 切换门控提示 (spec: notice naming the count of active sessions)
     pub notice: Option<String>,
-    /// 当前 active session 的稳定身份 (D4: gpui EntityId, 索引删除不错位)
-    pub active: Option<EntityId>,
+    /// 当前 active session 的稳定身份 (服务分配 SessionId; **镜像** —
+    /// 真值在 AgentService, 由 sessions_changed 投影驱动, task 3.2 / D4)
+    pub active: Option<SessionId>,
     /// 最近一次持久化失败的错误信息 (在 sidebar 顶部显示; spec:
     /// Persistence write failure surfacing — 配置写失败红条)
     pub save_error: Option<String>,
@@ -55,7 +62,7 @@ pub struct TerminalApp {
     /// sidebar 面板实体 (D2; notify 转发目标 — spike §10.5)
     pub sidebar: Entity<SidebarPanel>,
     /// 终端面板实体 (4.1; 焦点在其内, 一步切焦点/步骤 5 进 DockArea 中心)
-    pub terminal: Entity<TerminalPanel>,
+    pub terminal: Entity<AgentTerminal>,
     /// 文件树面板实体 (right-dock-file-tree; notify 转发名单成员)
     pub tree: Entity<TreePanel>,
     /// 右槽数据服务层 (asset-manager-right-dock D1): 面板读视图/代数,
@@ -79,6 +86,8 @@ pub struct TerminalApp {
     _appearance_subscription: Subscription,
     /// 累计实际传播的网格 resize 次数 (诊断/测试观测: 输入型重绘不增)
     pub grid_resizes: usize,
+    /// 上次传播的目标网格 (GUI 侧去重; task 3.2 — 未变布局零传播)
+    last_grid_size: Option<(u16, u16)>,
     /// 累计经 send_key 转发给会话的 Tab 键数 (诊断/测试观测: spec
     /// Keyboard input forwarding - Tab 的端到端守卫; pi 收到 Tab 无可见
     /// 反应, 只能在转发边界计数验证 — 见 spike F3 结论)
@@ -179,6 +188,7 @@ impl TerminalApp {
             _open_task: None,
             _appearance_subscription: appearance_subscription,
             grid_resizes: 0,
+            last_grid_size: None,
             tab_forwards: 0,
             wheel_forwards: 0,
             click_forwards: 0,
@@ -207,127 +217,135 @@ impl TerminalApp {
         }
     }
 
-    /// 用户点了某 Project 行下的 "[+ agent]": 创建嵌入式会话
-    /// (cwd = project root, spec: Session working directory),
-    /// 命名 <project>/pi-N (per-project 计数), 并设为 active。
+    /// 用户点了某 Project 行下的 "[+ agent]": 经服务创建 (ask, D6 —
+    /// 命名/active 归服务; 成功回执由 pump 切 console, 失败 notice 点名,
+    /// spec: Project session creation + spec delta 场景 3)。
     pub fn create_agent(&mut self, root: &Path, cx: &mut Context<Self>) {
-        // 先领名字 (计数在 model 的 Project 上; 借用分两段)
-        let Some(name) = self.workspace.as_mut().and_then(|ws| {
-            ws.model
-                .project_by_root_mut(root)
-                .map(|p| p.next_agent_name())
-        }) else {
-            return; // 无此 project (按钮本不该渲染)
-        };
-        let cwd = root.to_path_buf();
-        match PiAgentShell::new(name, cwd, crate::ui::tui_theme(cx.theme().mode)) {
-            Ok(shell) => {
-                let entity = cx.new(|_| AgentSession(Box::new(shell)));
-                self.active = Some(entity.entity_id());
-                if let Some(ws) = self.workspace.as_mut() {
-                    ws.agents.push(entity);
-                }
-            }
-            Err(e) => {
-                eprintln!("failed to spawn agent: {e}");
-            }
+        if self.workspace.is_none() {
+            return; // 无工作区 (按钮本不该渲染)
+        }
+        let result = self.service_layer.submit_control(
+            Route::Service("agent".into(), SelectPolicy::Any),
+            CtrlOp::Create,
+            KIND_CREATE,
+            Payload::new(CreateReq {
+                root: root.to_path_buf(),
+            }),
+            "创建会话",
+        );
+        match result {
+            Ok(_) => self.kick_input_drain(cx), // 快泵: 回执尽快达
+            Err(e) => self.notice = Some(format!("创建会话失败: {e}")),
         }
     }
 
-    /// 用户点了某个 agent 的 "×": hard kill 子进程 + 移除 + 调整 active。
-    /// (载荷 = EntityId 稳定身份, D3: 不因兄弟删除错位)
-    pub fn close_agent(&mut self, id: EntityId, cx: &mut Context<Self>) {
-        let Some(ws) = self.workspace.as_mut() else {
-            return;
-        };
-        let Some(agent_idx) = ws.agents.iter().position(|e| e.entity_id() == id) else {
-            return;
-        };
-
-        // hard kill (spec: 立即终止子进程)
-        let session = ws.agents.remove(agent_idx);
-        let removed_id = session.entity_id();
-        session.update(cx, |s, _| s.0.shutdown());
-
-        // 关掉的是 active -> 切到剩余最后一个 / 无则 None
-        // (单工作区: "同 workspace 内" == "剩余" — spec: the next remaining session)
-        if self.active == Some(removed_id) {
-            self.active = self
-                .workspace
-                .as_ref()
-                .and_then(|ws| ws.agents.last().map(|e| e.entity_id()));
+    /// 用户点了某个 agent 的 "×": 经服务关闭 (ask; 关 active 后退位归服务
+    /// — spec: next remaining session; 失败 notice, spec delta 场景 1)。
+    pub fn close_agent(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let result = self.service_layer.submit_control(
+            Route::Service("agent".into(), SelectPolicy::Any),
+            CtrlOp::Close,
+            KIND_CLOSE,
+            Payload::new(CloseReq(id)),
+            "关闭会话",
+        );
+        match result {
+            Ok(_) => self.kick_input_drain(cx),
+            Err(e) => self.notice = Some(format!("关闭会话失败: {e}")),
         }
     }
 
-    /// 按稳定 id 找 active session 实体 (D4: 遍历即可, 规模小)。
-    pub(crate) fn active_session(&self) -> Option<&Entity<AgentSession>> {
-        let active = self.active?;
-        self.workspace
-            .as_ref()?
-            .agents
-            .iter()
-            .find(|e| e.entity_id() == active)
-    }
-
-    /// 把当前主题的注入配色推给所有活会话 (add-light-dark-theme D4:
-    /// 外观变化时会话内容色跟随; spawn 时已注入, 此处只管热切换)。
+    /// 把当前主题推给服务 (服务存快照并广播全部会话; create 注入同源
+    /// — add-light-dark-theme D4 语义不变, change agent-service 3.2 改走消息)。
     fn push_tui_theme(&self, cx: &mut Context<Self>) {
         let theme = crate::ui::tui_theme(cx.theme().mode);
-        for agent in self.workspace.iter().flat_map(|w| w.agents.iter()) {
-            let theme = theme.clone();
-            agent.update(cx, |s, _| s.0.set_theme(theme));
-        }
+        let _ = self.service_layer.manager.tell(Envelope::new(
+            Route::Service("agent".into(), SelectPolicy::Any),
+            self.service_layer.listener.address().clone(),
+            KIND_THEME,
+            Payload::new(ThemeReq { theme }),
+        ));
     }
 
-    /// 把一个键送给 active session。
+    /// 把一个键送给 active session (tell, D6 静默; 输入注入归服务)。
     pub(crate) fn send_key(&mut self, key: crossterm::event::KeyEvent, cx: &mut Context<Self>) {
         if key.code == crossterm::event::KeyCode::Tab {
             self.tab_forwards += 1; // 诊断/测试观测 (spec: Tab 转发边界)
         }
-        let Some(session) = self.active_session().cloned() else {
+        let Some(active) = self.active else {
             return;
         };
-        session.update(cx, |s, _| s.0.send_key(key));
-        self.kick_input_drain(cx); // 快速 drain (design D7): pi 收键即重绘
+        let _ = self.service_layer.manager.tell(Envelope::new(
+            Route::Service("agent".into(), SelectPolicy::Any),
+            self.service_layer.listener.address().clone(),
+            KIND_INPUT_KEY,
+            Payload::new(InputKey {
+                session: active,
+                key,
+            }),
+        ));
+        self.kick_input_drain(cx); // 快速 pump (design D5): 字节即到即显
     }
 
     /// 把一段已提交文本（IME commit / 粘贴）送给 active session。
-    fn send_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        let Some(session) = self.active_session().cloned() else {
+    pub(crate) fn send_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let Some(active) = self.active else {
             return;
         };
-        session.update(cx, |s, _| s.0.send_text(text));
-        self.kick_input_drain(cx); // 快速 drain (design D7)
+        let _ = self.service_layer.manager.tell(Envelope::new(
+            Route::Service("agent".into(), SelectPolicy::Any),
+            self.service_layer.listener.address().clone(),
+            KIND_INPUT_TEXT,
+            Payload::new(InputText {
+                session: active,
+                text: text.to_string(),
+            }),
+        ));
+        self.kick_input_drain(cx); // 快速 pump (design D5)
     }
 
     /// 把滚轮行数送给 active session (task 2.2)。无 active session 时不
     /// 计数不转发 (与 send_text 同款: 无收者即无动作)。
     pub(crate) fn send_wheel(&mut self, lines: i16, cx: &mut Context<Self>) {
-        // cloned() 先释放对 self 的借用, 计数才可写 (无会话则提前返回
-        // — 不计数, 见 task 2.2 边界)
-        let Some(session) = self.active_session().cloned() else {
+        let Some(active) = self.active else {
             return;
         };
         self.wheel_forwards += 1;
-        session.update(cx, |s, _| s.0.send_wheel(lines));
-        self.kick_input_drain(cx); // 快速 drain (design D7): 滚动帧即到即显
+        let _ = self.service_layer.manager.tell(Envelope::new(
+            Route::Service("agent".into(), SelectPolicy::Any),
+            self.service_layer.listener.address().clone(),
+            KIND_INPUT_WHEEL,
+            Payload::new(InputWheel {
+                session: active,
+                lines,
+            }),
+        ));
+        self.kick_input_drain(cx); // 快速 pump (design D5): 滚动帧即到即显
     }
 
     /// 把左键单元格坐标送给 active session (task 2.2; 坐标系 = 会话帧
     /// 0-based, 命中在会话内部)。
     pub(crate) fn send_click(&mut self, x: u16, y: u16, cx: &mut Context<Self>) {
-        let Some(session) = self.active_session().cloned() else {
+        let Some(active) = self.active else {
             return;
         };
         self.click_forwards += 1;
-        session.update(cx, |s, _| s.0.send_click(x, y));
-        self.kick_input_drain(cx); // 快速 drain (design D7)
+        let _ = self.service_layer.manager.tell(Envelope::new(
+            Route::Service("agent".into(), SelectPolicy::Any),
+            self.service_layer.listener.address().clone(),
+            KIND_INPUT_CLICK,
+            Payload::new(InputClick {
+                session: active,
+                x,
+                y,
+            }),
+        ));
+        self.kick_input_drain(cx); // 快速 pump (design D5)
     }
 
-    /// 把 (cols, rows) 分发给所有会话 (Exited 会话自行跳过, spec:
-    /// Grid resize propagation); 仅当至少一个会话实际改变尺寸时才打
-    /// 日志并累加 `grid_resizes` — 未变尺寸的重绘零传播零日志 (去重
-    /// 在 `AgentEntity::resize` 内按会话进行)。
+    /// 把 (cols, rows) 分发给全部会话 (tell 经服务; 服务侧逐会话去重 +
+    /// 新会话迟到补传 — change agent-service 3.2)。GUI 侧按目标尺寸去重:
+    /// 未变尺寸的重绘零传播零日志零计数 (spec 语义保持)。
     ///
     /// 输入: cols/rows — 目标网格尺寸 (已夹取下限); w/h — 面板像素面积;
     ///       cell_w/line_h — 度量值 (日志用); cx — 实体上下文
@@ -342,31 +360,44 @@ impl TerminalApp {
         line_h: Pixels,
         cx: &mut Context<Self>,
     ) {
-        let mut resized = 0usize;
-        for session in self.workspace.iter().flat_map(|w| w.agents.iter()) {
-            {
-                if session.update(cx, |s, cx| {
-                    if s.0.resize(cols, rows) {
-                        cx.notify();
-                        true
-                    } else {
-                        false
-                    }
-                }) {
-                    resized += 1;
-                }
-            }
+        let target = (cols, rows);
+        if self.last_grid_size == Some(target) {
+            return; // 未变布局: 零传播 (旧逐会话去重的全局等价)
         }
-        if resized > 0 {
-            self.grid_resizes += resized;
-            eprintln!(
-                "[grid] pane {w:.0}x{h:.0}px -> {cols}x{rows} cells \
-                 (cell_w {:.2}, line_h {:.2}); resized {resized} session(s)",
-                f32::from(cell_w),
-                f32::from(line_h)
-            );
-            self.kick_input_drain(cx); // 快速 drain (design D7): 拖窗重排即显
+        self.last_grid_size = Some(target);
+        let ids: Vec<SessionId> = self
+            .service_layer
+            .sessions_view()
+            .map(|v| v.sessions.iter().map(|s| s.id).collect())
+            .unwrap_or_default();
+        if ids.is_empty() {
+            return; // 无会话: 不计数不日志 (同旧行为)
         }
+        for session in ids {
+            let _ = self.service_layer.manager.tell(Envelope::new(
+                Route::Service("agent".into(), SelectPolicy::Any),
+                self.service_layer.listener.address().clone(),
+                KIND_RESIZE,
+                Payload::new(ResizeReq {
+                    session,
+                    cols,
+                    rows,
+                }),
+            ));
+        }
+        let resized = self
+            .service_layer
+            .sessions_view()
+            .map(|v| v.sessions.len())
+            .unwrap_or(0);
+        self.grid_resizes += resized;
+        eprintln!(
+            "[grid] pane {w:.0}x{h:.0}px -> {cols}x{rows} cells \
+             (cell_w {:.2}, line_h {:.2}); resized {resized} session(s)",
+            f32::from(cell_w),
+            f32::from(line_h)
+        );
+        self.kick_input_drain(cx); // 快速 pump (design D5): 拖窗重排即显
     }
 
     /// 空态选择器 / 顶栏切换入口共用的打开流程 (spec: Workspace opening
@@ -532,8 +563,14 @@ impl TerminalApp {
                 // 清场: 旧会话全部关停 (切换语义: exited 屏幕随切走丢弃,
                 // spec: confirmation … discarded; 活动会话已被门控拦下)
                 if let Some(old) = self.workspace.take() {
-                    for session in old.agents {
-                        session.update(cx, |s, _| s.0.shutdown());
+                    // 会话本体归服务: 逐 id tell 关闭 (切换清场, D6 静默)
+                    for sid in old.agents.clone() {
+                        let _ = self.service_layer.manager.tell(Envelope::new(
+                            Route::Service("agent".into(), SelectPolicy::Any),
+                            self.service_layer.listener.address().clone(),
+                            KIND_CLOSE,
+                            Payload::new(CloseReq(sid)),
+                        ));
                     }
                 }
                 self.active = None;
@@ -633,18 +670,18 @@ impl TerminalApp {
         self.notify_panels(cx);
     }
 
-    /// 会话计数 (活动, exited) — 切换门控的输入 (design D6)。
-    fn count_sessions(&self, cx: &App) -> (usize, usize) {
-        let mut active = 0usize;
-        let mut exited = 0usize;
-        for session in self.workspace.iter().flat_map(|w| w.agents.iter()) {
-            match session.read(cx).0.status() {
-                crate::agent_entities::SessionStatus::Starting
-                | crate::agent_entities::SessionStatus::Running => active += 1,
-                crate::agent_entities::SessionStatus::Exited => exited += 1,
-            }
-        }
-        (active, exited)
+    /// 会话计数 (活动, exited) — 切换门控的输入 (design D6; 数据源 =
+    /// 服务投影镜像, change agent-service 3.2)。
+    fn count_sessions(&self, _cx: &App) -> (usize, usize) {
+        let Some(view) = self.service_layer.sessions_view() else {
+            return (0, 0);
+        };
+        let exited = view
+            .sessions
+            .iter()
+            .filter(|s| s.status == SessionStatus::Exited)
+            .count();
+        (view.sessions.len() - exited, exited)
     }
 
     /// 关闭右 dock（dock-layout spec: 关闭 + 焦点交回）：`toggle_dock`
@@ -723,22 +760,9 @@ impl TerminalApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // 会话相关事件先把中心切回 console 签 (spec: sidebar select returns
-        // to the console tab — viewer 点 sidebar agent 必须一步回 console
-        // + session 焦点); 然后统一把焦点交回 active tab 面板 (design D6):
-        // dock 的左 TabGroup 会把 sidebar 内的点击焦点抢给 sidebar 面板
-        // (真机实测 focus -> elsewhere), 不交回则键盘/IME 全断。放 match
-        // 前 = 所有 arm (含 NewWorkspace 对话框路径) 共用。
-        if matches!(
-            ev,
-            SidebarEvent::NewAgent(_)
-                | SidebarEvent::SelectAgent(_)
-                | SidebarEvent::CloseAgent(_)
-        ) {
-            let console = PanelId::from(self.terminal.entity_id());
-            self.dock_area
-                .update(cx, |area, cx| area.select_panel(console, window, cx));
-        }
+        // 焦点交回 active tab 面板 (design D6): dock 的左 TabGroup 会把
+        // sidebar 内的点击焦点抢给 sidebar 面板, 不交回则键盘/IME 全断。
+        // (console 切换已移至控制成功回执 — spec delta: 失败不切)
         self.focus_active_center_panel(window, cx);
         match ev {
             SidebarEvent::OpenWorkspace => {
@@ -758,7 +782,19 @@ impl TerminalApp {
             SidebarEvent::ToggleProjectCollapse(root) => self.toggle_project_collapse(&root),
             SidebarEvent::NewAgent(root) => self.create_agent(&root, cx),
             SidebarEvent::SelectAgent(id) => {
-                self.active = Some(id);
+                // ask 经服务 (D6): 成功回执切 console + active 镜像由投影
+                // 驱动; 失败 notice 点名 (spec delta 场景 2)
+                let result = self.service_layer.submit_control(
+                    Route::Service("agent".into(), SelectPolicy::Any),
+                    CtrlOp::Select,
+                    KIND_SELECT,
+                    Payload::new(SelectReq(id)),
+                    "切换会话",
+                );
+                match result {
+                    Ok(_) => self.kick_input_drain(cx),
+                    Err(e) => self.notice = Some(format!("切换会话失败: {e}")),
+                }
             }
             SidebarEvent::CloseAgent(id) => self.close_agent(id, cx),
         }
@@ -832,30 +868,82 @@ impl TerminalApp {
         }));
     }
 
-    /// 遍历所有 session entity, poll 并按需 notify。
-    /// session 自身 notify 走根读取链路 (现行为); 同时转发到面板
-    /// (spike §10.5: 面板自读不重建) — 输出滚动 + sidebar badge 同帧刷新。
-    /// 返回是否消费到新帧 (design D7: burst 据此"取到帧即停";
-    /// 主循环忽略返回值)。
-    fn poll_sessions(&mut self, cx: &mut Context<Self>) -> bool {
+    /// 服务总线泵 + 投影/帧/回执消费 (change agent-service 3.1/3.2:
+    /// Listener poll 并入本 50ms 泵, 无回调无跨线程合同 — D9)。
+    /// 返回是否有新件 (design D5: burst 据此"取到帧即停"; 主循环忽略)。
+    /// `pub(crate)`: 测试模块驱动泵 (property 侧 select 成功回执 → 切 console)。
+    pub(crate) fn poll_sessions(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
-        for session in self.workspace.iter().flat_map(|w| w.agents.iter()) {
-            session.update(cx, |s, cx| {
-                if s.0.poll() {
-                    cx.notify();
+        if self.service_layer.pump() {
+            changed = true;
+        }
+        // 控制成功回执 → 中央切回 console (成功才切 — spec delta: 失败不切)
+        if !self.service_layer.take_successes().is_empty() {
+            self.switch_console_tab(cx);
+            changed = true;
+        }
+        // 控制失败 notice (spec delta: 点名失败操作; 取最新一条)
+        if let Some(n) = self.service_layer.take_notices().pop() {
+            self.notice = Some(n);
+            changed = true;
+        }
+        // agent 首次就绪 → 补推主题 (服务快照默认深色, 宿主主题为准)
+        if self.service_layer.take_agent_ready() {
+            self.push_tui_theme(cx);
+        }
+        // 投影镜像: active + id 清单 (D4 真值在服务, GUI 只读)
+        if let Some(view) = self.service_layer.sessions_view().cloned() {
+            if self.active != view.active {
+                self.active = view.active;
+                changed = true;
+            }
+            if let Some(ws) = self.workspace.as_mut() {
+                let ids: Vec<SessionId> = view.sessions.iter().map(|s| s.id).collect();
+                if ws.agents != ids {
+                    ws.agents = ids;
                     changed = true;
                 }
-            });
+            }
+            // 镜像同步进面板 (design D7 入站: set_view)
+            self.sync_terminal_view(cx);
         }
-        // 服务总线 (task 6.1): Listener poll 并入本泵 — 状态翻转等事件与
-        // 会话帧同路 notify (§7.2 显式 notify; 无回调, D9)
-        if self.service_layer.pump() {
+        // 帧 → AgentTerminal (本地 parser 喂养; 字节零拷贝透传)
+        let frames = self.service_layer.take_frames();
+        if !frames.is_empty() {
+            self.terminal.update(cx, |t, cx| {
+                for f in frames {
+                    t.feed(f.session, &f.bytes, cx);
+                }
+            });
             changed = true;
         }
         if changed {
             self.notify_panels(cx);
         }
         changed
+    }
+
+    /// 投影镜像 → 面板 (测试镜像自举后调用; pump 路径在 poll_sessions 内)。
+    pub(crate) fn sync_terminal_view(&mut self, cx: &mut Context<Self>) {
+        let view = self.service_layer.sessions_view().cloned();
+        self.terminal.update(cx, |t, cx| t.set_view(view, cx));
+    }
+
+    /// 控制成功回执 → 中央切回 console 签并交焦 (spec: sidebar select
+    /// returns to the console tab; 成功才切 — spec delta)。经 `with_window`
+    /// 拿窗口 (TerminalApp 即窗口根视图)。
+    fn switch_console_tab(&mut self, cx: &mut Context<Self>) {
+        let console = PanelId::from(self.terminal.entity_id());
+        let dock = self.dock_area.clone();
+        let entity_id = cx.entity().entity_id();
+        cx.with_window(entity_id, move |window, cx| {
+            dock.update(cx, |area, cx| {
+                area.select_panel(console, window, cx);
+                if let Some(handle) = area.panel(console).map(|p| p.focus_handle(cx)) {
+                    handle.focus(window, cx);
+                }
+            });
+        });
     }
 }
 
@@ -930,109 +1018,6 @@ fn surface_fatal(_msg: &str) {}
 /// IME 桥 (design D5): 平台 NSTextInputClient → 这些方法。
 /// 只有 `replace_text_in_range` (最终提交/粘贴) 产生字节;
 /// preedit (`replace_and_mark_text_in_range`) 按 spec 不转发。
-impl EntityInputHandler for TerminalApp {
-    fn replace_text_in_range(
-        &mut self,
-        _replacement_range: Option<std::ops::Range<usize>>,
-        text: &str,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !text.is_empty() {
-            self.send_text(text, cx);
-        }
-    }
-
-    fn replace_and_mark_text_in_range(
-        &mut self,
-        _range_utf16: Option<std::ops::Range<usize>>,
-        _new_text: &str,
-        _new_selected_range: Option<std::ops::Range<usize>>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        // preedit: spec 明确不转发
-    }
-
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
-
-    /// 不报告 marked text (spec: 无预编辑显示) — 后端据此判断
-    /// 非组合态, 普通键走 key path (spike 验证过的路由)。
-    fn marked_text_range(
-        &self,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<std::ops::Range<usize>> {
-        None
-    }
-
-    fn selected_text_range(
-        &mut self,
-        _ignore_disabled_input: bool,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<UTF16Selection> {
-        Some(UTF16Selection {
-            range: 0..0,
-            reversed: false,
-        })
-    }
-
-    fn text_for_range(
-        &mut self,
-        _range_utf16: std::ops::Range<usize>,
-        _adjusted_range: &mut Option<std::ops::Range<usize>>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<String> {
-        None
-    }
-
-    fn bounds_for_range(
-        &mut self,
-        _range_utf16: std::ops::Range<usize>,
-        element_bounds: Bounds<Pixels>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<Bounds<Pixels>> {
-        Some(element_bounds) // IME 候选框定位在面板区域
-    }
-
-    fn selection_bounds_for_range(
-        &mut self,
-        _range_utf16: std::ops::Range<usize>,
-        _element_bounds: Bounds<Pixels>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Vec<Bounds<Pixels>> {
-        Vec::new()
-    }
-
-    fn character_index_for_point(
-        &mut self,
-        _point: Point<Pixels>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<usize> {
-        None
-    }
-
-    fn set_selected_text_range(
-        &mut self,
-        _range_utf16: std::ops::Range<usize>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-    }
-
-    fn text_length_utf16(
-        &mut self,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<usize> {
-        Some(0)
-    }
-}
 
 impl Render for TerminalApp {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
@@ -1055,14 +1040,13 @@ mod tests {
     //! `gpui_kit::*` 把 `#[test]` 宏遮蔽掉)。
 
     use super::TerminalApp;
-    use crate::agent_entities::{AgentEntity, AgentSession, PiAgentShell, SessionStatus};
+    // (会话测试直构已随 task 3.2 迁服务工厂; 见 test_sessions)
+    use crate::service_layer::test_sessions;
     use crate::workspace::Workspace;
     use pi_shell_rs::app::theme::TuiTheme;
-    use std::cell::RefCell;
     use std::path::{Path, PathBuf};
-    use std::rc::Rc;
     use gpui_kit::Focusable;
-    use crate::pane::{MIN_GRID_COLS, MIN_GRID_ROWS, grid_metrics};
+    use agent_service::terminal::{MIN_GRID_COLS, MIN_GRID_ROWS, grid_metrics};
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
         AppContext, Bounds, Point, TestAppContext, WindowBounds, WindowOptions, px, size,
@@ -1087,41 +1071,6 @@ mod tests {
         full
     }
 
-    /// 记录 set_theme 载荷的假会话 (add-light-dark-theme task 4.2)。
-    struct ThemeRecorder {
-        ws: PathBuf,
-        parser: vt100::Parser,
-        received: Rc<RefCell<Vec<TuiTheme>>>,
-    }
-
-    impl AgentEntity for ThemeRecorder {
-        fn name(&self) -> &str {
-            "recorder"
-        }
-        fn project_root(&self) -> &Path {
-            &self.ws
-        }
-        fn screen(&self) -> &vt100::Screen {
-            self.parser.screen()
-        }
-        fn poll(&mut self) -> bool {
-            false
-        }
-        fn send_key(&mut self, _key: crossterm::event::KeyEvent) {}
-        fn send_text(&mut self, _text: &str) {}
-        fn send_wheel(&mut self, _lines: i16) {}
-        fn send_click(&mut self, _x: u16, _y: u16) {}
-        fn shutdown(&mut self) {}
-        fn status(&self) -> SessionStatus {
-            SessionStatus::Running
-        }
-        fn resize(&mut self, _cols: u16, _rows: u16) -> bool {
-            false
-        }
-        fn set_theme(&mut self, theme: TuiTheme) {
-            self.received.borrow_mut().push(theme);
-        }
-    }
 
     /// task 4.2 (spec: Theme change updates live sessions): 外观切换 →
     /// push_tui_theme 把当前主题的配色推给所有活会话 (不重启)。
@@ -1148,48 +1097,45 @@ mod tests {
         });
         let _ = handle;
 
-        let received = Rc::new(RefCell::new(Vec::new()));
-        app_entity.update(cx, |app, cx| {
+        app_entity.update(cx, |app, _cx| {
             inject_test_workspace(app, "theme-push");
-            let ws_path = app.workspace.as_ref().expect("测试 workspace").path.clone();
-            let recorder = ThemeRecorder {
-                ws: ws_path,
-                parser: vt100::Parser::new(
-                    std::num::NonZeroU16::new(24).unwrap(),
-                    std::num::NonZeroU16::new(80).unwrap(),
-                    0,
-                ),
-                received: received.clone(),
-            };
-            app.workspace
-                .as_mut()
-                .expect("测试 workspace")
-                .agents
-                .push(cx.new(|_| AgentSession(Box::new(recorder))));
-
-            // 启动同步后主题 = 系统外观 (测试平台 = Light) → 推浅色
-            app.push_tui_theme(cx);
         });
+        let ws_path = cx.update(|cx| {
+            app_entity.read(cx).workspace.as_ref().expect("测试 workspace").path.clone()
+        });
+        // 经服务创建可检视测试会话 (task 3.2: 主题广播经服务)
+        let (_id, shared) = test_sessions::create_session(cx, &app_entity, &ws_path);
+        let shared = shared.expect("测试会话 (非 real-pi 路径)");
 
-        let first = received.borrow().clone();
-        assert_eq!(first.len(), 1, "首个会话应收到一次配色");
+        // 启动同步后主题 = 系统外观 (测试平台 = Light) → 推浅色 (服务广播)
+        app_entity.update(cx, |app, cx| app.push_tui_theme(cx));
+        test_sessions::wait_until(cx, || shared.lock().unwrap().themes.len() >= 1, "首推广播");
+        let first = shared.lock().unwrap().themes.clone();
         assert_eq!(
             first[0],
             crate::ui::tui_theme(ThemeMode::Light),
             "Light 主题下应推入浅色 TuiTheme"
         );
 
-        // 切到 Dark → 再推 → 会话收到 pi 默认深色 (不重启会话)
+        // 切到 Dark → 再推 → 会话收到 pi 默认深色 (不重启会话)。
+        // 按**值**等待 (agent-ready 的一次性补推可能插队 Light — 不按下标)。
         cx.update(|cx| Theme::change(ThemeMode::Dark, None, cx));
         app_entity.update(cx, |app, cx| app.push_tui_theme(cx));
-        let after = received.borrow().clone();
-        assert_eq!(after.len(), 2, "切换后应再收到一次配色");
-        assert_eq!(
-            after[1],
-            TuiTheme::default(),
+        test_sessions::wait_until(
+            cx,
+            || shared.lock().unwrap().themes.iter().any(|t| *t == TuiTheme::default()),
+            "切换推广播 (Dark 配色)",
+        );
+        let after = shared.lock().unwrap().themes.clone();
+        assert!(
+            after.iter().any(|t| *t == crate::ui::tui_theme(ThemeMode::Light)),
+            "浅色配色仍在推送序列里"
+        );
+        assert!(
+            after.iter().any(|t| *t == TuiTheme::default()),
             "Dark 主题下应推入 pi dark.json 默认值"
         );
-        assert_ne!(after[0], after[1], "两次配色必须不同");
+        assert_ne!(after[0], *after.last().unwrap(), "两次配色必须不同");
     }
 
     /// 假 pi (sleepy 版): 每个响应前 sleep 1s — 让 badge 测试首帧确定为
@@ -1304,37 +1250,41 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("input-kick-{unique}"));
         fs::create_dir_all(&dir).unwrap();
         let stub = write_stub(&dir);
-        app_entity.update(cx, |app, cx| {
+        app_entity.update(cx, |app, _cx| {
             inject_test_workspace(app, "kick");
-            let shell = PiAgentShell::new_with_pi_bin(
-                "pi-t".into(),
-                std::env::temp_dir(),
-                Some(stub.to_str().unwrap().to_string()),
-            )
-            .expect("stub embed spawn");
-            let e = cx.new(|_| AgentSession(Box::new(shell)));
-            let id = e.entity_id();
-            app.workspace.as_mut().expect("测试 workspace").agents.push(e);
-            app.active = Some(id);
             assert!(
                 app._input_drain_task.is_none(),
                 "输入前无 burst (主循环也未启动)"
             );
         });
+        // 注入目录是纯内存的 — spawn 需要 cwd 真实存在 (否则 ENOENT)
+        let ws_path =
+            cx.update(|cx| app_entity.read(cx).workspace.as_ref().unwrap().path.clone());
+        fs::create_dir_all(&ws_path).unwrap();
+        // .pi_bin 标记 → 测试工厂真 spawn stub 会话 (task 3.2: 会话归服务)
+        fs::write(
+            Path::new(&ws_path).join(".pi_bin"),
+            stub.to_str().unwrap(),
+        )
+        .unwrap();
+        let (_agent_id, _) = test_sessions::create_session(cx, &app_entity, Path::new(&ws_path));
 
-        // 等 stub 启动帧到达并手动消费 (真实时间等子进程; 主循环不存在)
-        // — 顺带验证 poll_sessions 的返回值语义 (design D7)
+        // 消费服务推送的首波事件 (poll_sessions 返回值语义 — design D5);
+        // 同时把投影镜像灌进 active (send_key 依赖)。
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let got = cx.update(|cx| {
-                app_entity.update(cx, |app, cx| app.poll_sessions(cx))
-            });
+            let got = cx.update(|cx| app_entity.update(cx, |app, cx| app.poll_sessions(cx)));
             if got {
                 break;
             }
-            assert!(Instant::now() < deadline, "stub 启动帧未到达");
+            assert!(Instant::now() < deadline, "启动事件未到达");
             std::thread::sleep(Duration::from_millis(20));
         }
+        assert_eq!(
+            cx.update(|cx| app_entity.read(cx).active),
+            Some(_agent_id),
+            "投影镜像灌入 active"
+        );
 
         // 注入输入 (kick 创建 burst) → 真实等待 pi 重绘写入 buffer
         cx.update(|cx| {
@@ -1348,33 +1298,35 @@ mod tests {
                 );
                 assert!(
                     app._input_drain_task.is_some(),
-                    "send_key 尾部必须 kick burst (design D7)"
+                    "send_key 尾部必须 kick burst (design D5)"
                 );
             });
         });
-        assert!(
-            !cx.update(|cx| app_entity.read(cx)
-                .active_session()
-                .map(|s| s.read(cx).0.screen().contents().contains('汉'))
-                .unwrap_or(false)),
-            "burst 尚未跑前 screen 不含注入字符 (帧仍在 buffer)"
-        );
+        // burst 尚未跑前: 字节最多到 mailbox, 本地 parser 未喂 → 不含注入
+        // 字符 (mailbox 与 parser 解耦 — 仅 poll_sessions 喂 parser)
+        let has_han = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let app = app_entity.read(cx);
+                let active = app.active;
+                app.terminal
+                    .read(cx)
+                    .active_screen_text(active)
+                    .is_some_and(|t| t.contains('汉'))
+            })
+        };
+        assert!(!has_han(cx), "burst 尚未跑前 screen 不含注入字符");
         // 逐轮: 真实等待 pi 重绘 → 推进虚拟时钟 (burst 的 8ms timer 必须
-        // 靠 advance_clock 到期 — run_until_parked 不推进时钟, 这正是
-        // burst 空转的机制坑) → 只读断言。消费完全归因于 burst:
-        // 主循环未启动, 检查路径不调 poll。
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // 靠 advance_clock 到期 — run_until_parked 不推进时钟) → burst 跑
+        // poll_sessions → 喂 parser。消费完全归因于 burst: 主循环未启动。
+        // (30s 预算: 链路 = 真实 stub pi 回显 + 服务 50ms 真实时钟 tick + watch
+        // 推送, 并行压力下真实时钟被严重挤压 — 单跑 0.5s 内完成; 预算只为
+        // 承压不误报, 真故障仍会在预算内显形)
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             std::thread::sleep(Duration::from_millis(30)); // pi 线程重绘时延
             cx.executor().advance_clock(Duration::from_millis(50));
             cx.run_until_parked();
-            let got = cx.update(|cx| {
-                app_entity.read(cx)
-                    .active_session()
-                    .map(|s| s.read(cx).0.screen().contents().contains('汉'))
-                    .unwrap_or(false)
-            });
-            if got {
+            if has_han(cx) {
                 break;
             }
             assert!(
@@ -1384,6 +1336,7 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&ws_path);
     }
 
     #[gpui_kit::test]
@@ -1406,7 +1359,8 @@ mod tests {
             .expect("open test window")
         });
 
-        // 注入 stub 会话并激活 (绕过 create_agent: 它走真实 pi)
+        // 注入 stub 会话并激活 (经服务: .pi_bin 标记 → 工厂真 spawn;
+        // task 3.2 — 会话本体归 AgentService)
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1414,19 +1368,40 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("grid-dispatch-{unique}"));
         fs::create_dir_all(&dir).unwrap();
         let stub = write_stub(&dir);
-        app_entity.update(cx, |app, cx| {
+        app_entity.update(cx, |app, _cx| {
             inject_test_workspace(app, "adaptive"); // hermetic: 不依赖本地文件
-            let shell = PiAgentShell::new_with_pi_bin(
-                "pi-t".into(),
-                std::env::temp_dir(),
-                Some(stub.to_str().unwrap().to_string()),
-            )
-            .expect("stub embed spawn");
-            let e = cx.new(|_| AgentSession(Box::new(shell)));
-            let id = e.entity_id(); // 先取 id 再 move (D4)
-            app.workspace.as_mut().expect("测试 workspace").agents.push(e);
-            app.active = Some(id);
         });
+        let ws_path =
+            cx.update(|cx| app_entity.read(cx).workspace.as_ref().unwrap().path.clone());
+        fs::create_dir_all(&ws_path).unwrap();
+        fs::write(
+            Path::new(&ws_path).join(".pi_bin"),
+            stub.to_str().unwrap(),
+        )
+        .unwrap();
+        let (agent_id, _) = test_sessions::create_session(cx, &app_entity, Path::new(&ws_path));
+
+        // 等服务推送首帧并经 poll 喂进本地 parser (parser 存在才可断言尺寸)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let fed = cx.update(|cx| {
+                app_entity.update(cx, |app, cx| {
+                    app.poll_sessions(cx);
+                    app.terminal
+                        .read(cx)
+                        .active_parser_size(Some(agent_id))
+                        .is_some()
+                })
+            });
+            if fed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "启动帧未喂进本地 parser"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
 
         // frame 1: paint 量 bounds -> defer 分发
         let _ = cx.update_window(handle.into(), |_, window, cx| {
@@ -1434,10 +1409,14 @@ mod tests {
         });
         cx.run_until_parked();
 
-        // 读取分发结果 + 网格区域 bounds + 度量
+        // 读取分发结果 + 网格区域 bounds + 度量 (尺寸真值 = 面板本地 parser)
         let (resizes1, screen) = app_entity.read_with(cx, |app, cx| {
-            let s = app.workspace.as_ref().expect("测试 workspace").agents[0].read(cx);
-            (app.grid_resizes, s.0.screen().size())
+            let size = app
+                .terminal
+                .read(cx)
+                .active_parser_size(Some(agent_id))
+                .expect("本地 parser 已喂帧");
+            (app.grid_resizes, size)
         });
         let (win_bounds, bounds, (cell_w, line_h)) = cx
             .update_window(handle.into(), |_, window, _cx| {
@@ -1452,7 +1431,7 @@ mod tests {
             f32::from(bounds.size.width),
             f32::from(bounds.size.height),
             f32::from(cell_w),
-            f32::from(line_h),
+            f32::from(line_h)
         );
 
         // 换算必须与 paint 侧同一公式一致 (1.1 bounds 流通 + 3.1 分发)
@@ -1465,8 +1444,9 @@ mod tests {
             resizes1 >= 1,
             "首帧测量后应至少传播一次 resize, 得 {resizes1}"
         );
-        assert_eq!(screen.1.get(), exp_cols, "会话列数 = floor(宽/cell_w)");
-        assert_eq!(screen.0.get(), exp_rows, "会话行数 = floor(高/line_h)");
+        let (rows, cols) = screen;
+        assert_eq!(cols, exp_cols, "会话列数 = floor(宽/cell_w)");
+        assert_eq!(rows, exp_rows, "会话行数 = floor(高/line_h)");
         // bounds 应排除 sidebar (240px) 与 chrome: 1000px 窗口下明显小于全宽
         assert!(
             f32::from(bounds.size.width) < 800.,
@@ -1492,8 +1472,12 @@ mod tests {
         });
         cx.run_until_parked();
         let (resizes3, screen3) = app_entity.read_with(cx, |app, cx| {
-            let s = app.workspace.as_ref().expect("测试 workspace").agents[0].read(cx);
-            (app.grid_resizes, s.0.screen().size())
+            let size = app
+                .terminal
+                .read(cx)
+                .active_parser_size(Some(agent_id))
+                .expect("本地 parser 已喂帧");
+            (app.grid_resizes, size)
         });
         let bounds3 = cx
             .update_window(handle.into(), |_, window, _cx| {
@@ -1510,17 +1494,17 @@ mod tests {
         );
         let exp_cols3 = clamp(f32::from(bounds3.size.width) / f32::from(cell_w), MIN_GRID_COLS);
         let exp_rows3 = clamp(f32::from(bounds3.size.height) / f32::from(line_h), MIN_GRID_ROWS);
-        assert_eq!(screen3.1.get(), exp_cols3, "resize 后列数跟随新 bounds");
-        assert_eq!(screen3.0.get(), exp_rows3, "resize 后行数跟随新 bounds");
+        let (rows3, cols3) = screen3;
+        assert_eq!(cols3, exp_cols3, "resize 后列数跟随新 bounds");
+        assert_eq!(rows3, exp_rows3, "resize 后行数跟随新 bounds");
 
-        // 收尾: 关会话、清 stub
-        app_entity.update(cx, |app, cx| {
-            if let Some(e) = app.workspace.as_mut().and_then(|w| w.agents.pop()) {
-                e.update(cx, |s, _| s.0.shutdown());
-            }
-        });
+        // 收尾: 经服务关会话、清 stub
+        app_entity.update(cx, |app, cx| app.close_agent(agent_id, cx));
+        cx.run_until_parked();
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&ws_path);
     }
+
     /// 回归 (crash fix): sidebar 行点击的 listener 在**面板 lease 内**执行,
     /// funnel 的 notify_panels 必须 `cx.defer` — 同步 panel.update 会重入
     /// panic/abort ("cannot update SidebarPanel while it is already being
@@ -1636,15 +1620,7 @@ mod tests {
             .expect("open test window")
         });
 
-        // 注入 stub 会话 (与 adaptive_grid_dispatch 同款, 绕过真实 pi)
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("one-step-focus-{unique}"));
-        fs::create_dir_all(&dir).unwrap();
-        let stub = write_stub(&dir);
-        // 先注入 workspace 拿 root: 会话 cwd 必须 == project root
+        // 注入 workspace 拿 root: 会话 cwd 必须 == project root
         // (spec: Session working directory), 否则 sidebar 分组键
         // (project_root == root) 不命中, agent 行不渲染
         let ws_path = cx.update(|cx| {
@@ -1652,18 +1628,17 @@ mod tests {
         });
         // 注入目录是纯内存的 — spawn 需要 cwd 真实存在 (否则 ENOENT)
         fs::create_dir_all(&ws_path).unwrap();
-        let shell = PiAgentShell::new_with_pi_bin(
-            "pi-t".into(),
-            PathBuf::from(&ws_path),
-            Some(stub.to_str().unwrap().to_string()),
+        let stub = write_stub(Path::new(&ws_path));
+        // .pi_bin 标记 → 测试工厂真 spawn stub 会话 (task 3.2: 归服务)
+        fs::write(
+            Path::new(&ws_path).join(".pi_bin"),
+            stub.to_str().unwrap(),
         )
-        .expect("stub embed spawn");
-        let e = cx.new(|_| AgentSession(Box::new(shell)));
-        let agent_id = e.entity_id();
+        .unwrap();
+        let (agent_id, _) =
+            test_sessions::create_session(cx, &app_entity, Path::new(&ws_path));
         cx.update(|cx| {
             let app = app_entity.update(cx, |app, cx| {
-                app.workspace.as_mut().expect("测试 workspace").agents.push(e);
-                app.active = Some(agent_id);
                 // 直接注入绕过 funnel, 面板需显式 notify 才会重渲 (§10.5)
                 app.sidebar.update(cx, |_, cx| cx.notify());
             });
@@ -1712,7 +1687,6 @@ mod tests {
             "Tab 应经 send_key 转发给会话 (spec: Tab SHALL be delivered),              实际 {forwards_before} -> {forwards_after}"
         );
 
-        let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&ws_path);
     }
     /// 回归 (6.1 手动发现 F4): agent 输出到达 -> drain 循环 (50ms 测试时钟)
@@ -1747,25 +1721,30 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("badge-refresh-{unique}"));
         fs::create_dir_all(&dir).unwrap();
         let stub = write_stub_sleepy(&dir);
-        let shell = PiAgentShell::new_with_pi_bin(
-            "pi-t".into(),
-            std::env::temp_dir(),
-            Some(stub.to_str().unwrap().to_string()),
-        )
-        .expect("stub embed spawn");
-        let e = cx.new(|_| AgentSession(Box::new(shell)));
-        let agent_id = e.entity_id();
-        app_entity.update(cx, |app, cx| {
+        app_entity.update(cx, |app, _cx| {
             inject_test_workspace(app, "badge"); // hermetic
-            app.workspace.as_mut().expect("测试 workspace").agents.push(e);
-            app.active = Some(agent_id);
-            // 直接注入绕过 funnel: 两个面板都需显式 notify (§10.5)
-            app.sidebar.update(cx, |_, cx| cx.notify());
-            app.terminal.update(cx, |_, cx| cx.notify());
+        });
+        let ws_path =
+            cx.update(|cx| app_entity.read(cx).workspace.as_ref().unwrap().path.clone());
+        fs::create_dir_all(&ws_path).unwrap();
+        // .pi_bin 标记 → 真 spawn sleepy stub (状态三态经服务观测, task 3.2)
+        fs::write(
+            Path::new(&ws_path).join(".pi_bin"),
+            stub.to_str().unwrap(),
+        )
+        .unwrap();
+        let (agent_id, _) = test_sessions::create_session(cx, &app_entity, Path::new(&ws_path));
+        cx.update(|cx| {
+            app_entity.update(cx, |app, cx| {
+                // 直接注入绕过 funnel: 两个面板都需显式 notify (§10.5)
+                app.sidebar.update(cx, |_, cx| cx.notify());
+                app.terminal.update(cx, |_, cx| cx.notify());
+            });
         });
         cx.run_until_parked();
 
         // 首帧: sleepy stub 的响应 ≥1s (真实时间) 才到, 此刻必为 [Starting]
+        // (服务观测: 尚无字节 → Starting)
         let starting = cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             let all: Vec<String> = gpui_kit::base::test_support::texts(window)
@@ -1778,12 +1757,30 @@ mod tests {
         .expect("update window");
         assert!(starting, "首帧状态条应显示 [Starting]");
 
-        // 启动 drain 循环 (50ms 测试时钟) -> 真实时间等 stub 响应进缓冲
-        // -> 推进测试时钟触发 drain -> poll 消费 -> Running + notify 转发
+        // 服务 drain 循环 (真实 tokio 时钟) 消费首字节 → Running 投影事件
+        // → GUI 泵 (测试时钟, advance 推进) 消费 → 面板重渲 (F4 回归)
         app_entity.update(cx, |app, cx| app.start_update_loop(cx));
-        std::thread::sleep(std::time::Duration::from_millis(1300));
-        cx.executor().advance_clock(std::time::Duration::from_millis(200));
-        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(1300)); // 真实时间等 sleepy stub
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            cx.executor().advance_clock(std::time::Duration::from_millis(200));
+            cx.run_until_parked();
+            let status = cx.update(|cx| {
+                let app = app_entity.read(cx);
+                app.service_layer
+                    .sessions_view()
+                    .and_then(|v| v.sessions.iter().find(|s| s.id == agent_id))
+                    .map(|s| s.status)
+            });
+            if status == Some(agent_service::contract::SessionStatus::Running) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "服务侧状态未翻 Running: {status:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
 
         let running = cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
@@ -1797,14 +1794,13 @@ mod tests {
             "drain -> notify 转发后面板状态必须刷新为 [Running] (F4 回归)"
         );
 
-        // 收尾: 关会话、清 stub
-        app_entity.update(cx, |app, cx| {
-            if let Some(e) = app.workspace.as_mut().and_then(|w| w.agents.pop()) {
-                e.update(cx, |s, _| s.0.shutdown());
-            }
-        });
+        // 收尾: 经服务关会话、清 stub
+        app_entity.update(cx, |app, cx| app.close_agent(agent_id, cx));
+        cx.run_until_parked();
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&ws_path);
     }
+
 
     // ===== single-workspace-project-model 新增测试 =====
     // (组 3: 启动恢复/空态/创建; 组 4: 门控/epoch; 组 5: 树/分组/状态栏;
@@ -1963,22 +1959,23 @@ mod tests {
     fn gated_switch_with_active_session_shows_notice(cx: &mut TestAppContext) {
         let history = fresh_history_path();
         let (handle, app_entity) = open_app_with_history(cx, history);
-        let received = Rc::new(RefCell::new(Vec::new()));
-        app_entity.update(cx, |app, cx| {
+        app_entity.update(cx, |app, _cx| {
             inject_test_workspace(app, "gate-notice"); // 含同路径 root project
-            let ws_path = app.workspace.as_ref().unwrap().path.clone();
-            let recorder = ThemeRecorder {
-                ws: ws_path,
-                parser: vt100::Parser::new(
-                    std::num::NonZeroU16::new(24).unwrap(),
-                    std::num::NonZeroU16::new(80).unwrap(),
-                    0,
-                ),
-                received: received.clone(),
-            };
-            let e = cx.new(|_| AgentSession(Box::new(recorder)));
-            app.workspace.as_mut().unwrap().agents.push(e);
-            // Running 状态 → 活动支: 同步拦截, 不 spawn picker 对话框
+        });
+        let ws_path = cx.update(|cx| app_entity.read(cx).workspace.as_ref().unwrap().path.clone());
+        // Running 状态 → 活动支: 注入服务投影镜像 (task 3.2 接缝)
+        test_sessions::inject_view(
+            cx,
+            &app_entity,
+            vec![(
+                ws_path,
+                "recorder".into(),
+                agent_service::contract::SessionStatus::Running,
+            )],
+            Some(0),
+        );
+        app_entity.update(cx, |app, cx| {
+            // 同步拦截, 不 spawn picker 对话框
             app.request_workspace_open(true, cx);
         });
         cx.run_until_parked();
@@ -2201,7 +2198,7 @@ mod tests {
         let history = fresh_history_path();
         let (handle, app_entity) = open_app_with_history(cx, history);
         let external = temp_dir("external-project"); // 工作区外的 project
-        let (a_ws, a_ext) = app_entity.update(cx, |app, cx| {
+        let ws_path = app_entity.update(cx, |app, _cx| {
             inject_test_workspace(app, "grouping"); // project root1 = ws 目录
             let ws_path = app.workspace.as_ref().unwrap().path.clone();
             app.workspace
@@ -2210,27 +2207,31 @@ mod tests {
                 .model
                 .projects
                 .push(Project::from_root(external.clone()));
-            let mk = |ws: PathBuf, cx: &mut gpui_kit::Context<TerminalApp>| {
-                let recorder = ThemeRecorder {
-                    ws,
-                    parser: vt100::Parser::new(
-                        std::num::NonZeroU16::new(24).unwrap(),
-                        std::num::NonZeroU16::new(80).unwrap(),
-                        0,
-                    ),
-                    received: Rc::new(RefCell::new(Vec::new())),
-                };
-                cx.new(|_| AgentSession(Box::new(recorder)))
-            };
-            let a1 = mk(ws_path, cx);
-            let a2 = mk(external.clone(), cx);
-            let (i1, i2) = (a1.entity_id(), a2.entity_id());
-            app.workspace.as_mut().unwrap().agents.push(a1);
-            app.workspace.as_mut().unwrap().agents.push(a2);
-            app.active = Some(i2); // 状态栏显示外部 project 的 root
+            ws_path
+        });
+        // 两个会话归两个 project 根 (cwd 分组) — 注入服务投影镜像
+        let ids = test_sessions::inject_view(
+            cx,
+            &app_entity,
+            vec![
+                (
+                    ws_path,
+                    "recorder".into(),
+                    agent_service::contract::SessionStatus::Running,
+                ),
+                (
+                    external.clone(),
+                    "recorder".into(),
+                    agent_service::contract::SessionStatus::Running,
+                ),
+            ],
+            None,
+        );
+        let (a_ws, a_ext) = (ids[0], ids[1]);
+        app_entity.update(cx, |app, cx| {
+            app.active = Some(a_ext); // 状态栏显示外部 project 的 root
             app.sidebar.update(cx, |_, cx| cx.notify());
             app.terminal.update(cx, |_, cx| cx.notify());
-            (i1, i2)
         });
         cx.run_until_parked();
 
@@ -2256,8 +2257,8 @@ mod tests {
         let external_str = external.to_string_lossy().into_owned();
         assert!(
             texts.iter()
-                .any(|t| t.contains(&external_str) && t.contains("recorder")),
-            "状态栏应显示 project root 绝对路径, 实际: {texts:?}"
+                .any(|t| t.contains(&external_str) && t.contains("/pi-1")),
+            "状态栏应显示 project root 绝对路径 + `<project>/pi-1` 名, 实际: {texts:?}"
         );
     }
 
@@ -2267,24 +2268,23 @@ mod tests {
     fn project_row_click_keeps_active_session_and_tab(cx: &mut TestAppContext) {
         let history = fresh_history_path();
         let (handle, app_entity) = open_app_with_history(cx, history);
-        let agent_id = app_entity.update(cx, |app, cx| {
+        app_entity.update(cx, |app, _cx| {
             inject_test_workspace(app, "row-keep");
-            let ws_path = app.workspace.as_ref().unwrap().path.clone();
-            let recorder = ThemeRecorder {
-                ws: ws_path.clone(),
-                parser: vt100::Parser::new(
-                    std::num::NonZeroU16::new(24).unwrap(),
-                    std::num::NonZeroU16::new(80).unwrap(),
-                    0,
-                ),
-                received: Rc::new(RefCell::new(Vec::new())),
-            };
-            let e = cx.new(|_| AgentSession(Box::new(recorder)));
-            let id = e.entity_id();
-            app.workspace.as_mut().unwrap().agents.push(e);
-            app.active = Some(id);
+        });
+        let ws_path = cx.update(|cx| app_entity.read(cx).workspace.as_ref().unwrap().path.clone());
+        let ids = test_sessions::inject_view(
+            cx,
+            &app_entity,
+            vec![(
+                ws_path,
+                "recorder".into(),
+                agent_service::contract::SessionStatus::Running,
+            )],
+            Some(0),
+        );
+        let agent_id = ids[0];
+        app_entity.update(cx, |app, cx| {
             app.sidebar.update(cx, |_, cx| cx.notify());
-            id
         });
         cx.run_until_parked();
         render_texts(handle, cx); // 首帧让行进观测注册表
@@ -2392,7 +2392,8 @@ mod tests {
             .expect("update window");
         assert!(project_row_found, "项目行 id 进观测注册表");
 
-        // 建会话 (stub shell, cwd = project root — spec: working directory)
+        // 建会话 (经服务创建, cwd = project root — spec: working directory;
+        // .pi_bin 标记 → 工厂真 spawn stub, task 3.2)
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2400,21 +2401,15 @@ mod tests {
         let stub_dir = std::env::temp_dir().join(format!("chain-stub-{unique}"));
         fs::create_dir_all(&stub_dir).unwrap();
         let stub = write_stub(&stub_dir);
-        let shell = PiAgentShell::new_with_pi_bin(
-            "pi-chain".into(),
-            project_dir.clone(),
-            Some(stub.to_str().unwrap().to_string()),
+        fs::write(
+            project_dir.join(".pi_bin"),
+            stub.to_str().unwrap(),
         )
-        .expect("stub embed spawn");
-        let e = cx.new(|_| AgentSession(Box::new(shell)));
-        let agent_id = e.entity_id();
-        app_entity.update(cx, |app, cx| {
-            app.workspace.as_mut().unwrap().agents.push(e);
-            app.active = Some(agent_id);
-            app.sidebar.update(cx, |_, cx| cx.notify());
-            app.terminal.update(cx, |_, cx| cx.notify());
-        });
+        .unwrap();
+        let (agent_id, _) =
+            test_sessions::create_session(cx, &app_entity, &project_dir);
         cx.run_until_parked();
+
         let texts = render_texts(handle, cx);
         let agent_row_found = cx
             .update_window(handle, |_, window, _cx| {
@@ -2446,6 +2441,165 @@ mod tests {
         });
 
         let _ = fs::remove_dir_all(&stub_dir);
+    }
+
+    /// change agent-service task 3.2 (spec delta: Session control failure
+    /// feedback 三场景): 失败选/失败关/失败建 → 状态保持原样 + notice 点名。
+    /// 失败注入: select/close = 未知 id (回执 Err 路径); create = `.pi_bin`
+    /// 指向坏二进制 (工厂 spawn 失败 — spec 场景原文 "pi cannot be started")。
+    #[gpui_kit::test]
+    fn control_failure_feedback_covers_delta_scenarios(cx: &mut TestAppContext) {
+        use agent_service::contract::SessionId;
+        use crate::sidebar::SidebarEvent;
+        use std::time::{Duration, Instant};
+
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app_with_history(cx, history);
+        app_entity.update(cx, |app, _cx| {
+            inject_test_workspace(app, "delta-fail");
+        });
+        let ws_path =
+            cx.update(|cx| app_entity.read(cx).workspace.as_ref().unwrap().path.clone());
+        let (agent_id, shared) = test_sessions::create_session(cx, &app_entity, &ws_path);
+        let (keys, _, _, _) = test_sessions::counters(&shared.expect("计数会话"));
+        render_texts(handle, cx);
+
+        let center_tab = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let app = app_entity.read(cx);
+                let area = app.dock_area.read(cx);
+                crate::property_detail_manager::active_center_panel_id(area)
+            })
+        };
+        let center_before = center_tab(cx);
+        let wait_notice = |cx: &mut TestAppContext, needle: &str| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                cx.run_until_parked();
+                app_entity.update(cx, |app, cx| {
+                    app.poll_sessions(cx);
+                });
+                let got = cx.update(|cx| app_entity.read(cx).notice.clone());
+                if got.as_deref().is_some_and(|n| n.contains(needle)) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "notice 未出现: {needle}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        // ---- 场景 2: 失败选 (未知 id) → notice 点名 + active 不变 + 键仍达原会话
+        cx.update_window(handle, |_, window, cx| {
+            app_entity.update(cx, |app, cx| {
+                app.notice = None;
+                app.on_sidebar_event(SidebarEvent::SelectAgent(SessionId(9999)), window, cx);
+            });
+        })
+        .expect("update window");
+        wait_notice(cx, "切换会话失败");
+        assert_eq!(
+            cx.update(|cx| app_entity.read(cx).active),
+            Some(agent_id),
+            "失败 select 不动 active (spec delta 场景 2)"
+        );
+        assert_eq!(center_tab(cx), center_before, "失败 select 不切 console 签");
+        app_entity.update(cx, |app, cx| app.send_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('k'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            cx,
+        ));
+        test_sessions::wait_until(cx, || keys.get() >= 1, "原会话仍收键");
+
+        // ---- 场景 1: 失败关 (未知 id) → 会话仍在清单 + active/签不变 + notice
+        app_entity.update(cx, |app, cx| {
+            app.notice = None;
+            app.close_agent(SessionId(9998), cx);
+        });
+        wait_notice(cx, "关闭会话失败");
+        let (len, active) = cx.update(|cx| {
+            let app = app_entity.read(cx);
+            let v = app
+                .service_layer
+                .sessions_view()
+                .map(|v| (v.sessions.len(), v.active))
+                .expect("投影在场");
+            (v.0, v.1)
+        });
+        assert_eq!(len, 1, "失败关后会话仍在清单 (spec delta 场景 1)");
+        assert_eq!(active, Some(agent_id), "失败关不动 active");
+        assert_eq!(center_tab(cx), center_before, "失败关后 console 签内容不变");
+
+        // ---- 场景 3: 失败建 (.pi_bin 指坏二进制) → 无新行 + notice 点名
+        let bad_root = std::env::temp_dir().join(format!(
+            "delta-badpi-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&bad_root).unwrap();
+        fs::write(bad_root.join(".pi_bin"), "/nonexistent/pi-binary-xyz").unwrap();
+        app_entity.update(cx, |app, cx| {
+            app.notice = None;
+            app.create_agent(&bad_root, cx);
+        });
+        wait_notice(cx, "创建会话失败");
+        let len = cx.update(|cx| {
+            app_entity.read(cx)
+                .service_layer
+                .sessions_view()
+                .map(|v| v.sessions.len())
+                .expect("投影在场")
+        });
+        assert_eq!(len, 1, "失败建无新行 (spec delta 场景 3)");
+        let _ = fs::remove_dir_all(&bad_root);
+        let _ = fs::remove_dir_all(&ws_path);
+    }
+
+    /// change agent-service task 3.3: 输入 tell 的信封面 — kind 进追踪面、
+    /// 载荷 session id 精确投递 (双会话: 键只达 active, 非 active 零计数)。
+    #[gpui_kit::test]
+    fn input_tell_envelope_targets_active_session(cx: &mut TestAppContext) {
+        use agent_service::contract::KIND_INPUT_KEY;
+
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app_with_history(cx, history);
+        app_entity.update(cx, |app, _cx| {
+            inject_test_workspace(app, "envelope");
+        });
+        let ws_path =
+            cx.update(|cx| app_entity.read(cx).workspace.as_ref().unwrap().path.clone());
+
+        // 同 root 两个会话 (pi-1/pi-2); 后建者为 active (create 置 active)
+        let (id_a, shared_a) = test_sessions::create_session(cx, &app_entity, &ws_path);
+        let (id_b, shared_b) = test_sessions::create_session(cx, &app_entity, &ws_path);
+        assert_ne!(id_a, id_b);
+        assert_eq!(cx.update(|cx| app_entity.read(cx).active), Some(id_b));
+        let (ka, _, _, _) = test_sessions::counters(&shared_a.expect("会话 A"));
+        let (kb, _, _, _) = test_sessions::counters(&shared_b.expect("会话 B"));
+
+        // send_key → tell(input.key): 载荷 session = active (B)
+        app_entity.update(cx, |app, cx| {
+            app.send_key(
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char('x'),
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                cx,
+            );
+        });
+        test_sessions::wait_until(cx, || kb.get() >= 1, "active 会话收到键");
+        assert_eq!(ka.get(), 0, "载荷 session id 精确: 非 active 零投递");
+
+        // kind 进追踪面 (manager 观测面: 一问一答全程留痕 — tell 也记 Out)
+        let trace = cx.update(|cx| app_entity.read(cx).service_layer.manager.trace_entries());
+        assert!(
+            trace.iter().any(|t| t.kind == KIND_INPUT_KEY),
+            "input.key 必须进追踪面, 实际 kinds: {:?}",
+            trace.iter().map(|t| t.kind).collect::<Vec<_>>()
+        );
+        let _ = handle;
+        let _ = fs::remove_dir_all(&ws_path);
     }
 
     // ===== 4.1: asset_manager 注册接线 =====

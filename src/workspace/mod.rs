@@ -11,9 +11,8 @@ pub mod store;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use gpui_kit::Entity;
+use agent_service::contract::SessionId;
 
-use crate::agent_entities::AgentSession;
 use crate::project_model::WorkspaceModel;
 
 /// 当前打开的工作区: 目录 + 领域模型 + 会话。
@@ -28,8 +27,9 @@ pub struct Workspace {
     pub model: WorkspaceModel,
     /// 折叠的 Project 行 (易失, 不持久化 — 对齐"折叠态不持久化"立场)。
     pub collapsed_projects: HashSet<PathBuf>,
-    /// 该工作区下的全部会话 (平铺; 计数器在 `model` 的 Project 上)。
-    pub agents: Vec<Entity<AgentSession>>,
+    /// 该工作区下的全部会话 id (平铺; 会话本体归 AgentService 所有,
+    /// 此处仅 id 镜像 — change agent-service task 3.2, D4)。
+    pub agents: Vec<SessionId>,
 }
 
 impl Workspace {

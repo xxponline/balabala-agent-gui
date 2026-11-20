@@ -22,7 +22,6 @@ pub use project::{Module, Project};
 pub use solution::SolutionItem;
 pub use validate::load;
 
-use std::path::Path;
 
 /// 一个已打开工作区的领域模型: solution 配置 + 展开后的 Project 列表。
 ///
@@ -37,9 +36,4 @@ pub struct WorkspaceModel {
 }
 
 impl WorkspaceModel {
-    /// 按 root 路径找 Project (可变; 会话计数器领取 — `create_agent` 用,
-    /// design D2: 身份 = root)。
-    pub fn project_by_root_mut(&mut self, root: &Path) -> Option<&mut Project> {
-        self.projects.iter_mut().find(|p| p.root == root)
-    }
 }

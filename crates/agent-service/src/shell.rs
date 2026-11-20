@@ -6,49 +6,35 @@
 //!   send_key/send_text --> embed 注入通道 (UiEvent::Key)
 //!   shutdown()     --> embed.shutdown()  (退出事件循环 + 杀 pi 子进程)
 //!
-//! 状态机 (spec: Sidebar session item display):
-//!   Starting (会话已创建, 尚无帧)
-//!     | 第一帧 ANSI
-//!     v
-//!   Running  (embed 线程存活)
-//!     | embed 线程退出 (pi 自行退出 / 关闭)
-//!     v
-//!   Exited   (最后一帧保留在 vt100 屏幕上)
+//! 状态机 (spec: Sidebar session item display) 由 **AgentService** 从
+//! `drain` 首批字节 / `alive()` 观测推导 (Starting → Running → Exited);
+//! 最后一帧保留发生在 AgentTerminal 的本地 parser (task 3.4/3.5)。
 //!
-//! 与原 PTY 实现的对照关系见 design D6: `screen()` 契约不变,
-//! 输入从字节改为结构化 KeyEvent / 文本。
+//! change agent-service task 3.5: 本文件自 GUI 迁入 agent-service,
+//! `AgentEntity` trait impl 已溶解为 inherent 方法 (SessionIo 走同名转发)。
+//! 与原 PTY 实现的对照关系见 design D6: 输入从字节改为结构化
+//! KeyEvent / 文本。
 
-use std::num::NonZeroU16;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use pi_shell_rs::app::embed::{EmbedConfig, EmbeddedApp};
 use pi_shell_rs::app::theme::TuiTheme;
-use vt100::Parser;
 
-use crate::agent_entities::{AgentEntity, SessionStatus};
 
 /// 终端网格回退尺寸 (首帧测量前使用; 自适应后由 pane 测量接管 —
 /// 见 change `add-adaptive-terminal-grid` design D6)。与 pane.rs 渲染一致。
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
 
-/// vt100 scrollback 行数 (与原 PTY 实现一致)。
-const SCROLLBACK: usize = 1000;
-
+/// change agent-service task 3.5 (design D2): 渲染面已整体溶解 —
+/// name/root 元数据归 AgentService 注册表, vt100 parser/screen 归
+/// AgentTerminal 本地, 状态三态由服务从 drain/alive 观测。本体只剩
+/// embed 句柄 + 尺寸去重缓存。
 pub struct PiAgentShell {
-    /// sidebar 上显示的名字, 例如 "pi-1"
-    name: String,
-    /// 挂载的 Project 根 = 启动 cwd (spec: Session working directory)
-    project_root: PathBuf,
-    /// 嵌入会话句柄 (输入注入 / 取帧 / 状态 / 关闭)
+    /// 嵌入会话句柄 (输入注入 / 取帧 / 关闭)
     embed: EmbeddedApp,
-    /// vt100 解析器: embed ANSI 帧 -> 屏幕 (UI 直接读 cell)
-    parser: Parser,
-    /// 当前网格尺寸 (cols, rows): 去重依据; 初始为回退常量 (D6),
-    /// 首帧测量后由 `resize` 接管
+    /// 当前网格尺寸 (cols, rows): embed 侧去重依据; 初始为回退常量 (D6)
     grid_size: (u16, u16),
-    /// 当前状态
-    status: SessionStatus,
 }
 
 impl PiAgentShell {
@@ -58,33 +44,30 @@ impl PiAgentShell {
     /// `theme` 是宿主按当前主题构造的注入配色 (add-light-dark-theme D4:
     /// 颜色真相在宿主)。
     /// 失败 (pi 缺失/探活超时) 返回 Err, 不会留下半开的会话。
-    pub fn new(name: String, cwd: PathBuf, theme: TuiTheme) -> Result<Self, String> {
-        Self::spawn(name, cwd, None, theme)
+    pub fn new(_name: String, cwd: PathBuf, theme: TuiTheme) -> Result<Self, String> {
+        Self::spawn(cwd, None, theme)
     }
 
     /// 测试专用: 以指定 pi 二进制 (stub) 构造会话 (配色用默认值)。
-    #[cfg(test)]
-    pub(crate) fn new_with_pi_bin(
-        name: String,
+    /// 测试专用: 以指定 pi 二进制 (stub) 构造会话 — 跨 crate 测试工厂
+    /// (GUI cfg(test)) 消费, 生产路径用 `new` (task 3.5 迁移注记)。
+    #[allow(dead_code)] // 仅测试构建的 GUI 工厂调用
+    pub fn new_with_pi_bin(
+        _name: String,
         cwd: PathBuf,
         pi_bin: Option<String>,
     ) -> Result<Self, String> {
-        Self::spawn(name, cwd, pi_bin, TuiTheme::default())
+        Self::spawn(cwd, pi_bin, TuiTheme::default())
     }
 
     /// 以指定 pi 二进制启动会话 (生产走 `None` = PATH 解析; 测试注入 stub)。
     ///
-    /// 输入: name — sidebar 显示名; cwd — 工作目录; pi_bin — pi 可执行文件
-    ///       (None = Windows PATHEXT 解析, 解析不到再回退 resolve_binary());
-    ///       theme — 宿主注入配色 (add-light-dark-theme D4)
-    /// 输出: 成功返回就绪会话 (Starting 状态, 网格为回退尺寸);
-    ///       失败 (pi 缺失/探活超时) 返回 Err, 不留下半开会话
-    fn spawn(
-        name: String,
-        cwd: PathBuf,
-        pi_bin: Option<String>,
-        theme: TuiTheme,
-    ) -> Result<Self, String> {
+    /// 输入: cwd — 工作目录 (spec: Session working directory); pi_bin — pi
+    ///       可执行文件 (None = Windows PATHEXT 解析, 解析不到再回退
+    ///       resolve_binary()); theme — 宿主注入配色 (add-light-dark-theme D4)
+    /// 输出: 成功返回就绪 embed 会话; 失败 (pi 缺失/探活超时) 返回 Err,
+    ///       不留下半开会话
+    fn spawn(cwd: PathBuf, pi_bin: Option<String>, theme: TuiTheme) -> Result<Self, String> {
         let config = EmbedConfig {
             // 测试注入的 pi_bin 优先; 否则 Windows 上做 PATHEXT 语义解析
             // (见 resolve_pi_bin), 解析不到再回退 None = resolve_binary()
@@ -102,19 +85,9 @@ impl PiAgentShell {
         };
         let embed = EmbeddedApp::spawn(config)?;
 
-        let parser = Parser::new(
-            NonZeroU16::new(ROWS).unwrap(),
-            NonZeroU16::new(COLS).unwrap(),
-            SCROLLBACK,
-        );
-
         Ok(Self {
-            name,
-            project_root: cwd,
             embed,
-            parser,
             grid_size: (COLS, ROWS),
-            status: SessionStatus::Starting,
         })
     }
 }
@@ -162,38 +135,7 @@ fn resolve_pi_bin() -> Option<String> {
     None
 }
 
-impl AgentEntity for PiAgentShell {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn project_root(&self) -> &Path {
-        &self.project_root
-    }
-
-    fn screen(&self) -> &vt100::Screen {
-        self.parser.screen()
-    }
-
-    fn poll(&mut self) -> bool {
-        // 1) 吃掉 embed 产出的 ANSI 帧, 喂 vt100 parser。
-        let bytes = self.embed.take_ansi();
-        if !bytes.is_empty() {
-            self.parser.process(&bytes);
-            if self.status == SessionStatus::Starting {
-                self.status = SessionStatus::Running;
-            }
-            return true; // 有消费 -> UI notify
-        }
-        // 2) embed 线程退出 (pi 自行退出/连接关闭) -> Exited;
-        //    最后一帧保留在屏幕上 (spec: Observed subprocess exit)。
-        if !self.embed.is_running() && self.status != SessionStatus::Exited {
-            self.status = SessionStatus::Exited;
-            return true;
-        }
-        false
-    }
-
+impl PiAgentShell {
     fn send_key(&mut self, key: crossterm::event::KeyEvent) {
         self.embed.inject_key(key);
     }
@@ -212,14 +154,14 @@ impl AgentEntity for PiAgentShell {
 
     fn shutdown(&mut self) {
         // 退出事件循环并 join (线程侧杀 pi 子进程, spec: Manual session close)
+        // 存活性由 embed.is_running 观测 (服务侧 alive → Exited 三态)
         self.embed.shutdown();
-        self.status = SessionStatus::Exited;
     }
 
     fn resize(&mut self, cols: u16, rows: u16) -> bool {
-        // Exited: embed 线程已死且最后画面必须保留 (spec: Grid resize
-        // propagation — exited 会话不 reflow)
-        if self.status == SessionStatus::Exited {
+        // Exited: embed 线程已死 (spec: Grid resize propagation — exited
+        // 会话不 reflow; 屏幕保留的半边归 AgentTerminal 本地 parser)
+        if !self.embed.is_running() {
             return false;
         }
         let (cols, rows) = (cols.max(1), rows.max(1));
@@ -228,21 +170,63 @@ impl AgentEntity for PiAgentShell {
             return false;
         }
         self.grid_size = (cols, rows);
-        // 两半同步: embed TUI 下一帧 autoresize 重绘, vt100 屏幕立即 reflow
+        // embed TUI 下一帧 autoresize 重绘 (vt100 半边由 AgentTerminal
+        // 的本地 parser 同拍 set_size — task 3.4)
         self.embed.resize(cols, rows);
-        if let (Some(r), Some(c)) = (NonZeroU16::new(rows), NonZeroU16::new(cols)) {
-            self.parser.set_size(r, c);
-        }
         true
     }
-
-    fn status(&self) -> SessionStatus {
-        self.status
-    }
-
     fn set_theme(&mut self, theme: TuiTheme) {
         // 转发给 embed: UiEvent::Theme → 事件循环应用 + 重绘 (D4)
         self.embed.set_theme(theme);
+    }
+}
+
+/// change agent-service task 3.2: 服务侧控制面（design D2）。
+///
+/// - `drain` = 原始 ANSI 字节**所有权移动**（不喂本体 parser —— 渲染
+///   parser 已归 AgentTerminal，双喂会分账；embed_layout 测试仍直调
+///   `poll()` 自喂自读，不经服务）；
+/// - `alive` 直读 embed 线程存活（不依赖 `status` 字段 —— 那由 `poll()`
+///   维护，而服务路径不再调它）。
+impl crate::session::SessionIo for PiAgentShell {
+    fn drain(&mut self) -> Vec<u8> {
+        self.embed.take_ansi()
+    }
+
+    fn alive(&self) -> bool {
+        self.embed.is_running()
+    }
+
+    fn send_key(&mut self, key: crossterm::event::KeyEvent) {
+        PiAgentShell::send_key(self, key);
+    }
+
+    fn send_text(&mut self, text: &str) {
+        PiAgentShell::send_text(self, text);
+    }
+
+    fn send_wheel(&mut self, lines: i16) {
+        PiAgentShell::send_wheel(self, lines);
+    }
+
+    fn send_click(&mut self, x: u16, y: u16) {
+        PiAgentShell::send_click(self, x, y);
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) -> bool {
+        PiAgentShell::resize(self, cols, rows)
+    }
+
+    fn set_theme(&mut self, theme: &TuiTheme) {
+        PiAgentShell::set_theme(self, theme.clone());
+    }
+
+    fn shutdown(&mut self) {
+        PiAgentShell::shutdown(self);
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -339,7 +323,6 @@ mod tests {
         // 真实生产入口 (None -> resolve_pi_bin -> pi --mode rpc 探活)
         let shell = PiAgentShell::new("pi-real".into(), dir.clone(), TuiTheme::default())
             .expect("生产路径必须能启动 pi (Windows: 不得报 program not found)");
-        assert_eq!(shell.status(), SessionStatus::Starting);
         shell_embed_running(&shell);
 
         let _ = fs::remove_dir_all(&dir);
@@ -350,25 +333,11 @@ mod tests {
         assert!(shell.embed.is_running(), "pi 子进程必须存活");
     }
 
-    /// 把整个屏幕 dump 成带分隔符的字符串, 用于逐字节比较。
-    fn dump(screen: &vt100::Screen) -> String {
-        let (rows, cols) = screen.size();
-        let mut out = String::new();
-        for r in 0..rows.get() {
-            for c in 0..cols.get() {
-                out.push_str(screen.cell(r, c).map(|c| c.contents()).unwrap_or("\u{0}"));
-                out.push('\u{1}');
-            }
-            out.push('\n');
-        }
-        out
-    }
-
-    /// spec: Adaptive terminal grid sizing / Grid resize propagation。
-    /// 2.1: resize 同步两半 + 去重 + Exited 屏幕逐字节保留;
-    /// 2.2: 首帧测量前会话处于回退尺寸。
+    /// spec: Grid resize propagation 的 embed 半边 — 去重 + Exited 不传播;
+    /// vt100 屏幕 reflow / 逐字节保留的半边归 AgentTerminal 本地 parser
+    /// (design D2 渲染面溶解, 见 pane `apply_grid_size` 测试)。
     #[test]
-    fn resize_updates_dedupes_and_preserves_exited_screen() {
+    fn resize_dedupes_and_shutdown_stops_propagation() {
         let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("pi-shell-resize-{unique}-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -381,31 +350,21 @@ mod tests {
         )
         .expect("stub embed spawn");
 
-        // 2.2: 首帧测量前 = 回退常量 (网格与 parser 初始一致)
+        // 首帧测量前 = 回退常量
         assert_eq!(shell.grid_size, (COLS, ROWS));
-        assert_eq!(
-            shell.screen().size(),
-            (NonZeroU16::new(ROWS).unwrap(), NonZeroU16::new(COLS).unwrap()),
-            "新会话首帧前应回退尺寸"
-        );
 
-        // 2.1: resize 传播到 vt100 屏幕 (embed 半边经共享槽+Resize 事件,
-        // 由 embed.resize 内部完成) 并记录尺寸
+        // 尺寸变化必须传播 + 记录
         assert!(shell.resize(80, 24), "尺寸变化必须传播");
         assert_eq!(shell.grid_size, (80, 24));
-        assert_eq!(shell.screen().size().0.get(), 24, "vt100 行数已 reflow");
-        assert_eq!(shell.screen().size().1.get(), 80, "vt100 列数已 reflow");
 
         // 去重: 同尺寸不再传播 (spec: Unchanged layout propagates nothing)
         assert!(!shell.resize(80, 24), "同尺寸必须去重");
 
-        // Exited: 不传播, 屏幕逐字节保留 (spec: Exited session screen preserved)
+        // Exited: 不传播 (spec: Exited session screen preserved 的 embed 半边)
         shell.shutdown();
-        assert_eq!(shell.status(), SessionStatus::Exited);
-        let before = dump(shell.screen());
+        assert!(!shell.embed.is_running(), "shutdown 后 embed 线程必须退出");
         assert!(!shell.resize(60, 20), "Exited 会话不得 resize");
         assert_eq!(shell.grid_size, (80, 24), "Exited 不得更新尺寸状态");
-        assert_eq!(dump(shell.screen()), before, "Exited 屏幕必须逐字节保留");
 
         let _ = fs::remove_dir_all(&dir);
     }

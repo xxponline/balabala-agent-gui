@@ -6,7 +6,7 @@
 //! （key = 绝对路径字符串，与 `AssetNode.id` 同一身份体系）：
 //! 已有 → 聚焦既有签，没有 → `add_panel_view(Center)` 尾插新签。
 //!
-//! console 恒为第一签：尾插天然保位 + `TerminalPanel::closable()=false`
+//! console 恒为第一签：尾插天然保位 + `AgentTerminal::closable()=false`
 //! （specs/center-tabs: Console is the permanent first center tab）。
 
 pub mod editor_panel;
@@ -82,7 +82,6 @@ mod tests {
     //! (app.rs tests 同款教训)。
 
     use super::*;
-    use crate::agent_entities::{AgentEntity, AgentSession, SessionStatus};
     use crate::app::TerminalApp;
     use crate::sidebar::SidebarEvent;
     use crate::project_model::WorkspaceModel;
@@ -94,9 +93,7 @@ mod tests {
         AnyWindowHandle, AppContext, Bounds, Focusable, Point, TestAppContext, WindowBounds,
         WindowOptions, px, size,
     };
-    use std::cell::Cell;
     use std::path::PathBuf;
-    use std::rc::Rc;
 
     /// 起完整 app（隔离全局历史/外部配置, 模式同 tree tests）。
     fn open_app(
@@ -218,128 +215,37 @@ mod tests {
         cx.run_until_parked();
     }
 
-    /// 计数假会话: 记录 send_key / send_text 次数（5.2/5.3 观测口）。
-    struct CountingAgent {
-        name: String,
-        ws: PathBuf,
-        parser: vt100::Parser,
-        keys: Rc<Cell<usize>>,
-        texts: Rc<Cell<usize>>,
-        /// 累计滚轮行数 (2.2/3.x 观测)。
-        wheels: Rc<Cell<i64>>,
-        /// 最近一次点击坐标 (2.2/4.x 观测)。
-        clicks: Rc<Cell<Option<(u16, u16)>>>,
-    }
 
-    impl CountingAgent {
-        fn new(
-            name: &str,
-            ws: &Path,
-            keys: Rc<Cell<usize>>,
-            texts: Rc<Cell<usize>>,
-            wheels: Rc<Cell<i64>>,
-            clicks: Rc<Cell<Option<(u16, u16)>>>,
-        ) -> Self {
-            Self {
-                name: name.to_string(),
-                ws: ws.to_path_buf(),
-                parser: vt100::Parser::new(
-                    std::num::NonZeroU16::new(24).unwrap(),
-                    std::num::NonZeroU16::new(80).unwrap(),
-                    0,
-                ),
-                keys,
-                texts,
-                wheels,
-                clicks,
-            }
-        }
-    }
 
-    impl AgentEntity for CountingAgent {
-        fn name(&self) -> &str {
-            &self.name
-        }
-        fn project_root(&self) -> &Path {
-            &self.ws
-        }
-        fn screen(&self) -> &vt100::Screen {
-            self.parser.screen()
-        }
-        fn poll(&mut self) -> bool {
-            false
-        }
-        fn send_key(&mut self, _key: crossterm::event::KeyEvent) {
-            self.keys.set(self.keys.get() + 1);
-        }
-        fn send_text(&mut self, text: &str) {
-            let _ = text;
-            self.texts.set(self.texts.get() + 1);
-        }
-        fn send_wheel(&mut self, lines: i16) {
-            self.wheels.set(self.wheels.get() + i64::from(lines));
-        }
-        fn send_click(&mut self, x: u16, y: u16) {
-            self.clicks.set(Some((x, y)));
-        }
-        fn shutdown(&mut self) {}
-        fn status(&self) -> SessionStatus {
-            SessionStatus::Running
-        }
-        fn resize(&mut self, _cols: u16, _rows: u16) -> bool {
-            false
-        }
-        fn set_theme(&mut self, _theme: pi_shell_rs::app::theme::TuiTheme) {}
-    }
-
-    use std::path::Path;
-
-    /// 注入 workspace + 计数会话为 active。
+    /// 注入 workspace + 经服务创建计数会话为 active（task 3.2: 会话归
+    /// AgentService，计数读共享测试会话 — `.get()` 读法不变）。
     fn inject_session(
         cx: &mut TestAppContext,
         app: &gpui_kit::Entity<TerminalApp>,
         tag: &str,
     ) -> (
-        Rc<Cell<usize>>,
-        Rc<Cell<usize>>,
-        Rc<Cell<i64>>,
-        Rc<Cell<Option<(u16, u16)>>>,
+        crate::service_layer::test_sessions::NumCounter,
+        crate::service_layer::test_sessions::NumCounter,
+        crate::service_layer::test_sessions::NumCounter,
+        crate::service_layer::test_sessions::ClickCounter,
     ) {
+        use crate::service_layer::test_sessions;
         let ws = std::env::temp_dir().join(format!("pdm-ws-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
         std::fs::create_dir_all(&ws).unwrap();
-        let keys = Rc::new(Cell::new(0usize));
-        let texts = Rc::new(Cell::new(0usize));
-        let wheels = Rc::new(Cell::new(0i64));
-        let clicks = Rc::new(Cell::new(None));
-        cx.update(|cx| {
-            app.update(cx, |app, cx| {
-                app.workspace = Some(Workspace::new(ws.clone(), WorkspaceModel::default()));
-                let agent = cx.new(|_| {
-                    AgentSession(Box::new(CountingAgent::new(
-                        "pi-1",
-                        &ws,
-                        keys.clone(),
-                        texts.clone(),
-                        wheels.clone(),
-                        clicks.clone(),
-                    )))
-                });
-                let id = agent.entity_id();
-                app.workspace
-                    .as_mut()
-                    .expect("注入的 workspace")
-                    .agents
-                    .push(agent);
-                app.active = Some(id);
-                app.notify_panels(cx);
-            });
+        app.update(cx, |app, cx| {
+            app.workspace = Some(Workspace::new(ws.clone(), WorkspaceModel::default()));
+            app.notify_panels(cx);
+        });
+        let (id, shared) = test_sessions::create_session(cx, app, &ws);
+        let shared = shared.expect("计数测试会话 (非 real-pi 路径)");
+        // 喂首帧 → 面板建本地 parser (grid 行/hover/点击/选区的在场前提)
+        app.update(cx, |app, cx| {
+            app.terminal.update(cx, |t, cx| t.feed(id, b"probe\r\n", cx));
         });
         cx.run_until_parked();
-        (keys, texts, wheels, clicks)
+        test_sessions::counters(&shared)
     }
-
-    // ---------- 2.2 tab 条常驻 ----------
 
     #[gpui_kit::test]
     fn top_bar_always_visible(cx: &mut TestAppContext) {
@@ -624,7 +530,7 @@ mod tests {
         if let Some(b) = first {
             let line_h = cx
                 .update_window(handle, |_, window, _| {
-                    f32::from(crate::pane::grid_metrics(window).1)
+                    f32::from(agent_service::terminal::grid_metrics(window).1)
                 })
                 .expect("metrics");
             assert!((f32::from(b.size.height) - line_h).abs() < 1.0, "段高=行高");
@@ -643,7 +549,7 @@ mod tests {
         let _ = render(handle, cx);
 
         let (cell_w, line_h) = cx
-            .update_window(handle, |_, window, _| crate::pane::grid_metrics(window))
+            .update_window(handle, |_, window, _| agent_service::terminal::grid_metrics(window))
             .expect("grid_metrics");
         // 点网格内第 10 列第 5 行的格子中心 → (10, 5)
         let target = point(
@@ -757,7 +663,7 @@ mod tests {
         let _ = render(handle, cx);
 
         let line_h = cx
-            .update_window(handle, |_, window, _| f32::from(crate::pane::grid_metrics(window).1))
+            .update_window(handle, |_, window, _| f32::from(agent_service::terminal::grid_metrics(window).1))
             .expect("grid_metrics");
         assert!(line_h > 0., "行高可测得");
 
@@ -779,10 +685,12 @@ mod tests {
         scroll_px(cx, line_h * 0.4);
         assert_eq!(wheels.get(), 0, "未凑满一行不发送 (余数携带)");
         scroll_px(cx, line_h * 0.4);
+        crate::service_layer::test_sessions::wait_until(cx, || wheels.get() == -1, "wheel(-1) 经服务送达");
         assert_eq!(wheels.get(), -1, "-1.2 行 → 发 -1 行 (负=看更早)");
 
         // 快滚一次 5 行 → 一次发 -5 (累积 -0.2-5=-5.2 → -5)
         scroll_px(cx, line_h * 5.);
+        crate::service_layer::test_sessions::wait_until(cx, || wheels.get() == -6, "wheel 累计经服务送达");
         assert_eq!(wheels.get(), -6, "整数行不丢");
 
         let wf = cx.update(|cx| app.read(cx).wheel_forwards);
@@ -830,6 +738,7 @@ mod tests {
                 app.send_click(12, 7, cx);
             });
         });
+        crate::service_layer::test_sessions::wait_until(cx, || wheels.get() == 2 && clicks.get() == Some((12, 7)), "输入经服务送达");
         assert_eq!(wheels.get(), 2, "行数载荷累计 (-3+5)");
         assert_eq!(clicks.get(), Some((12, 7)), "坐标载荷原样送达");
         let (wf, cf) = cx.update(|cx| {
@@ -1369,8 +1278,17 @@ mod tests {
         let (tabs, active) = center_tabs(cx, &app);
         assert_eq!(active, 1, "viewer active");
 
-        // 点 sidebar agent 行 → 一步回 console 签 + session 焦点
-        let agent_id = cx.update(|cx| cx.new(|_| 0u8).entity_id());
+        // 注入 workspace + 经服务建会话 (task 3.2: select ask, 成功才切 console)
+        let ws = std::env::temp_dir().join(format!("pdm-sel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        app.update(cx, |app, _cx| {
+            app.workspace = Some(Workspace::new(ws.clone(), WorkspaceModel::default()));
+        });
+        let (agent_id, _shared) =
+            crate::service_layer::test_sessions::create_session(cx, &app, &ws);
+
+        // 点 sidebar agent 行 → ask 经服务 → 成功回执经泵切 console + 焦点
         let term_focus = cx.update(|cx| app.read(cx).terminal.read(cx).focus_handle(cx));
         cx.update_window(handle, |_, window, cx| {
             app.update(cx, |app, cx| {
@@ -1378,7 +1296,23 @@ mod tests {
             });
         })
         .expect("update window");
-        cx.run_until_parked();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            cx.run_until_parked();
+            app.update(cx, |app, cx| {
+                app.poll_sessions(cx);
+            });
+            let (t, a) = center_tabs(cx, &app);
+            if a == 0 {
+                assert_eq!(t, tabs, "签不增减");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "select 成功回执未切 console"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
 
         let (tabs_after, active_after) = center_tabs(cx, &app);
         assert_eq!(tabs_after, tabs, "签不增减");
@@ -1386,7 +1320,7 @@ mod tests {
         let focused = cx
             .update_window(handle, |_, window, cx| window.focused(cx))
             .expect("update window");
-        assert_eq!(focused, Some(term_focus), "一步聚焦: 焦点在 TerminalPanel");
+        assert_eq!(focused, Some(term_focus), "一步聚焦: 焦点在 AgentTerminal");
         let _ = render(handle, cx);
     }
 
@@ -1409,6 +1343,7 @@ mod tests {
         })
         .expect("update window");
         cx.run_until_parked();
+        crate::service_layer::test_sessions::wait_until(cx, || keys.get() == 1, "按键经服务送达");
         assert_eq!(keys.get(), 1, "console active → session 收键");
 
         // 开 viewer → viewer active: 按键不进 session

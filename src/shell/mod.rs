@@ -16,16 +16,72 @@ use gpui_kit::component::dock::{panel_handle, DockArea, DockLayout, DockPlacemen
 use gpui_kit::*;
 
 use crate::app::TerminalApp;
-use crate::pane::TerminalPanel;
 use crate::sidebar::SidebarPanel;
+use agent_service::terminal::{AgentTerminal, TerminalBus};
+use std::sync::Arc;
 use crate::tree::TreePanel;
+
+/// AgentTerminal 出站窄缝的 GUI 实现 (change agent-service design D7):
+/// 面板语义 → TerminalApp 控制方法 (ask/tell 由 app 内部走服务消息)。
+struct AppTerminalBus {
+    app: WeakEntity<TerminalApp>,
+}
+
+impl AppTerminalBus {
+    fn new(app: WeakEntity<TerminalApp>) -> Arc<Self> {
+        Arc::new(Self { app })
+    }
+}
+
+impl TerminalBus for AppTerminalBus {
+    fn send_key(&self, cx: &mut App, key: crossterm::event::KeyEvent) {
+        self.app
+            .update(cx, |app, cx| app.send_key(key, cx))
+            .ok();
+    }
+
+    fn send_text(&self, cx: &mut App, text: &str) {
+        self.app
+            .update(cx, |app, cx| app.send_text(text, cx))
+            .ok();
+    }
+
+    fn send_wheel(&self, cx: &mut App, lines: i16) {
+        self.app
+            .update(cx, |app, cx| app.send_wheel(lines, cx))
+            .ok();
+    }
+
+    fn send_click(&self, cx: &mut App, x: u16, y: u16) {
+        self.app
+            .update(cx, |app, cx| app.send_click(x, y, cx))
+            .ok();
+    }
+
+    fn propagate_grid_size(
+        &self,
+        cx: &mut App,
+        cols: u16,
+        rows: u16,
+        w: f32,
+        h: f32,
+        cell_w: gpui_kit::Pixels,
+        line_h: gpui_kit::Pixels,
+    ) {
+        self.app
+            .update(cx, |app, cx| {
+                app.propagate_grid_size(cols, rows, w, h, cell_w, line_h, cx)
+            })
+            .ok();
+    }
+}
 
 /// `shell::build` 的产出；TerminalApp 保存实体句柄
 /// （sidebar 用于 notify 转发，terminal 用于一步切焦点/关闭右 dock 后回焦点）。
 pub struct ShellParts {
     pub dock_area: Entity<DockArea>,
     pub sidebar: Entity<SidebarPanel>,
-    pub terminal: Entity<TerminalPanel>,
+    pub terminal: Entity<AgentTerminal>,
     /// 文件树面板 (notify 转发名单 + 一步焦点目标; app 持实体)
     pub tree: Entity<TreePanel>,
 }
@@ -46,7 +102,7 @@ pub fn build(
     skin.set_close_button_visible(true, cx);
 
     let sidebar = cx.new(|cx| SidebarPanel::new(weak_app.clone(), cx));
-    let terminal = cx.new(|cx| TerminalPanel::new(weak_app.clone(), cx));
+    let terminal = cx.new(|cx| AgentTerminal::new(AppTerminalBus::new(weak_app.clone()), cx));
     let right = cx.new(|cx| TreePanel::new(weak_app.clone(), cx));
 
     dock_area.update(cx, |area, cx| {
