@@ -2,12 +2,12 @@
 
 ## 1. 归位与改名（机械搬迁，行为冻结）
 
-- [ ] 1.1 建 `src/assets/`：`mod.rs`（模块文档 + 导出伞）、`dto.rs`→`state.rs` 平移并改名 DTO `AssetView`→`AssetState`（含 `find_kind` 形参改 `state`）。验证：`cargo build` 通过；`rg "AssetView::(Empty|Degraded|Forest)"` 全库归零
-- [ ] 1.2 trait 定义平移 `src/assets/traits.rs`（旧名暂留，design D6）；`manager.rs`→`src/assets/manager.rs` 并改 `view()`→`state()`，测试外提 `manager_tests.rs`。验证：`cargo build` 通过；`rg "fn view\(" src/assets/` 归零
-- [ ] 1.3 `tree/mod.rs`→`src/assets/panel.rs`（`TreePanel`→`AssetView`、`last_synced: Option<AssetState>`），测试外提 `panel_tests.rs`（**只改 use 路径，断言零改写**）。验证：`cargo build` 通过；`rg "TreePanel"` 全库归零
-- [ ] 1.4 枚举实现归位 `project_model/enumerate.rs`：`FileEnumerator`/`ModuleEnumerator`/`ProjectEnumerator`、`scan_root`/`scan_dir` 与 impl 块整体平移，`FileFilter` 引用改项目内。验证：`cargo build` 通过；`rg "FileFilter" src/assets/` 归零
-- [ ] 1.5 消费方接线：`main.rs`（`mod assets;`）、`shell/mod.rs`（use/构造/`ShellParts.tree`→`asset_view`）、`app.rs`（字段、`notify_panels`、注册点、测试 import）、`property_detail_manager/` 3 处 `AssetKind` import；删除 `src/tree/`、`src/asset_manager/` 残壳。验证：`cargo build` 通过；`rg "asset_manager::|crate::tree|TreePanel"` 全库归零
-- [ ] 1.6 组 1 验收：`cargo test --workspace` 全绿且 **268 passed / 0 failed / 0 warnings** 与基线逐数对账；`cargo clippy --all-targets` 干净；新增/迁移函数中文 doc 注释（功能/输入/输出）齐全。验证：命令输出对账 + 组 1 独立 commit
+- [x] 1.1 建 `src/assets/`：`mod.rs`（模块文档 + 导出伞）、`dto.rs`→`state.rs` 平移并改名 DTO `AssetView`→`AssetState`（含 `find_kind` 形参改 `state`）。验证：`cargo build` 通过；`rg "AssetView::(Empty|Degraded|Forest)"` 全库归零
+- [x] 1.2 trait 定义平移 `src/assets/traits.rs`（旧名暂留，design D6）；`manager.rs`→`src/assets/manager.rs` 并改 `view()`→`state()`，测试外提 `manager_tests.rs`。验证：`cargo build` 通过；`rg "fn view\(" src/assets/` 归零
+- [x] 1.3 `tree/mod.rs`→`src/assets/panel.rs`（`TreePanel`→`AssetView`、`last_synced: Option<AssetState>`），测试外提 `panel_tests.rs`（**只改 use 路径，断言零改写**）。验证：`cargo build` 通过；`rg "TreePanel"` 全库归零
+- [x] 1.4 枚举实现归位 `project_model/enumerate.rs`：`FileEnumerator`/`ModuleEnumerator`/`ProjectEnumerator`、`scan_root`/`scan_dir` 与 impl 块整体平移，`FileFilter` 引用改项目内。验证：`cargo build` 通过；`rg "FileFilter" src/assets/` 归零
+- [x] 1.5 消费方接线：`main.rs`（`mod assets;`）、`shell/mod.rs`（use/构造/`ShellParts.tree`→`asset_view`）、`app.rs`（字段、`notify_panels`、注册点、测试 import）、`property_detail_manager/` 3 处 `AssetKind` import；删除 `src/tree/`、`src/asset_manager/` 残壳。验证：`cargo build` 通过；`rg "asset_manager::|crate::tree|TreePanel"` 全库归零
+- [x] 1.6 组 1 验收：`cargo test --workspace` 全绿且 **268 passed / 0 failed / 0 warnings** 与基线逐数对账；`cargo clippy --all-targets` 干净；新增/迁移函数中文 doc 注释（功能/输入/输出）齐全。验证：命令输出对账 + 组 1 独立 commit
 
 ## 2. 边界收紧 Level 2（design D2–D4）
 

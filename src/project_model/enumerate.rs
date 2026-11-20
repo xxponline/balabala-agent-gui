@@ -12,39 +12,16 @@
 //! 逐条目无序 OR 求值 — 任一命中即排除, 目录命中即减支。
 //! 扫描体 (符号链接不跟随 / 排序) 自旧 `filetree` 平移, 语义逐字。
 
-use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
 
 use gpui_kit::BackgroundExecutor;
 
-use crate::project_model::filter::FileFilter;
-use crate::project_model::{Module, Project};
+use super::filter::FileFilter;
+use super::{Module, Project};
 
-use super::dto::{AssetKind, AssetNode, project_id};
-
-/// 异步枚举结果的盒装 future (BoxFuture 别名; 零新依赖)。
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
-/// 可枚举资产的实体 (Project / Module)。
-///
-/// 链上不携带过滤输入 — filter 由 Project 在枚举需要 Module 时
-/// 构建并注入 (design D2/D8), 所有输入从 `root` 自身推导。
-pub trait AssetEnumeratable {
-    fn enumerator(&self) -> Box<dyn AssetEnumerator>;
-}
-
-/// 资产枚举器: 异步产出该实体的完整资产子树。
-///
-/// `bg` 供阻塞 fs 工作丢后台执行器; future 为 `'static`, 由 manager 在
-/// 自己的 spawn 里驱动 (design D2: 一次 spawn 内组装, 原子 land)。
-pub trait AssetEnumerator: Send {
-    fn enumerate(
-        self: Box<Self>,
-        bg: BackgroundExecutor,
-    ) -> BoxFuture<'static, Result<AssetNode, String>>;
-}
+use crate::assets::state::{AssetKind, AssetNode, project_id};
+use crate::assets::traits::{AssetEnumeratable, AssetEnumerator, BoxFuture};
 
 /// 标准文件资产枚举器 (单独实现): 保存注入的 filter 列表
 /// (design D2), 从根目录递归枚举、逐条目过滤减支。

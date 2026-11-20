@@ -24,10 +24,9 @@ use crate::service_layer::CtrlOp;
 use agent_service::terminal::{AgentTerminal, TerminalCopy, TerminalTab};
 use crate::property_detail_manager::{OpenObject, active_center_panel_id, handler_for};
 use crate::shell;
-use crate::asset_manager::AssetManager;
+use crate::assets::{AssetManager, AssetView};
 use crate::project_model::{self, MarkerStatus, WorkspaceModel};
 use crate::sidebar::{SidebarEvent, SidebarPanel};
-use crate::tree::TreePanel;
 use crate::workspace::history::History;
 use crate::workspace::Workspace;
 
@@ -64,7 +63,7 @@ pub struct TerminalApp {
     /// 终端面板实体 (4.1; 焦点在其内, 一步切焦点/步骤 5 进 DockArea 中心)
     pub terminal: Entity<AgentTerminal>,
     /// 文件树面板实体 (right-dock-file-tree; notify 转发名单成员)
-    pub tree: Entity<TreePanel>,
+    pub asset_view: Entity<AssetView>,
     /// 右槽数据服务层 (asset-manager-right-dock D1): 面板读视图/代数,
     /// app 钩子做注册与刷新
     pub asset_manager: Entity<AssetManager>,
@@ -156,7 +155,7 @@ impl TerminalApp {
             dock_area,
             sidebar,
             terminal,
-            tree,
+            asset_view,
         } = shell::build(weak_app.clone(), window, cx);
         // 右槽数据的服务层 (asset-manager-right-dock D1): 面板经 app 读它
         let asset_manager = cx.new(|cx| AssetManager::new(weak_app, cx));
@@ -196,7 +195,7 @@ impl TerminalApp {
             dock_area,
             sidebar,
             terminal,
-            tree,
+            asset_view,
             asset_manager,
             service_layer,
         };
@@ -816,12 +815,12 @@ impl TerminalApp {
     pub(crate) fn notify_panels(&self, cx: &mut Context<Self>) {
         let sidebar = self.sidebar.clone();
         let terminal = self.terminal.clone();
-        let tree = self.tree.clone();
+        let asset_view = self.asset_view.clone();
         cx.defer(move |cx| {
             sidebar.update(cx, |_, cx| cx.notify());
             terminal.update(cx, |_, cx| cx.notify());
             // 树面板不是裸 notify: 要走"根比对→按需重扫→同步 TreeState"
-            tree.update(cx, |panel, cx| panel.on_data_changed(cx));
+            asset_view.update(cx, |panel, cx| panel.on_data_changed(cx));
         });
     }
 
@@ -1812,7 +1811,7 @@ mod tests {
     //  其决策点已拆成纯函数/同步方法被下面测试覆盖。
 
     use super::{GateDecision, OpenProbe, switch_gate};
-    use crate::asset_manager::{AssetKind, AssetView, project_id};
+    use crate::assets::{AssetKind, AssetState, project_id};
     use crate::project_model::{self, Project, SolutionItem, WorkspaceModel};
     use crate::workspace::history::History;
 
@@ -2624,8 +2623,8 @@ mod tests {
         cx.run_until_parked();
         cx.update(|cx| {
             let app = app_entity.read(cx);
-            let view = app.asset_manager.read(cx).view();
-            let AssetView::Forest { nodes, .. } = &view else {
+            let view = app.asset_manager.read(cx).state();
+            let AssetState::Forest { nodes, .. } = &view else {
                 panic!("应注册落树, got {view:?}")
             };
             assert_eq!(nodes.len(), 1);
@@ -2647,7 +2646,7 @@ mod tests {
         // 零 solution → 空视图
         cx.update(|cx| {
             let app = app_entity.read(cx);
-            assert_eq!(app.asset_manager.read(cx).view(), AssetView::Empty);
+            assert_eq!(app.asset_manager.read(cx).state(), AssetState::Empty);
         });
 
         let pdir = ws.join("bar");
@@ -2660,8 +2659,8 @@ mod tests {
         cx.run_until_parked();
         cx.update(|cx| {
             let app = app_entity.read(cx);
-            let view = app.asset_manager.read(cx).view();
-            let AssetView::Forest { nodes, .. } = &view else {
+            let view = app.asset_manager.read(cx).state();
+            let AssetState::Forest { nodes, .. } = &view else {
                 panic!("增量注册后应落树, got {view:?}")
             };
             assert_eq!(nodes.len(), 1);
@@ -2690,7 +2689,7 @@ mod tests {
         cx.run_until_parked();
         cx.update(|cx| {
             let app = app_entity.read(cx);
-            let AssetView::Forest { nodes, .. } = app.asset_manager.read(cx).view() else {
+            let AssetState::Forest { nodes, .. } = app.asset_manager.read(cx).state() else {
                 panic!("ws1 应落树")
             };
             assert_eq!(nodes[0].id, project_id(&one));
@@ -2701,7 +2700,7 @@ mod tests {
         cx.update(|cx| {
             let app = app_entity.read(cx);
             assert_eq!(app.workspace.as_ref().unwrap().path, ws2);
-            let AssetView::Forest { nodes, .. } = app.asset_manager.read(cx).view() else {
+            let AssetState::Forest { nodes, .. } = app.asset_manager.read(cx).state() else {
                 panic!("ws2 应落树")
             };
             assert_eq!(nodes.len(), 1, "只剩 ws2 的注册");

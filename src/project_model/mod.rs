@@ -9,6 +9,7 @@
 //!
 //! 行为契约: openspec/specs/project-model/spec.md。
 
+pub mod enumerate;
 pub mod files;
 pub mod filter;
 pub mod project;

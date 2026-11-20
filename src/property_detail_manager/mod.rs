@@ -19,7 +19,7 @@ use gpui_kit::component::dock::DockPlacement;
 use gpui_kit::{Context, Window};
 
 use crate::app::TerminalApp;
-use crate::asset_manager::AssetKind;
+use crate::assets::AssetKind;
 use editor_panel::RustViewerHandler;
 use md_panel::MarkdownViewerHandler;
 

@@ -1,4 +1,4 @@
-//! asset_manager 的中立 DTO — 不含任何 gpui 类型, 可跨面板/服务边界。
+//! assets 包的中立 DTO — 不含任何 gpui 类型, 可跨面板/服务边界。
 //!
 //! 由旧 `workspace_property_source` 的 DTO 家族改名迁入 (design D3)。
 //! **身份体系不变**: `AssetNode::id` 对目录/文件仍是绝对路径字符串 —
@@ -72,7 +72,7 @@ pub enum AssetEffect {
 
 /// manager 暴露给面板的视图状态 (design D5: 三态 + 原子落地)。
 #[derive(Clone, Debug, PartialEq)]
-pub enum AssetView {
+pub enum AssetState {
     /// 无工作区 / 零注册 — 面板显示空态。
     Empty,
     /// 模块根枚举失败 — 面板显示降级提示 (命名失败原因)。
@@ -83,7 +83,7 @@ pub enum AssetView {
 }
 
 /// 在视图中按 id 找资产种类 (打开钩子的 kind 依据; 纯遍历)。
-pub fn find_kind(view: &AssetView, id: &str) -> Option<AssetKind> {
+pub fn find_kind(view: &AssetState, id: &str) -> Option<AssetKind> {
     fn walk(node: &AssetNode, id: &str) -> Option<AssetKind> {
         if node.id == id {
             return Some(node.kind);
@@ -91,7 +91,7 @@ pub fn find_kind(view: &AssetView, id: &str) -> Option<AssetKind> {
         node.children.iter().find_map(|c| walk(c, id))
     }
     match view {
-        AssetView::Forest { nodes, .. } => nodes.iter().find_map(|n| walk(n, id)),
+        AssetState::Forest { nodes, .. } => nodes.iter().find_map(|n| walk(n, id)),
         _ => None,
     }
 }

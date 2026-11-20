@@ -6,14 +6,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
-mod asset_manager;
+mod assets;
 
 mod project_model;
 mod service_layer;
 mod property_detail_manager;
 mod shell;
 mod sidebar;
-mod tree;
 mod ui;
 mod workspace;
 
