@@ -22,8 +22,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// drain 循环拍距 (design D5: 与既有 50ms 宿主泵同相位)。
-const DRAIN_INTERVAL_MS: u64 = 50;
+/// drain 循环拍距。**25ms** (三次回改, 长文滚动验收驱动): 补采窗 (48ms)
+/// 关闭后的遗留帧原本要等 50ms 主 tick — 单次刻意滚动 (滚一下停一下)
+/// 恰好落这档, 实测滚动 52-77ms 里最多 50ms 是在等相位; 减半到 25ms。
+/// 成本: 每秒 40 次 µs 级空 drain (无字节不推帧) <0.1% CPU;
+/// 自发输出双相位同步 50+50≤100 → 25+50≤75ms (design D5)。
+const DRAIN_INTERVAL_MS: u64 = 25;
 /// 循环自寻址 kind (service 内部, GUI 不发)。
 const KIND_DRAIN_TICK: &str = "drain.tick";
 /// 循环自寻址载荷 (空; dispatch 按 kind 分发)。
@@ -1137,7 +1141,8 @@ mod tests {
             PathBuf::from("/p"),
             Box::new(StubSession::new(Arc::clone(&script))),
         );
-        assert!(svc.start().is_ok());
+        // 不 start(): 本测只验证"输入→补采"链 (主 tick 现为 25ms,
+        // 起了会混进窗口污染精确拍数)。
 
         svc.dispatch(tell_env(
             KIND_INPUT_TEXT,
@@ -1146,8 +1151,9 @@ mod tests {
                 text: "x".into(),
             }),
         ));
-        // 真实时钟推进: 补采在 8..48ms 六拍发, 主 tick 首拍 >60ms
-        rt.block_on(async { tokio::time::sleep(Duration::from_millis(60)).await });
+        // 真实时钟推进: 补采在 8..48ms 六拍发 — 窗口取 100ms (末拍 48ms
+        // + 调度抖动的余量; 主循环未起, 窗内不会混入杂拍, ==6 确定)
+        rt.block_on(async { tokio::time::sleep(Duration::from_millis(100)).await });
         let ticks = msg
             .sent()
             .iter()

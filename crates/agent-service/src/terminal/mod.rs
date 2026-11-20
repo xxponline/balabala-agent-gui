@@ -1805,7 +1805,9 @@ impl AgentTerminal {
                 PARSER_SCROLLBACK,
             )
         });
+        let __t = std::time::Instant::now();
         parser.process(bytes);
+        rate_log::note_feed(__t.elapsed().as_nanos() as u64, bytes.len());
         cx.notify();
     }
 
@@ -1864,6 +1866,7 @@ impl AgentTerminal {
         }
         let keys = keystroke_to_keyevents(&ks.key, ks.key_char.as_deref());
         if !keys.is_empty() {
+            rate_log::note_input();
             for key in keys {
                 self.bus.send_key(cx, key);
             }
@@ -1887,6 +1890,7 @@ impl AgentTerminal {
         else {
             return; // 未凑满一行 (余数已携带)
         };
+        rate_log::note_input();
         self.bus.send_wheel(cx, lines);
     }
 
@@ -2164,8 +2168,147 @@ impl Focusable for AgentTerminal {
     }
 }
 
+/// AgentTerminal 刷新率日志（验收: 滚动延迟归因, 用户点名要）——
+/// 每秒一行、仅窗口内有活动时打印（空闲静默, 与 `[grid]` 同级调试输出）。
+/// 滚动手感差时看三处: render/s 是否被压低、feed/s 是否跟上滚轮节奏、
+/// `since_feed` 是否持续偏大（帧断流 = 上游重绘慢, 帧到但 render 低 = 绘制慢）。
+mod rate_log {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    static START: OnceLock<Instant> = OnceLock::new();
+    static LAST_PRINT: Mutex<Option<Instant>> = Mutex::new(None);
+    static RENDER_N: AtomicU64 = AtomicU64::new(0);
+    static RENDER_NS: AtomicU64 = AtomicU64::new(0);
+    static RENDER_MAX: AtomicU64 = AtomicU64::new(0);
+    static FEED_N: AtomicU64 = AtomicU64::new(0);
+    static FEED_NS: AtomicU64 = AtomicU64::new(0);
+    static FEED_MAX: AtomicU64 = AtomicU64::new(0);
+    static FEED_BYTES: AtomicU64 = AtomicU64::new(0);
+    static FEED_MAX_BYTES: AtomicU64 = AtomicU64::new(0);
+    static LAST_FEED_MS: AtomicU64 = AtomicU64::new(0);
+    static LAST_PAINTED_FEED_MS: AtomicU64 = AtomicU64::new(0);
+    static LAG_N: AtomicU64 = AtomicU64::new(0);
+    static LAG_SUM: AtomicU64 = AtomicU64::new(0);
+    static LAG_MAX: AtomicU64 = AtomicU64::new(0);
+    static INPUT_AT_MS: AtomicU64 = AtomicU64::new(u64::MAX); // MAX = 无在途输入
+    static ECHO_N: AtomicU64 = AtomicU64::new(0);
+    static ECHO_SUM: AtomicU64 = AtomicU64::new(0);
+    static ECHO_MAX: AtomicU64 = AtomicU64::new(0);
+    static ECHO_MISS: AtomicU64 = AtomicU64::new(0);
+
+    fn now_ms() -> u64 {
+        START.get_or_init(Instant::now).elapsed().as_millis() as u64
+    }
+
+    /// 面板发出一次输入 (键/滚轮) — 关掉它到下一帧的 echo 区间。
+    pub fn note_input() {
+        INPUT_AT_MS.store(now_ms(), Ordering::Relaxed);
+    }
+
+    pub fn note_render(ns: u64) {
+        RENDER_N.fetch_add(1, Ordering::Relaxed);
+        RENDER_NS.fetch_add(ns, Ordering::Relaxed);
+        RENDER_MAX.fetch_max(ns, Ordering::Relaxed);
+        // paint_lag: 本次绘制若覆盖了"尚未画过的新帧", 记帧到达→画出的延迟
+        // (只看最新帧 — 用户看到的就是最新帧; 无新帧的绘制不计)
+        let f = LAST_FEED_MS.load(Ordering::Relaxed);
+        let p = LAST_PAINTED_FEED_MS.load(Ordering::Relaxed);
+        if f > p {
+            let lag = now_ms().saturating_sub(f);
+            LAG_N.fetch_add(1, Ordering::Relaxed);
+            LAG_SUM.fetch_add(lag, Ordering::Relaxed);
+            LAG_MAX.fetch_max(lag, Ordering::Relaxed);
+            LAST_PAINTED_FEED_MS.store(f, Ordering::Relaxed);
+        }
+        maybe_print();
+    }
+
+    pub fn note_feed(ns: u64, bytes: usize) {
+        FEED_N.fetch_add(1, Ordering::Relaxed);
+        FEED_NS.fetch_add(ns, Ordering::Relaxed);
+        FEED_MAX.fetch_max(ns, Ordering::Relaxed);
+        FEED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        FEED_MAX_BYTES.fetch_max(bytes as u64, Ordering::Relaxed);
+        let t = now_ms();
+        LAST_FEED_MS.store(t, Ordering::Relaxed);
+        let iat = INPUT_AT_MS.swap(u64::MAX, Ordering::Relaxed);
+        if iat != u64::MAX {
+            let echo = t.saturating_sub(iat);
+            if echo <= 300 {
+                ECHO_N.fetch_add(1, Ordering::Relaxed);
+                ECHO_SUM.fetch_add(echo, Ordering::Relaxed);
+                ECHO_MAX.fetch_max(echo, Ordering::Relaxed);
+            } else {
+                // 超 300ms 未回帧: 边界滚动/无效果键 (无重绘, 伪影) 或
+                // pi 极慢重绘 — 单独计数, 不污染延迟统计
+                ECHO_MISS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        maybe_print();
+    }
+
+    fn maybe_print() {
+        let mut last = match LAST_PRINT.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let now = Instant::now();
+        if let Some(lp) = *last {
+            if now.duration_since(lp) < Duration::from_secs(1) {
+                return;
+            }
+        }
+        *last = Some(now);
+        let (rn, rs, _rmax) = (
+            RENDER_N.swap(0, Ordering::Relaxed),
+            RENDER_NS.swap(0, Ordering::Relaxed),
+            RENDER_MAX.swap(0, Ordering::Relaxed),
+        );
+        let (fn_, _fs, _fmax, fb, fbmax) = (
+            FEED_N.swap(0, Ordering::Relaxed),
+            FEED_NS.swap(0, Ordering::Relaxed),
+            FEED_MAX.swap(0, Ordering::Relaxed),
+            FEED_BYTES.swap(0, Ordering::Relaxed),
+            FEED_MAX_BYTES.swap(0, Ordering::Relaxed),
+        );
+        let last_feed = LAST_FEED_MS.load(Ordering::Relaxed);
+        let since = now_ms().saturating_sub(last_feed);
+        let (ln, ls, lmax) = (
+            LAG_N.swap(0, Ordering::Relaxed),
+            LAG_SUM.swap(0, Ordering::Relaxed),
+            LAG_MAX.swap(0, Ordering::Relaxed),
+        );
+        let (en, es, emax, miss) = (
+            ECHO_N.swap(0, Ordering::Relaxed),
+            ECHO_SUM.swap(0, Ordering::Relaxed),
+            ECHO_MAX.swap(0, Ordering::Relaxed),
+            ECHO_MISS.swap(0, Ordering::Relaxed),
+        );
+        if rn == 0 && fn_ == 0 && en == 0 {
+            return; // 静默窗口 (纯闲置)
+        }
+        eprintln!(
+            "[term-rate] 输入→帧 avg={}ms max={}ms (n={} miss={}) | 帧→画 avg={}ms max={}ms (n={}) | feed/s={fn_} render/s={rn} | 帧KB avg {:.1} max {:.1} | since_feed={}ms | render_cost avg {:.1}ms",
+            if en > 0 { es / en } else { 0 },
+            emax,
+            en,
+            miss,
+            if ln > 0 { ls / ln } else { 0 },
+            lmax,
+            ln,
+            if fn_ > 0 { fb as f64 / fn_ as f64 / 1024.0 } else { 0.0 },
+            fbmax as f64 / 1024.0,
+            since,
+            if rn > 0 { rs as f64 / rn as f64 / 1e6 } else { 0.0 },
+        );
+    }
+}
+
 impl Render for AgentTerminal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let __t = std::time::Instant::now();
         // 面板实体句柄: 量测 defer 同步本地 parser + IME 输入挂载 (task 3.4/4.1)
         let panel_entity = cx.entity();
         // 哨兵 (task 3.1, spec: Selection cleared when its content changes):
@@ -2214,7 +2357,7 @@ impl Render for AgentTerminal {
         // defer 用快照: render 期已新鲜, paint 后不再碰实体状态 (除 panel 自身)
         let view_snapshot = self.view.clone();
         let bus = Arc::clone(&self.bus);
-        div()
+        let __el = div()
             .id("terminal-pane")
             .test_support() // 观测锚点 (无 test-support 特性时为 no-op)
             // 尺寸策略 (DockArea 装配后二分实测):
@@ -2447,7 +2590,9 @@ impl Render for AgentTerminal {
                         )
                 }
             })
-            .into_any_element()
+            .into_any_element();
+        rate_log::note_render(__t.elapsed().as_nanos() as u64);
+        __el
     }
 }
 
