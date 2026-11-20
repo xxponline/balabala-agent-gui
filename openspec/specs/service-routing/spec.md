@@ -29,31 +29,33 @@ message into dead letters as `TypeMismatch`.
 - **THEN** no handler runs, the message lands in dead letters, and the
   failure is recorded as `TypeMismatch`
 
-### Requirement: Two-level addressing
+### Requirement: Instance and service-name addressing
 
 Messages SHALL be addressable by instance (`Route::Instance(id)`) or by
-service name with a policy (`Route::Service(name, policy)`). `Direct(id)`
-SHALL carry an instance id and assert that the instance belongs to the named
-service, refusing delivery otherwise. `Any` SHALL select one `available`
-instance of the named service.
+service name (`Route::Service(name)`). The service-name form SHALL carry no
+selection policy: the name SHALL resolve to the unique loaded instance of
+that contract. Resolving a name whose service is not loaded or whose instance
+is not `available` SHALL fail exactly as specified by the fail-fast delivery
+requirement — there are no candidate instances to choose among and no hidden
+buffering.
 
 #### Scenario: Instance direct delivery
 
 - **WHEN** a participant sends to `Route::Instance(id)` of a loaded instance
 - **THEN** the envelope is delivered to that instance's mailbox
 
-#### Scenario: Direct with wrong service name is refused
+#### Scenario: Service name resolves to the unique instance
 
-- **WHEN** a participant sends to `Route::Service(name, Direct(id))` where
-  instance `id` does not belong to service `name`
-- **THEN** delivery is refused with a routing error instead of reaching the
-  instance
+- **WHEN** a participant sends to `Route::Service(name)` for a loaded,
+  `available` service
+- **THEN** the envelope is delivered to that contract's single instance
 
-#### Scenario: Any picks an available instance
+#### Scenario: Service name with no loaded instance fails fast
 
-- **WHEN** a service has multiple instances and a participant sends to
-  `Route::Service(name, Any)`
-- **THEN** the envelope is delivered to one `available` instance
+- **WHEN** a participant sends to `Route::Service(name)` whose service has no
+  loaded instance
+- **THEN** delivery fails immediately with a routing error instead of
+  selecting a candidate or holding the envelope
 
 ### Requirement: Request/reply with router-held timeouts
 
