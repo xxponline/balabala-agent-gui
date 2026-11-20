@@ -1674,7 +1674,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.3",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5787,7 +5787,7 @@ dependencies = [
 [[package]]
 name = "pi-shell-rs"
 version = "0.1.0"
-source = "git+ssh://git@github.com/xxponline/pi-shell-rs.git#538db8fc68641734410b1092d226a6e10b1f9d3a"
+source = "git+ssh://git@github.com/xxponline/pi-shell-rs.git#319dd5b670ea0d5b9f1a6e820ed1f951b4465809"
 dependencies = [
  "crossterm",
  "pulldown-cmark",
@@ -9766,7 +9766,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
