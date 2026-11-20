@@ -1,6 +1,6 @@
 //! Catalog：服务条目表（design D8）——启动静态扫描 + 显式 reload，无 watch。
 
-use service_core::{ServiceFactory, ServiceName};
+use service_core::{ContractId, ServiceFactory, ServiceName};
 use std::path::PathBuf;
 
 /// 条目元数据（v1：描述；abi 版本经 DLL 指纹/符号在 load 时校验）。
@@ -39,22 +39,39 @@ pub struct ServiceDescriptor {
     pub name: ServiceName,
     pub origin: ServiceOrigin,
     pub meta: ServiceMeta,
+    /// 契约身份（change `singleton-per-contract`, design D1）：内部服务注册
+    /// 即携带；DLL 条目扫描期未知为 `None`，装载期经契约符号+宿主注册表
+    /// 解析后落到 Participant（拒载门的占用判据）。
+    pub contract: Option<ContractId>,
 }
 
 impl ServiceDescriptor {
-    pub fn internal(name: impl Into<ServiceName>, factory: ServiceFactory) -> Self {
+    /// 内部服务条目：注册即声明契约身份（`internal` 始终 `Some`）。
+    ///
+    /// 功能：构造 `Internal` 来源条目并携带契约身份。
+    /// 输入：`name` — 服务名（Catalog 键）；`factory` — 编译期工厂；
+    ///       `contract` — 宿主铸造的契约 marker 身份。
+    /// 输出：可直接插入 Catalog 的描述符。
+    pub fn internal(name: impl Into<ServiceName>, factory: ServiceFactory, contract: ContractId) -> Self {
         ServiceDescriptor {
             name: name.into(),
             origin: ServiceOrigin::Internal(factory),
             meta: ServiceMeta::default(),
+            contract: Some(contract),
         }
     }
 
+    /// DLL 产物条目：扫描期无契约（`None`），装载期解析。
+    ///
+    /// 功能：构造 `Dll` 来源条目。
+    /// 输入：`name` — 服务名；`path` — 产物路径。
+    /// 输出：描述符，`contract = None`（待 load 经契约符号解析）。
     pub fn dll(name: impl Into<ServiceName>, path: PathBuf) -> Self {
         ServiceDescriptor {
             name: name.into(),
             origin: ServiceOrigin::Dll(path),
             meta: ServiceMeta::default(),
+            contract: None,
         }
     }
 }
@@ -191,7 +208,8 @@ mod tests {
                 std::ptr::null()
             }
         }
-        let desc = ServiceDescriptor::internal("fake", a_service as ServiceFactory);
+        struct M;
+        let desc = ServiceDescriptor::internal("fake", a_service as ServiceFactory, service_core::ContractId::of::<M>());
         assert_eq!(desc.name.as_str(), "fake");
         match desc.origin {
             ServiceOrigin::Internal(f) => {
@@ -205,7 +223,8 @@ mod tests {
     #[test]
     fn remove_and_lookup() {
         let mut cat = Catalog::new();
-        cat.insert(ServiceDescriptor::internal("x", a_service as ServiceFactory));
+        struct M2;
+        cat.insert(ServiceDescriptor::internal("x", a_service as ServiceFactory, service_core::ContractId::of::<M2>()));
         assert!(cat.contains(&"x".into()));
         assert!(cat.remove(&"x".into()).is_some());
         assert!(cat.get(&"x".into()).is_none());

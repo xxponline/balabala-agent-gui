@@ -508,7 +508,8 @@ impl AgentService {
 }
 
 /// 内部服务工厂（`ServiceOrigin::Internal`；GUI bootstrap
-/// `register_internal("agent", agent_service_factory)` 装载）。
+/// `register_internal("agent", agent_service_factory, ContractId::of::<AgentContract>())`
+/// 装载）。
 pub fn agent_service_factory(ctx: ServiceCtx) -> Box<dyn Service> {
     Box::new(AgentService::new(ctx))
 }

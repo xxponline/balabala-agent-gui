@@ -48,6 +48,7 @@ fn silent_instance(
     mgr.instances.lock().unwrap().insert(Participant::service_instance(
         id,
         service.into(),
+        None,
         state,
         tx,
     ));
@@ -61,6 +62,7 @@ fn spawn_echo_responder(mgr: &ServiceManager, service: &str) -> InstanceId {
     mgr.instances.lock().unwrap().insert(Participant::service_instance(
         id,
         service.into(),
+        None,
         ServiceState::Available,
         tx,
     ));
@@ -449,6 +451,13 @@ impl Service for AskEcho {
     }
 }
 
+/// 契约标记（test）：echo 服务的类身份。
+struct EchoContract;
+/// 契约标记（test）：flaky 服务的类身份。
+struct FlakyContract;
+/// 契约标记（test）：bomb 服务的类身份。
+struct BombContract;
+
 fn echo_factory(ctx: ServiceCtx) -> Box<dyn Service> {
     Box::new(AskEcho { ctx })
 }
@@ -479,7 +488,7 @@ fn flaky_factory(_ctx: ServiceCtx) -> Box<dyn Service> {
 #[test]
 fn task_3_3_internal_load_reaches_available_and_serves_asks() {
     let mgr = test_manager();
-    mgr.register_internal("echo", echo_factory).unwrap();
+    mgr.register_internal("echo", echo_factory, service_core::ContractId::of::<EchoContract>()).unwrap();
 
     let id = mgr.load(&"echo".into()).unwrap();
     // 创建即 loading; driver init 极快, 断言容忍已翻转 available
@@ -510,7 +519,7 @@ fn task_3_3_internal_load_reaches_available_and_serves_asks() {
 fn task_3_3_missing_catalog_entry_is_rejected() {
     // 内部服务: Catalog 查无 → 拒 (这同时是 task 3.1 的第 4 验证断言)
     let mgr = test_manager();
-    mgr.register_internal("echo", echo_factory).unwrap();
+    mgr.register_internal("echo", echo_factory, service_core::ContractId::of::<EchoContract>()).unwrap();
     assert!(mgr.has_service(&"echo".into()));
 
     let err = mgr.load(&"missing".into()).expect_err("Catalog 查无 → 拒");
@@ -534,7 +543,7 @@ fn task_3_3_missing_catalog_entry_is_rejected() {
 fn task_3_3_init_failure_lands_in_error_and_retry_recovers() {
     let mgr = test_manager();
     FLAKY_FAIL.store(true, Ordering::SeqCst);
-    mgr.register_internal("flaky", flaky_factory).unwrap();
+    mgr.register_internal("flaky", flaky_factory, service_core::ContractId::of::<FlakyContract>()).unwrap();
 
     let id = mgr.load(&"flaky".into()).unwrap();
     assert!(
@@ -571,7 +580,7 @@ fn task_3_3_init_failure_lands_in_error_and_retry_recovers() {
 #[test]
 fn task_3_3_disable_enable_round_trip_through_loader() {
     let mgr = test_manager();
-    mgr.register_internal("echo", echo_factory).unwrap();
+    mgr.register_internal("echo", echo_factory, service_core::ContractId::of::<EchoContract>()).unwrap();
     let id = mgr.load(&"echo".into()).unwrap();
     assert!(wait_until(
         || mgr.supervisor().state_of(id) == Some(ServiceState::Available),
@@ -607,7 +616,7 @@ fn task_3_3_disable_enable_round_trip_through_loader() {
 #[test]
 fn task_3_3_unload_removes_instance_but_never_dlclose() {
     let mgr = test_manager();
-    mgr.register_internal("echo", echo_factory).unwrap();
+    mgr.register_internal("echo", echo_factory, service_core::ContractId::of::<EchoContract>()).unwrap();
     let id = mgr.load(&"echo".into()).unwrap();
     assert!(wait_until(
         || mgr.supervisor().state_of(id) == Some(ServiceState::Available),
@@ -635,38 +644,152 @@ fn task_3_3_unload_removes_instance_but_never_dlclose() {
 }
 
 #[test]
-fn task_3_3_multi_instance_internal_service() {
+fn same_contract_under_two_names_refused() {
     let mgr = test_manager();
-    mgr.register_internal("echo", echo_factory).unwrap();
+    mgr.register_internal("echo", echo_factory, service_core::ContractId::of::<EchoContract>()).unwrap();
+    // 同契约异名可进 Catalog，装载被单实例强制拦截（spec: 同契约异名拒载）
+    mgr.register_internal("echo.alias", echo_factory, service_core::ContractId::of::<EchoContract>()).unwrap();
+    let _a = mgr.load(&"echo".into()).unwrap();
+    let err = mgr
+        .load(&"echo.alias".into())
+        .expect_err("同契约异名装载必须拒载");
+    match &err {
+        crate::loader::LoadError::ContractAlreadyLoaded { loaded_name, requested_name } => {
+            assert_eq!(loaded_name.as_str(), "echo", "报错点名占用方");
+            assert_eq!(requested_name.as_str(), "echo.alias", "报错点名请求方");
+        }
+        other => panic!("应是 ContractAlreadyLoaded, got {other:?}"),
+    }
+    assert_eq!(mgr.instance_count(), 1, "实例表零新增");
+}
+
+/// 2.3/spec 场景1: 同名二次装载显式拒载——loading/offline 任一状态均占位。
+///
+/// 功能：断言占用与状态无关的拒载语义与零写入。
+/// 输入：无。
+/// 输出：断言通过。
+#[test]
+fn second_load_refused_while_instance_exists() {
+    let mgr = test_manager();
+    mgr.register_internal("echo", echo_factory, service_core::ContractId::of::<EchoContract>()).unwrap();
     let a = mgr.load(&"echo".into()).unwrap();
-    let b = mgr.load(&"echo".into()).unwrap();
-    assert_ne!(a, b, "同服务两实例");
+    // loading 期即占位：立即二次装载拒载
+    let err = mgr.load(&"echo".into()).expect_err("同名二次装载必须拒载");
+    match &err {
+        crate::loader::LoadError::ContractAlreadyLoaded { loaded_name, requested_name } => {
+            assert_eq!(loaded_name.as_str(), "echo");
+            assert_eq!(requested_name.as_str(), "echo");
+        }
+        other => panic!("应是 ContractAlreadyLoaded, got {other:?}"),
+    }
+    assert_eq!(mgr.instance_count(), 1, "实例表零新增");
+    // offline 同样占位
     assert!(wait_until(
-        || {
-            mgr.supervisor().state_of(a) == Some(ServiceState::Available)
-                && mgr.supervisor().state_of(b) == Some(ServiceState::Available)
-        },
+        || mgr.supervisor().state_of(a) == Some(ServiceState::Available),
         Duration::from_secs(2)
     ));
+    mgr.disable(a).unwrap();
+    let err2 = mgr.load(&"echo".into()).expect_err("offline 占位同样拒载");
+    assert!(matches!(err2, crate::loader::LoadError::ContractAlreadyLoaded { .. }));
+}
 
-    // Any 挑一个 available 实例
-    let env = Envelope::new(
-        Route::Service("echo".into(), SelectPolicy::Any),
-        caller_addr(&mgr),
-        "fanout",
-        Payload::new(()),
-    );
-    let reply = futures::executor::block_on(mgr.call(env)).expect("Any 可用");
-    assert!(reply.downcast::<String>().is_some());
+/// 2.3/spec 场景: error 状态占位——crash 落 error 后二次装载仍拒载
+/// （spec 描述句“任何状态（含 error）都占位”的直接证据）。
+///
+/// 功能：断言 error 态不释放契约槽位。
+/// 输入：无。
+/// 输出：断言通过。
+#[test]
+fn error_state_still_occupies_contract_slot() {
+    // 局部崩溃服务（避免借用其它用例的局部工厂/全局开关，自包含）
+    struct Boom;
+    impl Service for Boom {
+        fn start(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn handle(&mut self, _env: Envelope) -> ServiceFuture<'_> {
+            panic!("service exploded");
+        }
+    }
+    fn boom_factory(_ctx: ServiceCtx) -> Box<dyn Service> {
+        Box::new(Boom)
+    }
+    struct BoomContract;
 
-    // Direct 断言: 实例属于该服务
-    let env = Envelope::new(
-        Route::Service("echo".into(), SelectPolicy::Direct(a)),
-        caller_addr(&mgr),
-        "direct",
-        Payload::new(()),
+    let mgr = test_manager();
+    mgr.register_internal("boom", boom_factory, service_core::ContractId::of::<BoomContract>()).unwrap();
+    let id = mgr.load(&"boom".into()).unwrap();
+    assert!(wait_until(
+        || mgr.supervisor().state_of(id) == Some(ServiceState::Available),
+        Duration::from_secs(2)
+    ));
+    // 打炸 → error
+    let env = Envelope::new(Route::Instance(id), caller_addr(&mgr), "boom", Payload::new(()));
+    mgr.tell(env).unwrap();
+    assert!(wait_until(
+        || mgr.supervisor().state_of(id) == Some(ServiceState::Error),
+        Duration::from_secs(3)
+    ));
+    let err = mgr.load(&"boom".into()).expect_err("error 态仍占位");
+    assert!(matches!(err, crate::loader::LoadError::ContractAlreadyLoaded { .. }));
+}
+
+/// 2.3/spec 场景3: 卸载释放契约槽位，可重新装载（库常驻语义不变）。
+///
+/// 功能：断言 unload 后契约可再次装载。
+/// 输入：无。
+/// 输出：断言通过。
+#[test]
+fn unload_releases_contract_slot_for_reload() {
+    let mgr = test_manager();
+    mgr.register_internal("echo", echo_factory, service_core::ContractId::of::<EchoContract>()).unwrap();
+    let a = mgr.load(&"echo".into()).unwrap();
+    mgr.unload(a).unwrap();
+    assert_eq!(mgr.instance_count(), 0, "卸载移出实例表");
+    let b = mgr.load(&"echo".into()).unwrap();
+    assert_ne!(a, b, "槽位释放后重新装载分配新 id");
+}
+
+/// 2.4/spec 场景: 内部服务装载携契约身份进实例表（同一 load 流）。
+///
+/// 功能：断言 internal 装载后实例表记录其契约身份。
+/// 输入：无。
+/// 输出：断言通过。
+#[test]
+fn internal_service_contract_reaches_instance_table() {
+    let mgr = test_manager();
+    mgr.register_internal("echo", echo_factory, service_core::ContractId::of::<EchoContract>()).unwrap();
+    let id = mgr.load(&"echo".into()).unwrap();
+    let table = mgr.instances.lock().unwrap();
+    assert_eq!(
+        table.contract_instance(service_core::ContractId::of::<EchoContract>()),
+        Some(id),
+        "内部服务装载携契约身份进表"
     );
-    futures::executor::block_on(mgr.call(env)).expect("Direct 命中");
+}
+
+/// 2.4/spec 场景: 两个不同契约的实例并存互不占位。
+///
+/// 功能：断言异契约双实例共存与各自索引。
+/// 输入：无。
+/// 输出：断言通过。
+#[test]
+fn distinct_contracts_load_side_by_side() {
+    let mgr = test_manager();
+    mgr.register_internal("echo", echo_factory, service_core::ContractId::of::<EchoContract>()).unwrap();
+    mgr.register_internal("flaky", flaky_factory, service_core::ContractId::of::<FlakyContract>()).unwrap();
+    let e = mgr.load(&"echo".into()).unwrap();
+    let f = mgr.load(&"flaky".into()).unwrap();
+    assert_eq!(mgr.instance_count(), 2, "异契约并存");
+    let table = mgr.instances.lock().unwrap();
+    assert_eq!(
+        table.contract_instance(service_core::ContractId::of::<EchoContract>()),
+        Some(e)
+    );
+    assert_eq!(
+        table.contract_instance(service_core::ContractId::of::<FlakyContract>()),
+        Some(f)
+    );
 }
 
 #[test]
@@ -685,7 +808,7 @@ fn task_3_4_driver_panic_reports_crash_without_auto_restart() {
     }
 
     let mgr = test_manager();
-    mgr.register_internal("bomb", bomb_factory).unwrap();
+    mgr.register_internal("bomb", bomb_factory, service_core::ContractId::of::<BombContract>()).unwrap();
     let id = mgr.load(&"bomb".into()).unwrap();
     assert!(wait_until(
         || mgr.supervisor().state_of(id) == Some(ServiceState::Available),

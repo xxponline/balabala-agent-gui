@@ -110,6 +110,9 @@ pub type DllServiceFactory = unsafe extern "C-unwind" fn(ServiceCtx) -> Box<dyn 
 pub const CREATE_SYMBOL: &[u8] = b"service_create";
 /// 插件必须导出的构建指纹符号名（`static &'static [u8]`，D8 指纹校验）。
 pub const FINGERPRINT_SYMBOL: &[u8] = b"SERVICE_CONTRACT_FINGERPRINT";
+/// 插件必须导出的契约名符号名（`static &'static [u8]`；change
+/// `singleton-per-contract` design D2——装载期读出后查宿主契约表解析身份）。
+pub const CONTRACT_NAME_SYMBOL: &[u8] = b"SERVICE_CONTRACT_NAME";
 
 #[cfg(test)]
 mod tests {
@@ -243,6 +246,7 @@ mod tests {
     fn abi_symbols_are_stable_contract_strings() {
         assert_eq!(CREATE_SYMBOL, b"service_create");
         assert_eq!(FINGERPRINT_SYMBOL, b"SERVICE_CONTRACT_FINGERPRINT");
+        assert_eq!(CONTRACT_NAME_SYMBOL, b"SERVICE_CONTRACT_NAME");
     }
 
     #[test]

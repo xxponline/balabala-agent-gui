@@ -12,12 +12,13 @@
 //! 任何现有模块。
 
 use agent_service::contract::{
-    CloseOk, ControlResult, CreateOk, FrameBytes, SelectOk, SessionView, SessionsChanged,
-    WatchReq, KIND_CONTROL_REPLY, KIND_FRAME_BYTES, KIND_SESSIONS_CHANGED, KIND_WATCH,
+    AgentContract, CloseOk, ControlResult, CreateOk, FrameBytes, SelectOk, SessionView,
+    SessionsChanged, WatchReq, KIND_CONTROL_REPLY, KIND_FRAME_BYTES, KIND_SESSIONS_CHANGED,
+    KIND_WATCH,
 };
 use service_manager::{
-    Corr, Envelope, InstanceId, Listener, Payload, Route, Service, ServiceCtx, ServiceFuture,
-    ServiceManager, ServiceState, StateChange, KIND_ROUTE_ERROR, KIND_STATE_CHANGE,
+    ContractId, Corr, Envelope, InstanceId, Listener, Payload, Route, Service, ServiceCtx,
+    ServiceFuture, ServiceManager, ServiceState, StateChange, KIND_ROUTE_ERROR, KIND_STATE_CHANGE,
 };
 use std::any::Any;
 use std::collections::HashMap;
@@ -152,13 +153,26 @@ pub struct ServiceLayer {
     agent_ready: bool,
 }
 
+/// core.fake 契约类标记（change `singleton-per-contract`, design D1）：
+/// 内部核心假服务的骨架类身份（零大小 marker，只承载 `ContractId`）。
+struct CoreFakeContract;
+
 impl ServiceLayer {
     /// 启动接线：扫描 `scan_dir`（= 设计中的 `plugins/` 落点）建 Catalog，
     /// 注册并装载核心假服务，注册 GUI mailbox、订阅其状态翻转。
     pub fn bootstrap(scan_dir: &Path) -> Result<Self, String> {
         let manager = ServiceManager::new(scan_dir).map_err(|e| format!("service layer: {e}"))?;
+        // 契约登记（change `singleton-per-contract`, design D2）：宿主契约表供
+        // DLL 装载期按契约符号解析（demo = 示例插件）；agent 为内部单例类
+        // 身份，自述登记（内部装载不经此表，登记保持契约名表完整）。
+        manager.register_contract("demo", ContractId::of::<contracts::demo::DemoContract>());
+        manager.register_contract("agent", ContractId::of::<AgentContract>());
         manager
-            .register_internal("core.fake", core_fake_factory)
+            .register_internal(
+                "core.fake",
+                core_fake_factory,
+                ContractId::of::<CoreFakeContract>(),
+            )
             .map_err(|e| format!("register core.fake: {e}"))?;
         let core_id = manager
             .load(&"core.fake".into())
@@ -171,7 +185,7 @@ impl ServiceLayer {
         #[cfg(test)]
         let factory: service_manager::ServiceFactory = gui_test_agent_factory;
         manager
-            .register_internal("agent", factory)
+            .register_internal("agent", factory, ContractId::of::<AgentContract>())
             .map_err(|e| format!("register agent: {e}"))?;
         let agent_id = manager
             .load(&"agent".into())
@@ -362,6 +376,19 @@ mod tests {
     use agent_service::contract::SelectReq;
     use service_manager::Address;
     use std::time::{Duration, Instant};
+
+    /// 1.2: demo 与 agent 契约 marker 类型身份互异（类判据不串味）。
+    ///
+    /// 功能：断言两个契约 marker 铸出的 `ContractId` 不同。
+    /// 输入：无。
+    /// 输出：断言通过。
+    #[test]
+    fn contract_markers_are_distinct() {
+        assert_ne!(
+            ContractId::of::<contracts::demo::DemoContract>(),
+            ContractId::of::<AgentContract>()
+        );
+    }
 
     fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;

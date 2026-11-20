@@ -38,6 +38,14 @@ pub enum LoadError {
     MissingSymbol { path: PathBuf, symbol: &'static str },
     /// 指纹符号不可读（非 UTF-8 等）。
     BadFingerprint { path: PathBuf, detail: String },
+    /// DLL 契约名不在宿主契约表（change `singleton-per-contract` design D2：
+    /// 显式拒载，绝不静默）。
+    UnknownContract { name: String, path: PathBuf },
+    /// 契约名符号不可读（非 UTF-8 等，镜像 `BadFingerprint`）。
+    BadContractName { path: PathBuf, detail: String },
+    /// 同契约已有实例（每契约恰一实例, spec Single-instance loading per
+    /// contract）：同名二次与异名同契约同路径拒载；携带占用方/请求方名字。
+    ContractAlreadyLoaded { loaded_name: ServiceName, requested_name: ServiceName },
     /// 工厂 panic（`C-unwind` 穿回宿主被接住——插件工厂不应 panic，脚手架文档有约定）。
     FactoryPanic,
     /// 工厂返回前的宿主侧错误（如服务名参数非法）。
@@ -58,6 +66,19 @@ impl std::fmt::Display for LoadError {
             LoadError::BadFingerprint { path, detail } => {
                 write!(f, "load: bad fingerprint symbol in {}: {detail}", path.display())
             }
+            LoadError::UnknownContract { name, path } => write!(
+                f,
+                "load: contract '{name}' unknown to host contract table ({})",
+                path.display()
+            ),
+            LoadError::BadContractName { path, detail } => {
+                write!(f, "load: bad contract name symbol in {}: {detail}", path.display())
+            }
+            LoadError::ContractAlreadyLoaded { loaded_name, requested_name } => write!(
+                f,
+                "load: contract already loaded by '{loaded_name}'; '{requested_name}' refused \
+                 (one instance per contract)"
+            ),
             LoadError::FactoryPanic => write!(f, "load: service factory panicked"),
             LoadError::CreateFailed(what) => write!(f, "load: create failed: {what}"),
         }
@@ -84,7 +105,9 @@ enum DriverExit {
 impl ServiceManager {
     // ---------- 装载 ----------
 
-    /// 装载一个服务实例（多实例 = 多次调用；DLL 走 1 dlopen + N create）。
+    /// 装载服务实例：**每契约恰一实例**（change singleton-per-contract,
+    /// spec Single-instance loading per contract）——同名二次装载与同契约
+    /// 异名装载均显式拒载（占用与状态无关，含 `error`），拒载时零写入。
     ///
     /// 成功返回实例 id；实例进入 `loading`，init 结果经状态事件异步推送
     /// （`Ok` → `available`，`Err` → `error`，spec L5）。
@@ -93,7 +116,43 @@ impl ServiceManager {
             .catalog_entry(name)
             .ok_or_else(|| LoadError::NoSuchService(name.clone()))?;
 
-        // 创建（失败时实例表零写入 — 指纹拒载断言靠这里）
+        // 契约解析（change singleton-per-contract, design D2）：指纹先行
+        // （ABI 兼容优先于类判定）→ 读契约名符号查宿主契约表——未知名
+        // 显式拒载，实例表零写入；库句柄先入缓存，create 走命中不重开。
+        let contract = match &desc.origin {
+            crate::catalog::ServiceOrigin::Internal(_) => desc
+                .contract
+                .expect("内部条目注册即携带契约身份（register_internal, design D1）"),
+            crate::catalog::ServiceOrigin::Dll(path) => {
+                let lib = self.library_for(path)?;
+                let plugin_fp = unsafe { read_fingerprint(&lib, path) }?;
+                fingerprint::verify(&plugin_fp, HOST_FINGERPRINT)
+                    .map_err(LoadError::FingerprintMismatch)?;
+                let cname = unsafe { read_contract_name(&lib, path) }?;
+                self.resolve_contract(&ServiceName::from(cname.clone())).ok_or_else(|| {
+                    LoadError::UnknownContract { name: cname, path: path.clone() }
+                })?
+            }
+        };
+
+        // 拒载门（spec: Single-instance loading per contract）：契约在表即拒
+        // ——占用与状态无关（含 error）；同名二次与异名同契约同一路径；
+        // 在 allocate/创建之前返回 ⇒ 实例表零写入、id 不消耗。
+        {
+            let table = self.instances.lock().expect("instances poisoned");
+            if let Some(occupied) = table.contract_instance(contract) {
+                let loaded_name = table
+                    .get(occupied)
+                    .and_then(|p| p.service.clone())
+                    .unwrap_or_else(|| ServiceName::from("<unknown>"));
+                return Err(LoadError::ContractAlreadyLoaded {
+                    loaded_name,
+                    requested_name: name.clone(),
+                });
+            }
+        }
+
+        // 创建（失败时实例表零写入 — 指纹/契约拒载断言靠这里）
         let id = self.allocate_id();
         let (service, library) = self.create_service(&desc.origin, id, name.clone())?;
 
@@ -104,6 +163,7 @@ impl ServiceManager {
             table.insert(Participant::service_instance(
                 id,
                 name.clone(),
+                Some(contract),
                 ServiceState::Loading,
                 tx,
             ));
@@ -417,6 +477,30 @@ unsafe fn read_fingerprint(
     std::str::from_utf8(bytes)
         .map(|s| s.to_string())
         .map_err(|e| LoadError::BadFingerprint {
+            path: path.to_path_buf(),
+            detail: e.to_string(),
+        })
+}
+
+/// 读取插件导出的契约名符号（`static SERVICE_CONTRACT_NAME: &[u8]`）。
+///
+/// # Safety
+/// `lib` 必须是有效库句柄（调用方经 `library_for` 保证）。
+unsafe fn read_contract_name(
+    lib: &ManuallyDrop<libloading::Library>,
+    path: &std::path::Path,
+) -> Result<String, LoadError> {
+    let sym: libloading::Symbol<'_, *const &[u8]> = unsafe {
+        lib.get(service_core::CONTRACT_NAME_SYMBOL)
+    }
+    .map_err(|_| LoadError::MissingSymbol {
+        path: path.to_path_buf(),
+        symbol: std::str::from_utf8(service_core::CONTRACT_NAME_SYMBOL).unwrap_or("?"),
+    })?;
+    let bytes: &[u8] = unsafe { **sym };
+    std::str::from_utf8(bytes)
+        .map(|s| s.to_string())
+        .map_err(|e| LoadError::BadContractName {
             path: path.to_path_buf(),
             detail: e.to_string(),
         })

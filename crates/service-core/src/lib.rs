@@ -9,10 +9,13 @@
 //! - [`state`]：每实例标准状态 [`ServiceState`] 与状态翻转事件 [`StateChange`]。
 //! - [`error`]：[`RouteError`]（Timeout / TargetNotAvailable / DeadLetter /
 //!   NoSuchRoute / TypeMismatch / AmbiguousAddress）。
+//! - [`contract_id`]：契约身份 [`ContractId`]（change singleton-per-contract
+//!   的类判据——宿主侧 marker `TypeId` 铸造，每契约恰一实例）。
 //!
 //! service-manager 对外 `pub use` 本 crate 的词汇（宿主侧只经 manager 引用），
 //! 保持 D11 的依赖边：GUI -> contracts + manager；manager -> core。
 
+pub mod contract_id;
 pub mod envelope;
 pub mod error;
 pub mod fingerprint;
@@ -20,12 +23,13 @@ pub mod route;
 pub mod service;
 pub mod state;
 
+pub use contract_id::ContractId;
 pub use envelope::{Envelope, Payload};
 pub use error::{DeadLetterReason, RouteError};
 pub use route::{Address, Corr, InstanceId, Route, SelectPolicy, ServiceName};
 pub use service::{
     CallFuture, DllServiceFactory, Messaging, RuntimeToken, Service, ServiceCtx, ServiceFactory,
-    ServiceFuture, TaskFuture, CREATE_SYMBOL, FINGERPRINT_SYMBOL,
+    ServiceFuture, TaskFuture, CONTRACT_NAME_SYMBOL, CREATE_SYMBOL, FINGERPRINT_SYMBOL,
 };
 pub use state::{ServiceState, StateChange};
 

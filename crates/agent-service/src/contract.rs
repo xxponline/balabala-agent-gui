@@ -6,6 +6,13 @@ use pi_shell_rs::app::theme::TuiTheme;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+// ----------契约类标记 ----------
+
+/// agent 契约类标记（change `singleton-per-contract`, design D1）：骨架侧
+/// "agent 这一类服务"的身份判据——只承载 `TypeId`，无字段无行为；宿主以
+/// `ContractId::of::<AgentContract>()` 铸造（进程内服务不经 dylib 符号）。
+pub struct AgentContract;
+
 // ---------- 身份与投影 ----------
 
 /// 会话稳定身份（服务分配；`gpui EntityId` 消亡后的替代，design D4）。

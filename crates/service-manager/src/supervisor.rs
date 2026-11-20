@@ -176,6 +176,7 @@ mod tests {
         table.lock().unwrap().insert(crate::instance::Participant::service_instance(
             id,
             "demo".into(),
+            None,
             state,
             tx,
         ));

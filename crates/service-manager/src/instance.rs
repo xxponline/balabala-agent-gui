@@ -3,7 +3,7 @@
 //!
 //! 与 Catalog **结构分离**：`reload_catalog()` 只写 Catalog，本表不受影响（D8）。
 
-use service_core::{Envelope, InstanceId, ServiceName, ServiceState};
+use service_core::{ContractId, Envelope, InstanceId, ServiceName, ServiceState};
 use std::collections::HashMap;
 use tokio::sync::mpsc::Sender;
 
@@ -12,6 +12,10 @@ pub struct Participant {
     pub id: InstanceId,
     /// `Some` = 服务实例（入实例表）；`None` = 宿主 actor / GUI（不入实例表）。
     pub service: Option<ServiceName>,
+    /// 服务实例的契约身份（change `singleton-per-contract`, design D1）：
+    /// 骨架单实例的类判据与拒载门索引键；宿主参与者恒 `None`。
+    /// DLL 未解析过渡期可为 `None`（契约符号解析接入后恒 `Some`）。
+    pub contract: Option<ContractId>,
     /// 服务实例状态；宿主参与者恒 `Available`（始终可投递）。
     pub state: ServiceState,
     /// per-outlet 有界通道发送端（Router `try_send`，满即刻失败，D6）。
@@ -20,13 +24,19 @@ pub struct Participant {
 
 impl Participant {
     /// 服务实例。
-    pub fn service_instance(id: InstanceId, service: ServiceName, state: ServiceState, outlet: Sender<Envelope>) -> Self {
-        Participant { id, service: Some(service), state, outlet }
+    pub fn service_instance(
+        id: InstanceId,
+        service: ServiceName,
+        contract: Option<ContractId>,
+        state: ServiceState,
+        outlet: Sender<Envelope>,
+    ) -> Self {
+        Participant { id, service: Some(service), contract, state, outlet }
     }
 
     /// 宿主参与者（GUI/宿主 actor）：恒 available。
     pub fn host(id: InstanceId, outlet: Sender<Envelope>) -> Self {
-        Participant { id, service: None, state: ServiceState::Available, outlet }
+        Participant { id, service: None, contract: None, state: ServiceState::Available, outlet }
     }
 
     /// 是否服务实例（即"存在于实例表"）。
@@ -44,6 +54,9 @@ fn belongs(p: &Participant, service: &ServiceName) -> bool {
 #[derive(Default)]
 pub struct Instances {
     map: HashMap<InstanceId, Participant>,
+    /// 契约 → 实例（拒载门的占用索引，design D4）：仅 `contract = Some`
+    /// 的服务实例入索引；每契约至多一项（单实例的防御层）。
+    by_contract: HashMap<ContractId, InstanceId>,
 }
 
 impl Instances {
@@ -52,11 +65,36 @@ impl Instances {
     }
 
     pub fn insert(&mut self, p: Participant) -> Option<Participant> {
+        if let Some(c) = p.contract {
+            match self.by_contract.get(&c) {
+                Some(&other) if other != p.id => {
+                    panic!("同契约仅允许一个服务实例（拒载门应在建实例前拦截, design D4）")
+                }
+                _ => {
+                    self.by_contract.insert(c, p.id);
+                }
+            }
+        }
         self.map.insert(p.id, p)
     }
 
     pub fn remove(&mut self, id: InstanceId) -> Option<Participant> {
-        self.map.remove(&id)
+        let p = self.map.remove(&id)?;
+        if let Some(c) = p.contract
+            && self.by_contract.get(&c) == Some(&id)
+        {
+            self.by_contract.remove(&c);
+        }
+        Some(p)
+    }
+
+    /// 契约占用查询（拒载门，design D4）：该契约已有实例则返回其 id。
+    ///
+    /// 功能：按契约身份查占位实例（任何状态都占位，含 `error`）。
+    /// 输入：`contract` — 宿主铸造的契约身份。
+    /// 输出：占用实例的 id；未占位返回 `None`。
+    pub fn contract_instance(&self, contract: ContractId) -> Option<InstanceId> {
+        self.by_contract.get(&contract).copied()
     }
 
     pub fn get(&self, id: InstanceId) -> Option<&Participant> {
@@ -136,6 +174,7 @@ mod tests {
         t.insert(Participant::service_instance(
             InstanceId(1),
             "demo".into(),
+            None,
             ServiceState::Available,
             outlet(),
         ));
@@ -153,24 +192,24 @@ mod tests {
         t.insert(Participant::service_instance(
             InstanceId(1),
             "demo".into(),
+            None,
             ServiceState::Loading,
             outlet(),
         ));
         assert_eq!(t.pick_available(&"demo".into()), None, "loading 不可选");
 
-        t.insert(Participant::service_instance(
-            InstanceId(2),
-            "demo".into(),
-            ServiceState::Available,
-            outlet(),
-        ));
-        assert_eq!(t.pick_available(&"demo".into()), Some(InstanceId(2)));
+        // 状态翻转后可选/不可选（单实例口径, change singleton-per-contract）
+        t.get_mut(InstanceId(1)).unwrap().state = ServiceState::Available;
+        assert_eq!(t.pick_available(&"demo".into()), Some(InstanceId(1)), "available 可选");
 
-        // 状态翻转后不可选
-        t.get_mut(InstanceId(2)).unwrap().state = ServiceState::Error;
-        assert_eq!(t.pick_available(&"demo".into()), None);
+        t.get_mut(InstanceId(1)).unwrap().state = ServiceState::Error;
+        assert_eq!(t.pick_available(&"demo".into()), None, "error 不可选");
 
-        assert!(t.instances_of(&"demo".into()).len() == 2, "instances_of 不看状态");
+        assert_eq!(
+            t.instances_of(&"demo".into()),
+            vec![InstanceId(1)],
+            "按名索引单实例口径"
+        );
     }
 
     #[test]
@@ -179,11 +218,63 @@ mod tests {
         t.insert(Participant::service_instance(
             InstanceId(7),
             "demo".into(),
+            None,
             ServiceState::Available,
             outlet(),
         ));
         assert!(t.is_instance_of(InstanceId(7), &"demo".into()));
         assert!(!t.is_instance_of(InstanceId(7), &"other".into()), "服务名不符");
         assert!(!t.is_instance_of(InstanceId(99), &"demo".into()), "实例不存在");
+    }
+
+    /// 测试 marker：契约 A。
+    struct CA;
+    /// 测试 marker：契约 B。
+    struct CB;
+
+    /// 1.3: 契约索引建立与卸载清除（拒载门的占用查询基础）。
+    ///
+    /// 功能：断言 insert 维护 `by_contract`、remove 同步清除、异契约互不占位。
+    /// 输入：无。
+    /// 输出：断言通过。
+    #[test]
+    fn contract_index_tracks_insert_and_remove() {
+        let mut t = Instances::new();
+        t.insert(Participant::service_instance(
+            InstanceId(1),
+            "demo".into(),
+            Some(ContractId::of::<CA>()),
+            ServiceState::Loading,
+            outlet(),
+        ));
+        assert_eq!(t.contract_instance(ContractId::of::<CA>()), Some(InstanceId(1)));
+        assert_eq!(t.contract_instance(ContractId::of::<CB>()), None, "异契约不占位");
+        t.remove(InstanceId(1));
+        assert_eq!(t.contract_instance(ContractId::of::<CA>()), None, "卸载清除索引");
+    }
+
+    /// 1.3: 同契约二次 insert 由防御断言拦截（装载门应在建实例前拒载）。
+    ///
+    /// 功能：断言同 `ContractId` 的第二个服务实例插入即 panic。
+    /// 输入：无。
+    /// 输出：`should_panic` 通过。
+    #[test]
+    #[should_panic(expected = "同契约仅允许一个服务实例")]
+    fn second_insert_of_same_contract_panics() {
+        let mut t = Instances::new();
+        t.insert(Participant::service_instance(
+            InstanceId(1),
+            "demo".into(),
+            Some(ContractId::of::<CA>()),
+            ServiceState::Available,
+            outlet(),
+        ));
+        t.insert(Participant::service_instance(
+            InstanceId(2),
+            "demo.other".into(),
+            Some(ContractId::of::<CA>()),
+            ServiceState::Available,
+            outlet(),
+        ));
     }
 }

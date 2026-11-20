@@ -9,7 +9,8 @@ use crate::runtime::LayerRuntime;
 use crate::scanner::{self, ScanError};
 use crate::supervisor::Supervisor;
 use service_core::{
-    Address, Envelope, InstanceId, Messaging, Payload, RouteError, ServiceFactory, ServiceName,
+    Address, ContractId, Envelope, InstanceId, Messaging, Payload, RouteError, ServiceFactory,
+    ServiceName,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,6 +47,10 @@ pub struct ServiceManager {
     pub(crate) libs: Mutex<std::collections::HashMap<PathBuf, Arc<std::mem::ManuallyDrop<libloading::Library>>>>,
     /// 在跑 driver 的控制柄（每实例至多一个；enable/retry 换新代）。
     pub(crate) drivers: Mutex<std::collections::HashMap<InstanceId, crate::loader::DriverControl>>,
+    /// 宿主契约注册表（change `singleton-per-contract`, design D2）：契约名 →
+    /// 身份，DLL 装载期按产物契约符号查此表解析（内部服务不经此表，
+    /// 注册即携带身份）。同名重复登记且身份不同 = 引导期编程错误 → 断言。
+    contracts: Mutex<std::collections::HashMap<ServiceName, ContractId>>,
 }
 
 impl ServiceManager {
@@ -77,6 +82,7 @@ impl ServiceManager {
             router,
             libs: Mutex::new(std::collections::HashMap::new()),
             drivers: Mutex::new(std::collections::HashMap::new()),
+            contracts: Mutex::new(std::collections::HashMap::new()),
         };
         mgr.rebuild_catalog()?;
         Ok(mgr)
@@ -84,12 +90,14 @@ impl ServiceManager {
 
     /// 内部服务显式注册：**立即**进 Catalog（与 DLL 条目同表，D8），
     /// 并在每次 reload 时重新并入（程序注册优先于同名 DLL 产物）。
+    /// `contract` = 宿主铸造的契约身份（change `singleton-per-contract`, design D1）。
     pub fn register_internal(
         &self,
         name: impl Into<ServiceName>,
         factory: ServiceFactory,
+        contract: ContractId,
     ) -> Result<(), ServiceError> {
-        let desc = ServiceDescriptor::internal(name, factory);
+        let desc = ServiceDescriptor::internal(name, factory, contract);
         {
             let mut internals = self.internals.lock().expect("internals poisoned");
             if internals.iter().any(|d| d.name == desc.name) {
@@ -100,6 +108,41 @@ impl ServiceManager {
         let mut catalog = self.catalog.write().expect("catalog poisoned");
         catalog.insert(desc);
         Ok(())
+    }
+
+    /// 登记宿主契约表（change `singleton-per-contract`, design D2）：契约名 →
+    /// 身份——DLL 装载期按产物契约符号查此表解析；内部服务不经此表。
+    ///
+    /// 功能：写入/校验一条契约名映射。
+    /// 输入：`name` — 契约名（与 DLL 契约符号内容一致）；`contract` — 宿主铸造身份。
+    /// 输出：同名同身份幂等；同名异身份 = 引导期编程错误，断言 panic。
+    pub fn register_contract(&self, name: impl Into<ServiceName>, contract: ContractId) {
+        let mut map = self.contracts.lock().expect("contracts poisoned");
+        match map.entry(name.into()) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                assert_eq!(
+                    *e.get(),
+                    contract,
+                    "同名契约注册必须声明同一身份（引导期编程错误, design D2）"
+                );
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(contract);
+            }
+        }
+    }
+
+    /// 契约名 → 身份解析（DLL 装载期用，design D2）。
+    ///
+    /// 功能：查宿主契约表。
+    /// 输入：`name` — DLL 契约符号声明的契约名。
+    /// 输出：已登记身份；未登记返回 `None`（装载期显式拒载）。
+    pub(crate) fn resolve_contract(&self, name: &ServiceName) -> Option<ContractId> {
+        self.contracts
+            .lock()
+            .expect("contracts poisoned")
+            .get(name)
+            .copied()
     }
 
     /// 显式 reload（GUI 按钮/测试调用）：**只影响未来的 load，不动实例表**。
@@ -403,6 +446,49 @@ mod tests {
     use std::path::PathBuf;
     use tokio::sync::mpsc;
 
+    /// 契约标记（test）：fake 服务的类身份。
+    struct FakeContract;
+
+    /// 1.4: 宿主契约表登记与解析（同名同身份幂等、未登记返回 None）。
+    ///
+    /// 功能：断言 `register_contract` 写入语义与 `resolve_contract` 查询。
+    /// 输入：无。
+    /// 输出：断言通过。
+    #[test]
+    fn contract_registry_registers_and_resolves() {
+        let dir = temp_root("creg");
+        let mgr = ServiceManager::new(&dir).unwrap();
+        mgr.register_contract("demo", ContractId::of::<FakeContract>());
+        // 同名同身份幂等，不触发断言
+        mgr.register_contract("demo", ContractId::of::<FakeContract>());
+        assert_eq!(
+            mgr.resolve_contract(&"demo".into()),
+            Some(ContractId::of::<FakeContract>()),
+            "已登记契约名可解析"
+        );
+        assert_eq!(
+            mgr.resolve_contract(&"none".into()),
+            None,
+            "未登记契约名返回 None（装载期据此显式拒载）"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 1.4: 同名异身份 = 引导期编程错误，断言拦截（design D2）。
+    ///
+    /// 功能：断言同一契约名重复登记不同身份即 panic。
+    /// 输入：无。
+    /// 输出：`should_panic` 通过。
+    #[test]
+    #[should_panic(expected = "同名契约注册必须声明同一身份")]
+    fn contract_registry_rejects_conflicting_identity() {
+        struct OtherContract;
+        let dir = temp_root("creg2");
+        let mgr = ServiceManager::new(&dir).unwrap();
+        mgr.register_contract("demo", ContractId::of::<FakeContract>());
+        mgr.register_contract("demo", ContractId::of::<OtherContract>());
+    }
+
     struct Fake;
     impl service_core::Service for Fake {
         fn start(&mut self) -> Result<(), String> {
@@ -460,7 +546,7 @@ mod tests {
         let dir = temp_root("shared");
         std::fs::write(dir.join("libbeta.dylib"), b"").unwrap();
         let mgr = ServiceManager::new(&dir).unwrap();
-        mgr.register_internal("fake", fake_factory).unwrap();
+        mgr.register_internal("fake", fake_factory, ContractId::of::<FakeContract>()).unwrap();
 
         let names: Vec<_> = mgr.catalog_names().iter().map(|n| n.as_str().to_string()).collect();
         assert_eq!(names, vec!["beta", "fake"], "内部与 DLL 同一张表（有序）");
@@ -471,7 +557,7 @@ mod tests {
         ));
         // 重复注册被拒
         assert_eq!(
-            mgr.register_internal("fake", other_factory).unwrap_err(),
+            mgr.register_internal("fake", other_factory, ContractId::of::<FakeContract>()).unwrap_err(),
             ServiceError::DuplicateRegistration("fake".into())
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -490,6 +576,7 @@ mod tests {
             crate::instance::Participant::service_instance(
                 id,
                 "gamma".into(),
+                None,
                 ServiceState::Available,
                 tx,
             ),
@@ -515,7 +602,7 @@ mod tests {
     fn internal_registrations_survive_reload() {
         let dir = temp_root("internals");
         let mgr = ServiceManager::new(&dir).unwrap();
-        mgr.register_internal("fake", fake_factory).unwrap();
+        mgr.register_internal("fake", fake_factory, ContractId::of::<FakeContract>()).unwrap();
         mgr.reload_catalog().unwrap();
         assert!(mgr.has_service(&"fake".into()), "内部注册跨 reload 保留");
         std::fs::remove_dir_all(&dir).ok();

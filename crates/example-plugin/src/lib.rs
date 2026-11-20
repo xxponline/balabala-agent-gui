@@ -17,6 +17,7 @@ use service_plugin::{actor_service, Ingress, IngressFuture};
 
 // 构建指纹导出符号 (task 3.2; Loader 装载前比对, 不匹配显式拒载)
 include!(concat!(env!("OUT_DIR"), "/service_fingerprint.rs"));
+include!(concat!(env!("OUT_DIR"), "/service_contract_name.rs"));
 
 /// demo actor：收 `Ping` 回 `Pong`（回显值）。
 struct EchoActor;

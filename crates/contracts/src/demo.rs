@@ -11,3 +11,8 @@ pub struct Ping(pub u64);
 /// 回复：期待的应答类型（同样归调用方，D2 口径）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pong(pub u64);
+
+/// demo 契约类标记（change `singleton-per-contract`, design D1）：骨架侧
+/// "demo 这一类服务"的身份判据——只承载 `TypeId`，无字段无行为；由宿主
+/// 以 `ContractId::of::<DemoContract>()` 铸造，DLL 侧经契约符号声明同名。
+pub struct DemoContract;
