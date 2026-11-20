@@ -19,7 +19,7 @@ use crate::app::TerminalApp;
 use crate::sidebar::SidebarPanel;
 use agent_service::terminal::{AgentTerminal, TerminalBus};
 use std::sync::Arc;
-use crate::assets::AssetView;
+use crate::assets::{AssetManager, AssetView};
 
 /// AgentTerminal 出站窄缝的 GUI 实现 (change agent-service design D7):
 /// 面板语义 → TerminalApp 控制方法 (ask/tell 由 app 内部走服务消息)。
@@ -89,7 +89,9 @@ pub struct ShellParts {
 /// 在 `TerminalApp::new(window, cx)` 内调用。
 ///
 /// DockSkin 的 Rc 由 DockArea 持有（`with_renderer`），此处不保留。
+/// `asset_manager` 先于面板创建并注入 (asset-package-merge design D7)。
 pub fn build(
+    asset_manager: &Entity<AssetManager>,
     weak_app: WeakEntity<TerminalApp>,
     window: &mut Window,
     cx: &mut Context<TerminalApp>,
@@ -103,7 +105,7 @@ pub fn build(
 
     let sidebar = cx.new(|cx| SidebarPanel::new(weak_app.clone(), cx));
     let terminal = cx.new(|cx| AgentTerminal::new(AppTerminalBus::new(weak_app.clone()), cx));
-    let right = cx.new(|cx| AssetView::new(weak_app.clone(), cx));
+    let right = cx.new(|cx| AssetView::new(asset_manager.clone(), weak_app.clone(), cx));
 
     dock_area.update(cx, |area, cx| {
         // 必须 panel_handle 包装（spike §10.5）；先 add 建 dock,

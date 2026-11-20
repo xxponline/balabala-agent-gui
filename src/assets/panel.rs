@@ -29,9 +29,13 @@ use gpui_kit::component::tree::{TreeEvent, TreeItem, TreeState, tree};
 use gpui_kit::*;
 
 use crate::app::TerminalApp;
+use super::manager::AssetManager;
 use super::state::{AssetEffect, AssetKind, AssetMenu, AssetNode, AssetState};
 
 pub struct AssetView {
+    /// 数据源实体 — 构造注入 (design D7): 拉视图/代数直读, 不再经
+    /// app 兄弟跳。
+    manager: Entity<AssetManager>,
     app: WeakEntity<TerminalApp>,
     /// `Focusable` 契约要求；dock 交互时会聚焦此 handle（spike E2 实测）。
     focus: FocusHandle,
@@ -57,7 +61,16 @@ pub struct AssetView {
 }
 
 impl AssetView {
-    pub fn new(app: WeakEntity<TerminalApp>, cx: &mut Context<Self>) -> Self {
+    /// 构造面板: 注入数据源实体与宿主弱引用。
+    ///
+    /// 输入: `manager` (数据源, 拉视图/菜单/打开意图的直连对象)、
+    /// `app` (宿主: 右 dock 可见性查询与打开分发)、`cx`。
+    /// 输出: 就绪待挂载的面板实体 (TreeState 订阅已建)。
+    pub fn new(
+        manager: Entity<AssetManager>,
+        app: WeakEntity<TerminalApp>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let tree_state = cx.new(|cx| TreeState::new(cx));
         let tree_events = cx.subscribe(&tree_state, |this, _state, event: &TreeEvent, cx| {
             match event {
@@ -74,6 +87,7 @@ impl AssetView {
             let _ = cx;
         });
         Self {
+            manager,
             app,
             focus: cx.focus_handle(),
             tree_state,
@@ -115,14 +129,11 @@ impl AssetView {
     /// 代数同步（`on_data_changed` 与 render 惰性检查共用）：
     /// 代数变化才拉视图 → 推入 `TreeState`；相等即早退（不调 `state()`）。
     fn sync_if_generation_changed(&mut self, cx: &mut Context<Self>) {
-        let Some(app) = self.app.upgrade() else {
-            return;
-        };
-        let generation = app.read(cx).asset_manager.read(cx).view_generation();
+        let generation = self.manager.read(cx).view_generation();
         if self.last_generation == Some(generation) {
             return; // O(1): 代数相等 → 不拉视图 (spec)
         }
-        let view = app.read(cx).asset_manager.read(cx).state();
+        let view = self.manager.read(cx).state();
         self.sync_tree(&view, cx);
         self.last_synced = Some(view);
         self.last_generation = Some(generation);
@@ -161,33 +172,22 @@ impl AssetView {
     /// 左键: 经 manager 的打开意图分发到默认打开后端
     /// (spec: through the asset manager's default-open dispatch)。
     fn open_asset(&mut self, item_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(app) = self.app.upgrade() else {
-            return;
-        };
-        let obj = app
-            .read(cx)
-            .asset_manager
-            .read(cx)
-            .open_object_for(item_id);
-        if let Some(obj) = obj {
+        let obj = self.manager.read(cx).open_object_for(item_id);
+        if let Some(obj) = obj
+            && let Some(app) = self.app.upgrade()
+        {
             app.update(cx, |app, cx| app.open_object(obj, window, cx));
         }
     }
 
     /// 右键菜单描述 (经 manager; spec: items provided by the asset manager)。
     fn asset_menu(&self, item_id: &str, cx: &App) -> Vec<AssetMenu> {
-        self.app
-            .upgrade()
-            .map(|app| app.read(cx).asset_manager.read(cx).menu(item_id))
-            .unwrap_or_default()
+        self.manager.read(cx).menu(item_id)
     }
 
     /// 菜单执行 → 效果意图 (经 manager; 面板在 `apply_effects` 落地)。
     fn asset_execute(&self, item_id: &str, func_id: &str, cx: &App) -> Vec<AssetEffect> {
-        self.app
-            .upgrade()
-            .map(|app| app.read(cx).asset_manager.read(cx).execute(item_id, func_id))
-            .unwrap_or_default()
+        self.manager.read(cx).execute(item_id, func_id)
     }
 }
 

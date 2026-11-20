@@ -151,14 +151,15 @@ impl TerminalApp {
                 let restore = history.most_recent().map(Path::to_path_buf);
         // 装配 DockArea 三槽 (shell::build; panel_handle 包装见其文档)
         let weak_app = cx.weak_entity();
+        // 右槽数据的服务层 (asset-manager-right-dock D1) — 先建以注入
+        // 面板 (asset-package-merge design D7: 构造注入, 无兄弟跳)
+        let asset_manager = cx.new(|cx| AssetManager::new(weak_app.clone(), cx));
         let shell::ShellParts {
             dock_area,
             sidebar,
             terminal,
             asset_view,
-        } = shell::build(weak_app.clone(), window, cx);
-        // 右槽数据的服务层 (asset-manager-right-dock D1): 面板经 app 读它
-        let asset_manager = cx.new(|cx| AssetManager::new(weak_app, cx));
+        } = shell::build(&asset_manager, weak_app, window, cx);
         // 主题跟随系统外观 (add-light-dark-theme D1): 启动同步一次,
         // 并订阅外观变化 → 每次变化重新 sync (Theme::change 内部会
         // refresh_windows, 全窗重渲即热切换生效), 并把新配色推给

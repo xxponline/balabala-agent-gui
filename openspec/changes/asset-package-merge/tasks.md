@@ -19,10 +19,10 @@
 
 ## 3. 构造注入（design D7）
 
-- [ ] 3.1 `AssetView::new(manager: Entity<AssetManager>, app: WeakEntity<TerminalApp>, cx)`；`sync_if_generation_changed` 改直读 `self.manager`（`state()`/`view_generation()`）；`right_dock_open` 保留经 app 查 `dock_area`。验证：`cargo build` 通过；panel.rs 内 `\.asset_manager` 字样归零
-- [ ] 3.2 `shell::build` 增参传 `&Entity<AssetManager>`；`TerminalApp` 构造顺序不变（manager 先建）。验证：`cargo build` 通过
-- [ ] 3.3 `notify_panels` 零改确认（`on_data_changed` 签名不动）。验证：`git diff` 中 `notify_panels` 函数体无改动
-- [ ] 3.4 组 3 验收：`cargo test --workspace` 全绿 / 0 warnings 逐数对账；`cargo clippy --all-targets` 干净。验证：命令输出对账 + 组 3 独立 commit
+- [x] 3.1 `AssetView::new(manager: Entity<AssetManager>, app: WeakEntity<TerminalApp>, cx)`；`sync_if_generation_changed` 改直读 `self.manager`（`state()`/`view_generation()`）；`right_dock_open` 保留经 app 查 `dock_area`。验证：`cargo build` 通过；panel.rs 内 `\.asset_manager` 字样归零
+- [x] 3.2 `shell::build` 增参传 `&Entity<AssetManager>`；`TerminalApp` 构造序调整为 manager 先建（原为 shell 先建——基线顺序与本句初稿相反，以 `manager 先建` 为准）。验证：`cargo build` 通过
+- [x] 3.3 `notify_panels` 零改确认（`on_data_changed` 签名不动）。验证：`git diff` 中 `notify_panels` 函数体无改动
+- [x] 3.4 组 3 验收：`cargo test --workspace` 全绿 / 0 warnings 逐数对账；`cargo clippy --all-targets` 干净。验证：命令输出对账 + 组 3 独立 commit
 
 ## Workflow follow-up
 

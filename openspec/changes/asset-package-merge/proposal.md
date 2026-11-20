@@ -24,7 +24,8 @@
   → `register(owner)`，manager 持 `Box<dyn EnumeratorOwner>`，不再可见
   `Project` 类型；`Module.filters` 降为私有（注入收敛到 project 构建期）。
 - 面板构造注入 `Entity<AssetManager>`：拉视图/代数不再经 app 兄弟跳；
-  `WeakEntity<TerminalApp>` 仅保留右 dock 可见性查询。
+  `WeakEntity<TerminalApp>` 收敛为两项职责——右 dock 可见性查询与打开
+  分发（`open_object` 属 app 域）。
 - 行为全部冻结：规格零改动（`.openspec.yaml` 声明 `skip_specs: true`）。
 
 ## Capabilities
