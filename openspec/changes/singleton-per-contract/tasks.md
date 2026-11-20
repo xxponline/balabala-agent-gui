@@ -24,10 +24,10 @@
 
 ## 4. 集成验证
 
-- [ ] 4.1 插件产物全量重编后跑通全部 DLL 流程测试（堵 `service-core` 枚举变更与旧 dylib 的 ABI 失配，design Risks 第一条）——验证：`cargo test -p service-manager`（含 flow_tests 5.x DLL 端到端）全绿
-- [ ] 4.2 全仓基线对账：`cargo test --workspace` 全绿、0 warnings，测试数 ≥253 且新增数对得上（拒载≥3、契约身份≥3、寻址≥2）——验证：命令输出与计数记录在提交说明
-- [ ] 4.3 规格自查：`openspec validate singleton-per-contract --strict` 通过；两个 delta 的全部 scenario 均有对应测试——验证：命令输出 valid，逐 scenario 对照任务 2.3/2.4/3.3 的测试名
-- [ ] 4.4 design.md 复核点收口：D3 的用户答复与最终形态写回 design Decisions——验证：文件中 ⚠ 标记替换为确认结论（或回退记录）
+- [x] 4.1 插件产物全量重编后跑通全部 DLL 流程测试（堵 `service-core` 枚举变更与旧 dylib 的 ABI 失配，design Risks 第一条）——验证：`cargo test -p service-manager`（含 flow_tests 5.x DLL 端到端）全绿
+- [x] 4.2 全仓基线对账：`cargo test --workspace` 全绿、0 warnings，测试数 ≥253 且新增数对得上（拒载≥3、契约身份≥3、寻址≥2）——验证：命令输出与计数记录在提交说明
+- [x] 4.3 规格自查：`openspec validate singleton-per-contract --strict` 通过；两个 delta 的全部 scenario 均有对应测试——验证：命令输出 valid，逐 scenario 对照任务 2.3/2.4/3.3 的测试名
+- [x] 4.4 design.md 复核点收口：D3 的用户答复与最终形态写回 design Decisions——验证：文件中 ⚠ 标记替换为确认结论（或回退记录）
 
 ## Workflow follow-up
 

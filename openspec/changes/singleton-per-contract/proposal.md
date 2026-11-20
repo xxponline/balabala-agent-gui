@@ -26,7 +26,7 @@ dlopen，`service-routing` 的 `SelectPolicy::Any` 负责挑一个），但负�
 - **BREAKING** 寻址简化：`Route::Service(name, policy)` →
   `Route::Service(name)`，**删除 `SelectPolicy`（`Direct`/`Any`）**；
   服务名寻址 = 直呼该契约唯一实例，"实例挑选"概念从契约面消失。
-  （⚠ 假设待复核：此条为探索中推荐方案，用户未逐字确认——见 design 决策 D3。）
+  （已复核确认：用户于 propose 指令中答"删除"，本条按删除方案实施——见 design D3 ✅。）
 - **容器约定（零框架代码）**：容器 = 普通服务内部私有多路复用；子状态经
   容器自己的投影消息上报（`SessionsChanged{SessionView}` 既有先例）；
   框架不新增容器机制——约定写入 design，不新增规格行为。
