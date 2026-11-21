@@ -110,10 +110,13 @@ pub struct ThemeReq {
 pub struct WatchReq;
 
 /// 帧全推载荷：字节所有权**移动**（`take_ansi` → Arc），传输零拷贝。
+/// `prod_gen` = 生产代际（推送处取 [`crate::frame_gen::current`]，任务 1.2）：
+/// "代际 > 输入基线" = 字节产生于输入注入之后（回显帧候选）。
 #[derive(Clone, Debug)]
 pub struct FrameBytes {
     pub session: SessionId,
     pub bytes: Arc<Vec<u8>>,
+    pub prod_gen: u64,
 }
 
 /// 会话投影事件（事件自带快照）。

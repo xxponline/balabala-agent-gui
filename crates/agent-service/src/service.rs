@@ -11,6 +11,7 @@ use crate::contract::{
 };
 use crate::contract::{SessionId, SessionInfo, SessionStatus, SessionView};
 use crate::session::{SessionFactory, SessionHandle, SessionIo};
+use crate::frame_gen;
 use pi_shell_rs::app::theme::TuiTheme;
 use service_core::{
     Address, DeadLetterReason, Envelope, InstanceId, Payload, RouteError, Service, ServiceCtx,
@@ -150,6 +151,9 @@ impl AgentService {
     pub(crate) fn tick(&mut self) -> TickOutcome {
         let mut changed = false;
         let mut frames = Vec::new();
+        // 生产代际（任务 1.2）：本 tick 取到的字节集的代际。同一 tick 内
+        // 无推进（advance 只在 dispatch 输入分支），逐 tick 取快照即可。
+        let prod_gen = frame_gen::current();
         for h in &mut self.sessions {
             let bytes = h.io.drain();
             if !h.io.alive() && h.status != SessionStatus::Exited {
@@ -173,6 +177,7 @@ impl AgentService {
                     Payload::new(FrameBytes {
                         session: *session,
                         bytes: Arc::clone(bytes),
+                        prod_gen,
                     }),
                 );
                 if self.ctx.messaging.tell(env).is_err() {
@@ -331,7 +336,11 @@ impl AgentService {
             }
         }
         if inline_drain {
-            self.tick(); // 输入即推帧 (已有字节)
+            self.tick(); // 输入即推帧 (已有字节 — 均为输入生效前残留, 旧代际)
+            // 代际推进（任务 1.2, design Decisions 方案 A）：此后 take_ansi
+            // 产出的帧才算回显候选 —— 内联残留旧代际被排除，H1 排队期
+            // 产出的帧也落在基线侧，口径读数不掩盖排队。
+            frame_gen::advance();
             self.spawn_input_burst(); // 回显帧快采 (design D5 回改)
         }
     }
@@ -450,6 +459,9 @@ impl AgentService {
     }
 
     fn on_input_wheel(&mut self, env: &Envelope) {
+        // 注: t0→t1 探针只挂 key 一对 (design 仪器点表 t0=send_key/
+        // t1=on_input_key)。t1 不可只挂一侧: FIFO 配对要求 push/pop 对称,
+        // wheel 的 echo 数值已由 handle_scroll 的 note_input 覆盖。
         let Ok(req) = env.downcast::<InputWheel>() else {
             let _ = self.ctx.messaging.reject(env);
             return;

@@ -501,6 +501,7 @@ mod tests {
                 Payload::new(FrameBytes {
                     session: SessionId(1),
                     bytes: Arc::new(b"frame".to_vec()),
+                    prod_gen: 0,
                 }),
             ))
             .expect("inject frame");

@@ -28,13 +28,16 @@ drain 25ms tick + GUI 泵/帧合并）。`Docs/pending-decisions.md` 现有结�
 
 ## What Changes
 
-- **调查先行（先证后改）**：分段打点定位 38–106ms 落在哪一段（输入注入 →
-  服务处理 → 帧推送 → 泵 → feed），对 design.md 的 H1–H4 假设逐项证伪；
-  探针量完即拆（或 env 门控保留）。
-- **echo 口径修正**：`[term-rate]` 只计**回显帧**（输入效果所在的首帧），
-  流式帧不再计入 echo 样本；口径修正后同场景复测。
-- **流式期输入快路径修复**（按归因结论择行）：使流式中输入→帧与闲置档
-  同量级（avg ≤20ms）。
+- **尺子先行：echo 口径修正**（必做，不依赖归因）：帧在 take_ansi/推送处
+  带生产代际号，`[term-rate]` 只计**回显帧**（代际 > 输入基线的首帧），
+  流式帧不再计入 echo 样本；口径修正后同场景复测（此时读数是真话）。
+- **最小探针归因**：design.md 假设 H2 已由代码阅读排除（pump 全量入队、
+  FIFO 逐帧 feed，无帧合并）；以 t0→t1（信封排队，H1）+ 快泵关窗归因
+  （退出条件歧义 H3′）两点最小探针判定 H1/H3′/H4；探针量完即拆
+  （或 env 门控保留）。
+- **流式期输入快路径修复**（按归因结论择行）：H3′ 成立 → 快泵 break
+  只认"喂到代际 > 基线的帧"（代际号原语复用）；H1 成立 → 输入信封
+  让位/补采拍独立计时；使流式中输入→帧与闲置档同量级（avg ≤20ms）。
 - **文档修订**：`Docs/pending-decisions.md` "管线无可挖余量"结论补充前提
   或修订；term-rate 口径说明随实现注记。
 - **不做**：pi-shell-rs 渲染侧（已完成，见 pi-shell-rs 仓
@@ -56,9 +59,10 @@ drain 25ms tick + GUI 泵/帧合并）。`Docs/pending-decisions.md` 现有结�
 
 ## Impact
 
-- **代码**：`crates/agent-service/src/service.rs`（drain 循环 / 补采拍 /
-  `on_input_key` / 信封优先级）、`src/app.rs`（`kick_input_drain` / 泵合并）、
-  `crates/agent-service/src/terminal/mod.rs`（`rate_log` 口径、`feed` 合并语义）。
+- **代码**：`crates/agent-service/src/service.rs`（帧代际号 / drain 循环 /
+  补采拍 / `on_input_key` / 信封优先级）、`src/app.rs`（`kick_input_drain`
+  break 条件 / 关窗归因探针）、`crates/agent-service/src/terminal/mod.rs`
+  （`rate_log` 口径：代际 > 输入基线才计 echo 样本）。
 - **文档**：`Docs/pending-decisions.md`（"管线无可挖余量"条目修订）；
   归因数据回填本 change design.md。
 - **依赖**：pi-shell-rs `9df02dc+`（渲染链基线；宿主 `Cargo.lock` 已更新）。

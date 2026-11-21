@@ -56,7 +56,8 @@ GUI debug 构建，pi-shell-rs `9df02dc`（含流式尾条行级 memo），会�
 
 **Goals:**
 
-- 归因：把 38–106ms 分解到具体段（t0..t5，见下），H1–H4 逐项证伪；
+- 归因：以最小探针（t0→t1 + 快泵关窗归因，见仪器点）判定 H1/H3′/H4；
+  H2 已经代码阅读排除（见假设段），不再为其打点；
 - 口径：`[term-rate]` echo 只计回显帧，流式期读数可信；
 - 修复：流式中输入→帧 avg ≤20ms（与闲置档同量级），滚动输入 ≤30ms；
 - 闲置档不劣化（11–18ms 保持）；渲染侧零回退（pi-shell-rs 基线 1–3ms）。
@@ -70,68 +71,121 @@ GUI debug 构建，pi-shell-rs `9df02dc`（含流式尾条行级 memo），会�
 - 自发输出双相位（无输入触发的 ≤75ms 结构值）——本 change 只管**输入回显**；
   若调查证明回显路径与自发路径无法分离，再扩目标（见 Open Questions）。
 
-## 归因分解（现状认知，待 1.2 打点证实）
+## 归因分解（已定案：H5 引擎 batch-draw 合并）
 
-已排除：pi-shell-rs draw（1.2ms）、ANSI 生成（2.6ms）、vt100 feed（≤0.5ms）、
-宿主 paint（render_cost 4–5ms，且不计入 echo——echo 止于 note_feed）。
-剩余嫌疑集中在：**service actor 的信封调度** 与 **GUI 泵的帧合并/快泵窗**。
+**真因 H5 ✅**：`pi-shell-rs` `event_loop` 的 design D4「整批只 draw 一次
+（合并高频 `tool_execution_update` 的重绘）」。`event.rs` 中输入 `keys` 与
+RPC 流式读线程**共用同一 `tx/rx` channel** → `event_loop` 的 `recv_timeout`
+\+ `try_recv` drain 把输入事件和流式 `UiEvent::Rpc` 收成一批 → `for ev in
+batch` 整批处理、`if need_draw { draw }` 只画一次。流式期 batch 巨大（2k
+长文含大量 Rpc）→ 单批处理 + draw 耗时长、帧大（5–21KB）→ 输入回显被
+diff 进这个大帧、跟着整批 draw 出，延迟 = 等下一次大 draw。
 
-## 假设（H1–H4，调查逐项证伪）
+排除链（实测 + 代码）：pi-shell-rs draw 单帧（1.2ms）、ANSI 生成（2.6ms）、
+vt100 feed（≤0.5ms）、宿主 paint（render_cost 4–15ms，echo 止于 note_feed）
+均不构成 38–617ms。
 
-- **H1 补采拍被信封 FIFO 挤占**：drain.tick 是自寻址信封，与 KIND_INPUT_KEY
-  同一 mailbox 顺序处理；流式期 tick 频度（25ms）+ 会话数多时 tick 自身耗时
-  变长（MissedTickBehavior::Delay 顺延），输入信封/补采拍排队 → 输入注入
-  延迟。看点：`on_input_key` 入口时刻 vs `note_input` 的差值（t0→t1）。
-- **H2 帧合并吞并回显帧**：流式期 FrameBytes 密集，ServiceListener 合并语义
-  把回显帧与相邻流式帧合并到下一拍才投递（"帧合并红利"反向作用）。
-  看点：FrameBytes 推送（t3）→ 泵收到（t4）→ feed（t5）的间隔。
-- **H3 快泵窗在流式期失效**：`kick_input_drain` 的 10×8ms 快泵与流式帧 notify
-  竞争，或快泵只对"帧到达"起效而流式期帧已在途（set_view 快路径/泵节流）。
-  看点：输入后 0–80ms 内 pump 次数（流式 vs 闲置对照）。
-- **H4 口径污染为主**：真实回显只比闲置档多一个 drain tick 相位（~25ms），
-  读数的 85–106ms 主要是把流式帧当回显帧计。看点：口径修正后的分布。
+## 假设检验（H5 坐实，H1–H4 全排除）
 
-## 仪器点（临时探针；量完即拆或 env 门控保留）
-
-| 时刻 | 位置 | 含义 |
+| 假设 | 结论 | 证据 |
 | --- | --- | --- |
-| t0 | `src/app.rs::send_key`（`note_input` 同点） | 输入发出 |
-| t1 | `crates/agent-service/src/service.rs::on_input_key` 入口 | 服务收到输入 |
-| t2 | `SessionIo::inject_key`（embed keys 通道 send） | 注入引擎 |
-| t3 | `service.rs::tick` 推 FrameBytes 处（带帧字节数） | 帧推送 |
-| t4 | GUI 泵收到 frame_bytes（`service_layer` pump 分流处） | 帧到达 UI |
-| t5 | `terminal/mod.rs::feed`（`note_feed` 同点） | 喂入 parser |
+| H1 补采拍被信封 FIFO 挤占 | ❌ | `[echo-path] t0→t1 avg=0.0ms`（闲置/流式皆 0）——邮箱不堵 |
+| H2 帧合并吞并回显帧 | ❌ | `take_ansi`=`ansi.take()` 增量 drain、`pump` FIFO 逐帧 feed（代码） |
+| H3′ 快泵窗退出条件歧义 | ❌ | 关窗归因全"新帧"（回显帧到了只是晚）；echo-seq 证回显被合并，非被快泵漏 |
+| H4 口径污染（流式帧抢跑） | ❌ | 新口径（代际>基线首帧）≈旧口径（首 feed）读数一致（187 vs 183）→ 回显被合并，非被冒充 |
+| **H5 引擎 batch-draw 合并（D4）** | **✅（部分）** | echo-seq 回显混大帧、随帧增大 270→617ms、断流 1.14s；`draw_batch_probe` 测试证一批 `[Rpc×30, Key]` 只 draw 1 次。输入优先 draw 后 62×24 回显变独立小帧 9ms（有效）；2k 仍慢 → 主因转 H6 |
+| **H6 UI 构建 O(transcript)（布局缓存冷帧）** | **✅（2k 主因）** | `[draw-cost]` 分解：535ms 尖峰 = `ui=533.5ms`（diff=0.2ms/ansi=2.8ms 排除）= 布局缓存冷帧全量重排；cells=1 纯回显 draw 的 ui 也 8.5–9.3ms（闲置 1.6ms）→ 每帧 O(transcript) 重绘；回显 +10ms 可达 vs +223/+504ms 排在冷帧后 = 排队等 ui |
 
-输出按秒汇总（对齐 `[term-rate]` 风格，如 `[echo-path] t0→t1 avg/max …`），
-与 `[term-rate]` 同读 stderr。pi-shell-rs 侧无需打点（已证 1.2ms）。
+**逐帧铁证（`[echo-seq]`，2026-11-21 实测）**：闲置回显是独立小帧
+`+9ms/40B`；流式期回显被并进大帧 `+270ms/5931B`、`+456ms/10249B`、
+`+617ms/6297B`（帧越大越慢）；`baseline=170` 见 +71ms 后**断流 1.14s**才来
+一串 3–21KB 大帧——回显等整批大 draw 的直接观感。
 
-## Decisions（待 1.3 归因后定稿；以下为选项）
+**探针盲区（口径局限，记入 Decisions）**：代际号 `advance()` 只在输入
+dispatch 推进一次，输入后的**流式续帧与回显帧同代际**（均 > 基线），代际
+无法区分。故 1.2 的 echo 口径实际计"输入后首个新代际帧"（常为合并大帧），
+非纯回显帧；新旧口径读数一致（都测合并大帧到达）正源于此。严格分离回显需
+方案 B（pi-shell-rs 帧头标记），随 H5 修复一并考虑。
 
-**口径修正（2.1，独立于归因结论必做）**：
+## draw 耗时分解（定位 A，2026-11-22 `[draw-cost]` 实测）
 
-- 方案 A（推荐）：echo 只计**输入后首个产生于输入之后的帧**——实现上给输入
-  打代际号（`note_input` 时记 `input_gen++`），帧到达时若其字节产生于
-  `note_input` 之后（take_ansi 时间戳或帧序号）才计 echo 样本；
-- 方案 B：pi-shell-rs 在输入触发的 draw 上携带标记（如 AnsiBuffer 帧头注释
-  或事件回调），宿主据此识别回显帧——更准但要动 pi-shell-rs 契约；
-- 方案 C：流式期（feed 持续到达）直接停用 echo 统计，另设"回显专项"场景
-  （流式中静默敲键并观察首帧）——测量口径与验收口径分离。
+`[draw-cost] total/ui/diff/ansi | cells/bytes`（ui=闭包内 view::render，
+diff=ratatui buffer 比较余量，ansi=backend CSI 生成）：
 
-**快路径修复（2.2，按 H1–H3 结论择行）**：
+| 场景 | total | ui | diff | ansi | cells | 判读 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 闲档回显（cells=1） | 2.4ms | 1.6ms | 0.2ms | 0.7ms | 1 | 基线 |
+| 流式期纯回显（cells=1） | 10.4ms | **8.9ms** | 0.2ms | 1.4ms | 1 | ui 涨 5.6 倍 = O(transcript) |
+| 流式大帧 | 11–13ms | 8.5–9.3ms | 0.2ms | 2.8–4.2ms | 5k–12k | ui 主导 |
+| **卡顿尖峰** | **536.5ms** | **533.5ms** | 0.2ms | 2.8ms | 7577 | **布局缓存冷帧**（≈4f7b6ef 冷帧 600ms） |
 
-- H1 成立 → 输入信封优先于 drain.tick（mailbox 让位/合并 tick），或补采拍
-  改为独立计时器不经信箱；
-- H2 成立 → 回显帧不参与合并（帧带代际号，输入后首帧直达 feed）；
-- H3 成立 → 快泵窗与流式帧到达解耦（帧到即喂 feed，泵只控制 render 次数）。
+结论：**diff/ansi 排除**（各 ≤4ms）；主成本 = `view::render` 的布局/wrap
+构建——暖帧 O(transcript) 基础成本 9ms，冷帧（条目增删→缓存失效→全量
+重排）500ms+。流式期回显 draw 排在冷帧后（event_loop 单线程）→ 220–500ms。
+与 pending-decisions"残余 = pi 侧重绘 O(transcript)"一致，方向：布局缓存
+失效时增量重排 / 视口化 wrap 命中率提升（pi-shell-rs 渲染层）。
+
+## 仪器点（已落地，消盲区后定案）
+
+代际号原语（见 Decisions）落地后，原 t0..t5 六点全量打点不再需要。归因
+已定案 H5，保留的探针如下（均为临时，随 2.3 拆除；`[draw-probe]`/
+`draw_batch_probe` 在 pi-shell-rs 侧）：
+
+| 探针 | 位置 | 作用 |
+| --- | --- | --- |
+| `[echo-path]` t0→t1 | `app.rs::send_key` → `service.rs::on_input_key` | H1 排队量（实测 0ms，排除） |
+| `[echo-path]` 关窗归因 | `app.rs::kick_input_drain` `got=true` | 全旧帧关窗 = H3′（实测全"新帧"，排除） |
+| `[echo-path]` 旧口径镜像 | `note_input` 开 / 首 feed 关 | 1.1 ±10ms 对照 vs 原始数值 |
+| `[echo-seq]` 逐帧序列 | `echo_path::trace_*`（`note_input` 开/`note_feed` 落帧） | 消代际盲区：看回显小帧 vs 流式大帧排位/间隔 → **H5 铁证** |
+| `[draw-probe]` | pi-shell-rs `event_loop` draw 处 | batch 组成 + draw 节奏 `batch=N input=I rpc=R gap=Gms draw_cost=Cms` |
+| `draw_batch_probe` 测试 | pi-shell-rs `app::mod` | 确定性证 batch 合并（一批 `[Rpc×30, Key]` 只 draw 1 次） |
+
+输出按秒汇总（对齐 `[term-rate]` 风格），同读 stderr。
+
+## Decisions（定稿方向；H1 残差归因后可再调）
+
+**顺序原则：尺子先行。** 代际号原语 + 口径修正（任务 1.2）本就是必做项、
+不依赖归因结论，先落地再打最小探针——此时复测读数是真话，残差直接指向
+H1。仍是先证后改（2.1/2.2 修复前必有归因数据），只是尺子不是 throwaway。
+
+**代际号原语（三方共用支点，即方案 A）**：帧在 take_ansi/推送处带生产
+代际（或全局帧序号），`note_input` 时记基线。同一原语服务三处：
+
+| 用途 | 修什么 |
+| --- | --- |
+| `rate_log` 只计代际 > 基线的帧为 echo 样本 | H4 / 口径修正 |
+| 快泵 break 改为"喂到代际 > 基线的帧才关窗" | H3′ / 快路径修复 |
+| 探针关窗归因（仪器点归因行） | H3′ 直证 |
+
+**口径修正（必做，已落地）**：采用方案 A（上表第一用途）。**口径局限
+（H5 探针盲区）**：`advance()` 每输入推进一次，输入后流式帧与回显帧同
+代际，故 echo 口径计"输入后首个新代际帧"（常为合并大帧），非纯回显帧。
+严格分离需方案 B（pi-shell-rs 帧头携带回显标记——更准但动跨仓契约），随
+H5 修复一并考虑；方案 C（流式期停用 echo 统计）作备选。误差界：帧被取走
+时刻 ≥ 产生时刻，≤1 拍误差可接受。
+
+**修复（H5，跨仓 pi-shell-rs）**：`event_loop` 让输入类事件（Key/Wheel/
+Click/Pointer）**优先单独 draw**，不与流式 Rpc 合并到 batch 尾部——输入
+回显不等整批大 draw。候选实现：
+- 输入事件处理完立即 draw（打断 batch 的"整批一次 draw"，输入处多一次 draw
+  但输入低频）；或
+- batch 收集遇输入即断、输入优先处理 + draw，流式 Rpc 组内仍合并。
+约束：流式帧率不劣化（feed/s 不降）、render 次数增幅可控（仅输入触发的额外
+draw）。
+
+**作废**：~~H3′ 快泵 break 改"喂到代际 > 基线的帧才关窗"~~（H3′ 已排除，
+宿主快泵不是瓶颈，改了无用）；~~H1 mailbox 让位/补采拍改独立计时器~~
+（H1 已排除）。
 
 ## Risks / Trade-offs
 
 - [回显帧识别需要"帧产生时刻"可见] → 方案 A 用 take_ansi 时间戳近似
   （帧被取走的时刻 ≥ 产生时刻），存在 ≤1 拍误差；方案 B 精确但跨仓。
-- [输入优先/不合并可能加重流式期 UI 线程压力] → 上限约束：快泵窗总时长
-  不变（80ms），仅调整投递顺序；render 次数不增加。
-- [口径修正会让"流式期输入→帧"读数骤降，掩盖真实体感] → 验收以体感场景
-  （流式中打字）人工复核 + 修正口径双记录过渡一轮。
+- [输入优先 draw（H5 修复）可能增加 render 次数] → 仅输入触发的额外 draw
+  （输入低频），流式 Rpc 组内仍合并；约束流式 feed/s 不降、render 增幅可控。
+- [口径修正未达预期（新旧读数一致）] → 探针盲区所致：输入后流式帧与回显帧
+  同代际，口径实测合并大帧到达（非纯回显）。H5 修复后回显独立成小帧，口径
+  才真正生效；验收以体感场景（流式中打字）人工复核 + 双记录过渡一轮。
 - [多会话并发下 tick 自身耗时随会话数增长]（pending-decisions 已记 30+
   会话疑点）→ 打点顺带记录 tick 耗时与会话数，若相关则另立 follow-up。
 

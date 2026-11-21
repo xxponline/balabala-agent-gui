@@ -275,15 +275,20 @@ impl TerminalApp {
         let Some(active) = self.active else {
             return;
         };
-        let _ = self.service_layer.manager.tell(Envelope::new(
-            Route::Service("agent".into()),
-            self.service_layer.listener.address().clone(),
-            KIND_INPUT_KEY,
-            Payload::new(InputKey {
-                session: active,
-                key,
-            }),
-        ));
+        // 代际基线 (t0 同时, 任务 2.1): 快泵窗/echo 口径共用——此刻尚未
+        // tell 送入 mailbox；回显由快泵/主泵拉取。
+        let _ = self
+            .service_layer
+            .manager
+            .tell(Envelope::new(
+                Route::Service("agent".into()),
+                self.service_layer.listener.address().clone(),
+                KIND_INPUT_KEY,
+                Payload::new(InputKey {
+                    session: active,
+                    key,
+                }),
+            ));
         self.kick_input_drain(cx); // 快速 pump (design D5): 字节即到即显
     }
 
@@ -836,6 +841,7 @@ impl TerminalApp {
     /// 滚动卡顿主因 = 50ms 主循环相位抖动 — 输入后 8ms×4 拍快速采样,
     /// 取到新帧即停 (pi 每事件通常 1 帧, 4 拍覆盖其线程调度+重绘时延);
     /// 连续输入 drop 旧 task 重置 (风暴不叠加); 空闲仍靠主循环。
+    /// 控制回执 kick (create/close/select/resize) 与输入 kick 共用。
     fn kick_input_drain(&mut self, cx: &mut Context<Self>) {
         let weak = cx.entity().downgrade();
         self._input_drain_task = Some(cx.spawn(async move |_this, cx: &mut AsyncApp| {
@@ -921,7 +927,7 @@ impl TerminalApp {
         if !frames.is_empty() {
             self.terminal.update(cx, |t, cx| {
                 for f in frames {
-                    t.feed(f.session, &f.bytes, cx);
+                    t.feed(f.session, &f.bytes, f.prod_gen, cx);
                 }
             });
             changed = true;

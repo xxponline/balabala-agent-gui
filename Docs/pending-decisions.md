@@ -40,6 +40,13 @@ burst 消除了输入后的相位抖动。
   伪影或 pi 极慢重绘, echo 300ms 窗口已隔离计数 miss)。管线无可挖余量,
   残余 = pi 侧重绘 O(transcript) — 原生控制台是本地缓冲平移 (零往返),
   TUI 架构性差距; 若需逼近, 方向在 pi-shell-rs/pi 渲染增量化/虚拟列表
+  > **前提修正 (2026-11-21, change 2026-11-20-streaming-input-echo-latency)**:
+  > 上述"残余 = pi 侧重绘 O(transcript)"成立于渲染链 52-113ms 时代、且未计
+  > H5。流式期输入延迟 (38-617ms) 主因实为 **H5 pi-shell-rs `event_loop`
+  > batch-draw 合并** (输入回显绑进大流式帧、等整批 draw), 非单纯重绘
+  > O(transcript)。已修: 输入类事件优先独立 draw (详见该 change design.md
+  > 归因段)。term-rate 口径: 回显帧 = 代际 > 输入基线的首帧, 但同代际不区分
+  > 流式/回显 (探针盲区), H5 修复后回显才独立成小帧。
 - mio / epoll 选项已作废 — 不再有 pty master fd
 
 **备选方案**:

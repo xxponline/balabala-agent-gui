@@ -1792,8 +1792,16 @@ impl AgentTerminal {
 
     /// 喂入一个会话的新帧字节 (change agent-service 3.4; app 泵从
     /// `frame_bytes` 事件调入)。parser 按需创建 (初值 = 当前网格),
-    /// 有新字节即 notify (帧到必 render)。
-    pub fn feed(&mut self, session: SessionId, bytes: &[u8], cx: &mut Context<Self>) {
+    /// 有新字节即 notify (帧到必 render)。`prod_gen` = 帧生产代际
+    /// (任务 1.2): echo 口径只计代际 > 基线的首帧, 快泵关窗/探针归因
+    /// 复用同一记账。
+    pub fn feed(
+        &mut self,
+        session: SessionId,
+        bytes: &[u8],
+        prod_gen: u64,
+        cx: &mut Context<Self>,
+    ) {
         if bytes.is_empty() {
             return;
         }
@@ -1807,10 +1815,9 @@ impl AgentTerminal {
         });
         let __t = std::time::Instant::now();
         parser.process(bytes);
-        rate_log::note_feed(__t.elapsed().as_nanos() as u64, bytes.len());
+        rate_log::note_feed(__t.elapsed().as_nanos() as u64, bytes.len(), prod_gen);
         cx.notify();
     }
-
     /// 记录目标网格并同步本地 parser (与服务侧 resize 同拍; task 3.4)。
     /// `exited` = 状态为 Exited 的会话 — 不 reflow, 保留最后画面
     /// (spec: Grid resize propagation — exited 会话不 resize)。
@@ -2192,19 +2199,84 @@ mod rate_log {
     static LAG_N: AtomicU64 = AtomicU64::new(0);
     static LAG_SUM: AtomicU64 = AtomicU64::new(0);
     static LAG_MAX: AtomicU64 = AtomicU64::new(0);
-    static INPUT_AT_MS: AtomicU64 = AtomicU64::new(u64::MAX); // MAX = 无在途输入
-    static ECHO_N: AtomicU64 = AtomicU64::new(0);
-    static ECHO_SUM: AtomicU64 = AtomicU64::new(0);
-    static ECHO_MAX: AtomicU64 = AtomicU64::new(0);
-    static ECHO_MISS: AtomicU64 = AtomicU64::new(0);
+
+    /// echo 窗口账（change `2026-11-20-streaming-input-echo-latency` 任务 1.2，
+    /// design Decisions 方案 A 口径）：只有**代际 > 基线**的首帧才算回显帧
+    /// （输入效果所在的首帧）；流式帧（代际 ≤ 基线，字节产生于输入注入
+    /// 之前）不计样本、不关窗。miss 语义保持（关窗帧 >300ms 单独计数）。
+    /// 纯逻辑无全局状态 —— 单测直接驱动序列。**口径盲区**：代际号每输入
+    /// dispatch 才推进一次，故输入后的流式续帧与回显帧同代际（均 > 基线）——
+    /// 本口径计"输入后首个新代际帧"，H5 batch-draw 合并下常为合并大帧（非纯
+    /// 回显小帧）；H5 修复（输入独立 draw）后回显才独立成帧。
+    struct EchoWindow {
+        /// 在途输入: (发出时刻 ms, 代际基线); None = 无在途
+        pending: Option<(u64, u64)>,
+        n: u64,
+        sum: u64,
+        max: u64,
+        miss: u64,
+    }
+
+    impl EchoWindow {
+        const fn new() -> Self {
+            Self {
+                pending: None,
+                n: 0,
+                sum: 0,
+                max: 0,
+                miss: 0,
+            }
+        }
+
+        /// 记一次输入：基线 = 发出时刻的代际快照（帧代际号原语）。
+        fn note_input(&mut self, now_ms: u64, baseline_gen: u64) {
+            self.pending = Some((now_ms, baseline_gen));
+        }
+
+        /// 喂入一帧：仅当 `prod_gen > 基线`（回显帧）才关窗计样本/miss；
+        /// 返回关窗 echo ms（None = 流式帧/无在途，不动窗口）。
+        fn note_feed(&mut self, now_ms: u64, prod_gen: u64) -> Option<u64> {
+            let (at, baseline) = self.pending?;
+            if prod_gen <= baseline {
+                return None; // 流式帧: 不计样本、不关窗 (任务 1.2 口径)
+            }
+            self.pending = None;
+            let echo = now_ms.saturating_sub(at);
+            if echo <= 300 {
+                self.n += 1;
+                self.sum += echo;
+                self.max = self.max.max(echo);
+            } else {
+                self.miss += 1;
+            }
+            Some(echo)
+        }
+
+        /// 取走累计统计并清零（每秒汇总口径）。
+        fn take_stats(&mut self) -> (u64, u64, u64, u64) {
+            let s = (self.n, self.sum, self.max, self.miss);
+            self.n = 0;
+            self.sum = 0;
+            self.max = 0;
+            self.miss = 0;
+            s
+        }
+    }
+
+    static ECHO: Mutex<EchoWindow> = Mutex::new(EchoWindow::new());
 
     fn now_ms() -> u64 {
         START.get_or_init(Instant::now).elapsed().as_millis() as u64
     }
 
-    /// 面板发出一次输入 (键/滚轮) — 关掉它到下一帧的 echo 区间。
+    /// 面板发出一次输入 (键/滚轮) — 开 echo 区间，基线 = 发出时刻的代际
+    /// （帧代际号原语，任务 1.2）。
     pub fn note_input() {
-        INPUT_AT_MS.store(now_ms(), Ordering::Relaxed);
+        let baseline_gen = crate::frame_gen::current();
+        ECHO
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .note_input(now_ms(), baseline_gen);
     }
 
     pub fn note_render(ns: u64) {
@@ -2225,7 +2297,7 @@ mod rate_log {
         maybe_print();
     }
 
-    pub fn note_feed(ns: u64, bytes: usize) {
+    pub fn note_feed(ns: u64, bytes: usize, prod_gen: u64) {
         FEED_N.fetch_add(1, Ordering::Relaxed);
         FEED_NS.fetch_add(ns, Ordering::Relaxed);
         FEED_MAX.fetch_max(ns, Ordering::Relaxed);
@@ -2233,19 +2305,11 @@ mod rate_log {
         FEED_MAX_BYTES.fetch_max(bytes as u64, Ordering::Relaxed);
         let t = now_ms();
         LAST_FEED_MS.store(t, Ordering::Relaxed);
-        let iat = INPUT_AT_MS.swap(u64::MAX, Ordering::Relaxed);
-        if iat != u64::MAX {
-            let echo = t.saturating_sub(iat);
-            if echo <= 300 {
-                ECHO_N.fetch_add(1, Ordering::Relaxed);
-                ECHO_SUM.fetch_add(echo, Ordering::Relaxed);
-                ECHO_MAX.fetch_max(echo, Ordering::Relaxed);
-            } else {
-                // 超 300ms 未回帧: 边界滚动/无效果键 (无重绘, 伪影) 或
-                // pi 极慢重绘 — 单独计数, 不污染延迟统计
-                ECHO_MISS.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        // 任务 1.2 口径: 只有代际 > 基线的回显帧才关窗计样本/miss
+        ECHO
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .note_feed(t, prod_gen);
         maybe_print();
     }
 
@@ -2280,12 +2344,10 @@ mod rate_log {
             LAG_SUM.swap(0, Ordering::Relaxed),
             LAG_MAX.swap(0, Ordering::Relaxed),
         );
-        let (en, es, emax, miss) = (
-            ECHO_N.swap(0, Ordering::Relaxed),
-            ECHO_SUM.swap(0, Ordering::Relaxed),
-            ECHO_MAX.swap(0, Ordering::Relaxed),
-            ECHO_MISS.swap(0, Ordering::Relaxed),
-        );
+        let (en, es, emax, miss) = ECHO
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take_stats();
         if rn == 0 && fn_ == 0 && en == 0 {
             return; // 静默窗口 (纯闲置)
         }
@@ -2303,6 +2365,52 @@ mod rate_log {
             since,
             if rn > 0 { rs as f64 / rn as f64 / 1e6 } else { 0.0 },
         );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::EchoWindow;
+
+        /// 任务 1.2 验证: "连续流式帧 + 回显帧"序列只计回显帧。
+        /// 流式帧 (代际 ≤ 基线, 字节产生于输入注入之前) 不计样本、不关窗;
+        /// 代际 > 基线的首帧 (回显帧) 计样本并关窗, 后续帧不再计。
+        #[test]
+        fn echo_counts_only_first_post_baseline_frame() {
+            let mut w = EchoWindow::new();
+            w.note_input(1000, 5); // t=1000ms, 代际基线 5
+            // 连续流式帧 (旧代际): 不计样本、不关窗
+            assert_eq!(w.note_feed(1010, 5), None);
+            assert_eq!(w.note_feed(1020, 5), None);
+            assert_eq!(w.note_feed(1030, 4), None);
+            // 回显帧 (代际 > 基线): 计样本、关窗
+            assert_eq!(w.note_feed(1050, 6), Some(50));
+            // 窗口已关, 不再计
+            assert_eq!(w.note_feed(1060, 7), None);
+            let (n, sum, max, miss) = w.take_stats();
+            assert_eq!((n, sum, max, miss), (1, 50, 50, 0));
+        }
+
+        /// 任务 1.2: miss 语义保持 (关窗帧 >300ms 单独计数, 不进延迟统计)。
+        #[test]
+        fn echo_miss_over_300ms() {
+            let mut w = EchoWindow::new();
+            w.note_input(1000, 0);
+            assert_eq!(w.note_feed(1010, 0), None); // 流式帧不动窗
+            assert_eq!(w.note_feed(1400, 1), Some(400));
+            assert_eq!(w.take_stats(), (0, 0, 0, 1));
+        }
+
+        /// 旧口径对照: 无在途输入的帧不计样本; 连续输入覆盖前一样本
+        /// (单窗口语义, 与旧 INPUT_AT_MS 覆盖一致)。
+        #[test]
+        fn no_pending_and_overwrite_semantics() {
+            let mut w = EchoWindow::new();
+            assert_eq!(w.note_feed(100, 9), None); // 无在途
+            w.note_input(1000, 0);
+            w.note_input(1100, 1); // 连续输入: 覆盖前一样本
+            assert_eq!(w.note_feed(1110, 2), Some(10));
+            assert_eq!(w.take_stats(), (1, 10, 10, 0));
+        }
     }
 }
 

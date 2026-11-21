@@ -16,7 +16,7 @@
 //! | GUI→服务 | `input.key` / `input.text` / `input.wheel` / `input.click` | `InputKey` / `InputText` / `InputWheel` / `InputClick` | **tell**（静默失败，D6） |
 //! | GUI→服务 | `resize` / `theme` | `ResizeReq` / `ThemeReq` | tell（服务侧 `(cols,rows)` 去重 / 快照更新 + 广播） |
 //! | GUI→服务 | `watch` | `WatchReq` | tell（订阅身份取信封 `from`） |
-//! | 服务→GUI | `frame_bytes` | `FrameBytes { session, Arc<Vec<u8>> }` | tell → watcher：全推（仅变字节）、字节所有权移动零拷贝、出口满丢帧计数 |
+//! | 服务→GUI | `frame_bytes` | `FrameBytes { session, Arc<Vec<u8>>, prod_gen }` | tell → watcher：全推（仅变字节）、字节所有权移动零拷贝、`prod_gen` = 生产代际（帧代际号原语，任务 1.2）、出口满丢帧计数 |
 //! | 服务→GUI | `sessions_changed` | `SessionsChanged(SessionView)` | tell → watcher：事件自带快照（D10 零回程） |
 //! | 服务内部 | `drain.tick` | —（service 私有） | 循环自寻址（D5：tick 仍在 driver 顺序上下文） |
 //! | 框架既有 | `state_change` / `route_error` | `StateChange` / `RouteError` | change service-management-framework 6.1 |
@@ -30,6 +30,7 @@
 
 
 pub mod contract;
+pub mod frame_gen;
 pub mod service;
 pub mod session;
 pub mod shell;

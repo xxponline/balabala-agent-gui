@@ -241,7 +241,9 @@ mod tests {
         let shared = shared.expect("计数测试会话 (非 real-pi 路径)");
         // 喂首帧 → 面板建本地 parser (grid 行/hover/点击/选区的在场前提)
         app.update(cx, |app, cx| {
-            app.terminal.update(cx, |t, cx| t.feed(id, b"probe\r\n", cx));
+            app.terminal.update(cx, |t, cx| {
+                t.feed(id, b"probe\r\n", agent_service::frame_gen::current(), cx)
+            });
         });
         cx.run_until_parked();
         test_sessions::counters(&shared)
