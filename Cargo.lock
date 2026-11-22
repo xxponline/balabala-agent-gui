@@ -5787,7 +5787,7 @@ dependencies = [
 [[package]]
 name = "pi-shell-rs"
 version = "0.1.0"
-source = "git+ssh://git@github.com/xxponline/pi-shell-rs.git#319dd5b670ea0d5b9f1a6e820ed1f951b4465809"
+source = "git+ssh://git@github.com/xxponline/pi-shell-rs.git#eb918514f52e95eac96390d7048163d7f6dd16d6"
 dependencies = [
  "crossterm",
  "pulldown-cmark",
