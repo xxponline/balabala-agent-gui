@@ -128,6 +128,16 @@
   > | 流式 feed/s | 5–12 | 3–12 | 不劣化 | ✅ |
   > 铁证：回显独立小帧 `+9ms/40B`；2k 延迟 = `[draw-cost]` ui 段（冷帧 533ms /
   > 暖帧 9ms），diff/ansi 各 ≤4ms（design.md draw 耗时分解）。
+  >
+  > **注记（H6 follow-up 销账 2026-11-22）**：pi-shell-rs
+  > `2026-11-22-optimize-layout-cache-cold-frame` 交付后同场景复测（release
+  > 档）：**2k 最大化流式打字 输入→帧 avg=11–18ms max=18–26ms ✅**（对照
+  > 220–500ms）；`[draw-cost]` ui 回显 0.8–0.9ms（对照 8.9ms）、流式大帧
+  > 0.9ms、无冷帧尖峰（对照 533ms）。机制：布局缓存失效路径增量重排（内容
+  > 指纹，只重排变化条目）+ 暖帧按条目缓存命中。**档位注意**：debug 档
+  > （`cargo run`）paint/工具卡渲染慢 3–6 倍，同场景输入→帧 144–248ms
+  > （render/s 3–5），性能验收/日常使用请跑 `cargo run --release`。遗留：
+  > 会话载入首建一次性 212ms（tool卡渲染 96%），可作后续 follow-up。
 - [x] 4.2 全量 `cargo test --workspace` 绿、0 warnings；探针清点（2.3）无
   残留或已门控。**验证**：命令输出对账（测试计数与基线无缺失）
 
