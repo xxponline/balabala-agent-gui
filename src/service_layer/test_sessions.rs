@@ -149,7 +149,11 @@ pub fn create_session(
     });
     app.update(cx, |app, cx| app.create_agent(root, cx));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut iters: u32 = 0;
+    let mut max_iter_ms: u128 = 0;
     loop {
+        iters += 1;
+        let t0 = std::time::Instant::now();
         cx.run_until_parked();
         // 手动驱动泵: 多数测试不启 50ms 更新循环 — view 镜像只能靠
         // poll_sessions 消费 mailbox (真实 tokio 线程的回执/投影事件)
@@ -179,10 +183,44 @@ pub fn create_session(
             });
             return (id, shared);
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "create 会话超时: {root:?}"
-        );
+        if std::time::Instant::now() >= deadline {
+            // 诊断: 超时时带上 ask 结果面 + 循环节奏 定位卡点
+            let (notice, dead, pending, create_trace, watch_sent, events_seen, state_sent) =
+                app.read_with(cx, |app, _| {
+                    let mgr = &app.service_layer.manager;
+                    let dead: Vec<String> = mgr
+                        .dead_letters()
+                        .iter()
+                        .map(|d| format!("{}:{:?}", d.kind, d.reason))
+                        .collect();
+                    let create_trace: Vec<String> = mgr
+                        .trace_entries()
+                        .iter()
+                        .filter(|t| t.kind == agent_service::contract::KIND_CREATE)
+                        .map(|t| format!("{:?}:{}", t.direction, t.kind))
+                        .collect();
+                    let state_sent = mgr
+                        .trace_entries()
+                        .iter()
+                        .filter(|t| t.kind == service_manager::KIND_STATE_CHANGE)
+                        .count();
+                    (
+                        app.notice.clone(),
+                        dead,
+                        mgr.pending_count(),
+                        create_trace,
+                        app.service_layer.watch_sent,
+                        app.service_layer.events_seen,
+                        state_sent,
+                    )
+                });
+            panic!(
+                "create 会话超时: {root:?} (notice={notice:?} dead={dead:?} pending={pending} \
+                 create_trace={create_trace:?} watch_sent={watch_sent} events_seen={events_seen} \
+                 state_sent={state_sent} iters={iters} max_iter_ms={max_iter_ms})"
+            );
+        }
+        max_iter_ms = max_iter_ms.max(t0.elapsed().as_millis());
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }

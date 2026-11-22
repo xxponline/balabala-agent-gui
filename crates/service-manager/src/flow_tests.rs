@@ -399,11 +399,20 @@ fn task_4_4_poll_coalesces_but_replies_stay_discrete() {
         .submit(Route::Instance(responder), "b", Payload::new(()))
         .unwrap();
     assert_ne!(c1, c2, "corr 各自独立");
+    // 逐轮 drain 累计到两条: poll 只亮"有新件", 单次 poll 不保证第二条
+    // 已到 — 高负载并行下第二条回复晚到, 一次 drain 会只取到一条
+    let mut replies = Vec::new();
     assert!(
-        wait_until(|| listener.poll(), Duration::from_secs(2)),
+        wait_until(
+            || {
+                listener.poll();
+                replies.extend(listener.drain().filter(|e| e.corr.is_some()));
+                replies.len() >= 2
+            },
+            Duration::from_secs(2)
+        ),
         "两个回复都到"
     );
-    let replies: Vec<_> = listener.drain().filter(|e| e.corr.is_some()).collect();
     assert_eq!(replies.len(), 2, "Reply 逐条, corr 语义不被合并破坏");
     let corrs: Vec<_> = replies.iter().map(|e| e.corr.unwrap()).collect();
     assert!(corrs.contains(&c1) && corrs.contains(&c2));

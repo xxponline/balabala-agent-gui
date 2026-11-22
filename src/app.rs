@@ -1880,9 +1880,41 @@ mod tests {
         (handle, app)
     }
 
+    /// 等异步恢复落定（功能；输入；输出）。
+    /// 功能: `begin_open` 的 probe 跑在真实后台线程 — `run_until_parked` 只
+    ///   冲测试执行器不等它 — 限时轮询直到 pred 成立 (每轮冲执行器 + 真实时
+    ///   让时给后台线程)。
+    /// 输入: app — 被观的 app 实体; pred — 落定判据 (读 TerminalApp);
+    ///   what — 超时诊断文案。
+    /// 输出: pred 成立即返回; 5s 未落定 panic (带 what)。
+    fn wait_startup_settled(
+        cx: &mut TestAppContext,
+        app: &gpui_kit::Entity<TerminalApp>,
+        mut pred: impl FnMut(&TerminalApp) -> bool,
+        what: &str,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            cx.run_until_parked();
+            if cx.update(|cx| pred(app.read(cx))) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "启动恢复未落定: {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// task 6.1: 服务总线接入 — 状态翻转经 50ms 主循环泵落到 GUI
     /// (Listener 接入 poll 门; 无回调, D9)。事件不早产: 主循环未 advance
     /// 时 pump 不跑, disable 事件必在 tick 时被消费 (确定性)。
+    /// 注意: 状态事件经 LayerRuntime 转发循环(异步任务,独立 service-layer
+    /// 线程)投递, 与 mock 时钟的泵拍不同步 — 断言走限时轮询(5s, 每轮
+    /// advance_clock 喂一拍泵 + 真实让时给转发线程调度窗口), 避免高负载
+    /// 并行下单次断言的时序竞态(与 service_layer::disable_event_visible_
+    /// to_gui_pump 的 wait_until 同款)。
     #[gpui_kit::test]
     fn service_state_flip_reaches_gui_via_update_loop(cx: &mut TestAppContext) {
         use std::time::{Duration, Instant};
@@ -1917,7 +1949,10 @@ mod tests {
         // 启动 50ms 主循环 (生产在 main.rs 调; 测试显式启动)
         cx.update(|cx| app_entity.update(cx, |app, cx| app.start_update_loop(cx)));
 
-        // 主动翻转 → 事件落 GUI mailbox → 下个 tick 消费
+        // 主动翻转 → 事件经 LayerRuntime 转发循环(异步任务)投进 GUI
+        // mailbox → 下个 tick 消费。转发与 mock 时钟泵不同步: 限时轮询,
+        // 每轮 advance_clock 喂一拍泵 + 真实让时(给 service-layer 线程
+        // 调度窗口), 直到本地快照翻转或超时。
         cx.update(|cx| {
             app_entity
                 .read(cx)
@@ -1926,22 +1961,26 @@ mod tests {
                 .disable(core_id)
                 .expect("disable")
         });
-        cx.executor().advance_clock(Duration::from_millis(50));
-        cx.run_until_parked();
-
-        let (seen, last) = cx.update(|cx| {
-            let app = app_entity.read(cx);
-            (app.service_layer.events_seen, app.service_layer.last_state)
-        });
-        assert!(
-            seen >= 1,
-            "状态事件经 50ms 泵消费 (Listener 接入): seen={seen}"
-        );
-        assert_eq!(
-            last,
-            Some(service_manager::ServiceState::Offline),
-            "本地快照随事件更新 (D10)"
-        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            cx.executor().advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+            let (seen, core_state) = cx.update(|cx| {
+                let app = app_entity.read(cx);
+                (
+                    app.service_layer.events_seen,
+                    app.service_layer.states.get(&core_id).cloned(),
+                )
+            });
+            if seen >= 1 && core_state == Some(service_manager::ServiceState::Offline) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "状态事件未在 5s 内落到本地快照: seen={seen} core_state={core_state:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let _ = handle;
     }
 
@@ -2072,7 +2111,13 @@ mod tests {
         h.save_at(&history).unwrap();
 
         let (_handle, app_entity) = open_app_with_history(cx, history);
-        cx.run_until_parked(); // 后台 probe → commit
+        // 恢复 probe 在真实后台线程 — 限时轮询等落定 (run_until_parked 不等它)
+        wait_startup_settled(
+            cx,
+            &app_entity,
+            |app| app.workspace.is_some(),
+            "恢复最近工作区",
+        );
         cx.update(|cx| {
             let app = app_entity.read(cx);
             assert!(app.open_failure.is_none(), "合法工作区不报错");
@@ -2095,7 +2140,14 @@ mod tests {
         h.save_at(&history).unwrap();
 
         let (_handle, app_entity) = open_app_with_history(cx, history);
-        cx.run_until_parked();
+        // 恢复 probe 在真实后台线程 — 限时轮询等失败落定 (单次冲执行器会
+        // 在 probe 未跑完时误判 "未记录")
+        wait_startup_settled(
+            cx,
+            &app_entity,
+            |app| app.open_failure.is_some(),
+            "坏 marker 记录失败",
+        );
         cx.update(|cx| {
             let app = app_entity.read(cx);
             let msg = app.open_failure.clone().expect("坏 marker 必须记录失败");

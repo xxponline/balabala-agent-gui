@@ -133,8 +133,10 @@ pub struct ServiceLayer {
     pub agent_id: InstanceId,
     /// 经泵消费到的事件数（测试观测面：证明 Listener 接入 gpui 泵）。
     pub events_seen: usize,
-    /// 最近一次状态翻转（D10 本地快照；状态页 UX 属后续 change）。
-    pub last_state: Option<ServiceState>,
+    /// 各实例最新状态（D10 本地快照按实例口径；状态页 UX 属后续 change）。
+    /// 单槽"最近翻转"会被后到的无关实例事件踩掉（实测: agent 启动事件迟到
+    /// 覆盖 core 的 Offline）— 断言/消费方一律按实例查表。
+    pub states: HashMap<InstanceId, ServiceState>,
     /// `sessions_changed` 投影镜像（task 3.1；sidebar/active 渲染源）。
     pub sessions_view: Option<SessionView>,
     /// 待消费帧（task 3.1；app 泵转发给 AgentTerminal.feed）。
@@ -196,13 +198,38 @@ impl ServiceLayer {
         let listener = manager.new_mailbox(64);
         manager.subscribe_state(core_id, &listener);
         manager.subscribe_state(agent_id, &listener);
+        // 订阅时序补给 (竞态修复): driver 的 InitOk 翻转是异步任务, 可能抢在
+        // subscribe_state 之前发布 — 订阅表还空, 启动状态事件被静默丢弃
+        // (实测: 高负载并行下 watch 握手因此断链, 会话投影永不产生)。
+        // 订阅后按快照补发等价事件: 与真事件同形 (from=Loading), 消费方幂等
+        // (watch/agent_ready 均一次性守卫), 重复到达无害。
+        for (id, name) in [(core_id, "core.fake"), (agent_id, "agent")] {
+            let Some(state) = manager.supervisor().state_of(id) else {
+                continue; // 未装载: 不可能 (上文刚 load)
+            };
+            if state == ServiceState::Loading {
+                continue; // 尚未翻转: 真事件晚些必达 (订阅已在位)
+            }
+            let env = Envelope::new(
+                Route::Instance(listener.id()),
+                listener.address().clone(),
+                KIND_STATE_CHANGE,
+                Payload::new(StateChange {
+                    instance: id,
+                    service: name.to_string().into(),
+                    from: ServiceState::Loading,
+                    to: state,
+                }),
+            );
+            let _ = manager.tell(env);
+        }
         Ok(ServiceLayer {
             manager,
             listener,
             core_id,
             agent_id,
             events_seen: 0,
-            last_state: None,
+            states: HashMap::new(),
             sessions_view: None,
             frames: Vec::new(),
             notices: Vec::new(),
@@ -228,7 +255,7 @@ impl ServiceLayer {
             match env.kind {
                 KIND_STATE_CHANGE => {
                     if let Ok(change) = env.downcast::<StateChange>() {
-                        self.last_state = Some(change.to);
+                        self.states.insert(change.instance, change.to);
                         // agent 就绪 → 补发 watch 握手 (D3: from 即订阅身份)
                         if !self.watch_sent
                             && change.instance == self.agent_id
@@ -425,12 +452,12 @@ mod tests {
             wait_until(
                 || {
                     layer.pump();
-                    layer.last_state == Some(ServiceState::Available)
+                    layer.states.get(&layer.core_id) == Some(&ServiceState::Available)
                 },
                 Duration::from_secs(3)
             ),
             "状态翻转经订阅路由到达 GUI mailbox: {:?}",
-            layer.last_state
+            layer.states
         );
         assert!(layer.events_seen >= 1);
 
@@ -454,12 +481,12 @@ mod tests {
             wait_until(
                 || {
                     layer.pump();
-                    layer.last_state == Some(ServiceState::Available)
+                    layer.states.get(&layer.agent_id) == Some(&ServiceState::Available)
                 },
                 Duration::from_secs(3)
             ),
             "agent 状态翻转到 Available: {:?}",
-            layer.last_state
+            layer.states
         );
         assert!(layer.events_seen >= 1, "状态事件被 pump 消费");
         std::fs::remove_dir_all(&dir).ok();
@@ -577,23 +604,63 @@ mod tests {
     fn disable_event_visible_to_gui_pump() {
         let dir = temp_scan("disable");
         let mut layer = ServiceLayer::bootstrap(&dir).expect("bootstrap");
-        assert!(wait_until(
+        if !wait_until(
             || {
                 layer.pump();
-                layer.last_state == Some(ServiceState::Available)
+                layer.states.get(&layer.core_id) == Some(&ServiceState::Available)
             },
-            Duration::from_secs(3)
-        ));
+            Duration::from_secs(3),
+        ) {
+            // 诊断: 启动状态事件未达 — 区分"发布前订阅未就位(事件丢)"vs"慢"
+            let trace: Vec<String> = layer
+                .manager
+                .trace_entries()
+                .iter()
+                .filter(|t| t.kind == KIND_STATE_CHANGE)
+                .map(|t| format!("{:?}:{}", t.direction, t.kind))
+                .collect();
+            let dead: Vec<String> = layer
+                .manager
+                .dead_letters()
+                .iter()
+                .map(|d| format!("{}:{:?}", d.kind, d.reason))
+                .collect();
+            panic!(
+                "core.fake 启动 Available 事件未达 (3s): state_sent={trace:?} \
+                 dead={dead:?} seen={} states={:?}",
+                layer.events_seen, layer.states
+            );
+        }
         let seen_before = layer.events_seen;
 
         layer.manager.disable(layer.core_id).expect("disable");
-        assert!(wait_until(
+        if !wait_until(
             || {
                 layer.pump();
-                layer.last_state == Some(ServiceState::Offline)
+                layer.states.get(&layer.core_id) == Some(&ServiceState::Offline)
             },
-            Duration::from_secs(3)
-        ));
+            Duration::from_secs(3),
+        ) {
+            // 诊断: Offline 事件未达 — state_sent 含补发/启动/本次, 分辨卡点
+            let trace: Vec<String> = layer
+                .manager
+                .trace_entries()
+                .iter()
+                .filter(|t| t.kind == KIND_STATE_CHANGE)
+                .map(|t| format!("{:?}:{}", t.direction, t.kind))
+                .collect();
+            let dead: Vec<String> = layer
+                .manager
+                .dead_letters()
+                .iter()
+                .map(|d| format!("{}:{:?}", d.kind, d.reason))
+                .collect();
+            panic!(
+                "disable Offline 事件未达 (3s): state_sent={trace:?} dead={dead:?} \
+                 seen={} states={:?}",
+                layer.events_seen, layer.states
+            );
+        }
         assert!(layer.events_seen > seen_before, "新事件被消费");
         std::fs::remove_dir_all(&dir).ok();
     }
