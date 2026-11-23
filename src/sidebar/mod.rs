@@ -125,42 +125,47 @@ pub struct SidebarSnapshot {
     pub ws: Option<WsView>,
 }
 
-/// 从 model + 服务投影镜像快照 (render 内调用; 会话归 AgentService,
-/// GUI 读 `sessions_view` 镜像 — change agent-service 3.2, D4)。
+/// 从服务投影镜像快照 (render 内调用; 会话归 AgentService, 项目树归
+/// solution 服务 — change solution-service 5.4: 视图读镜像, 无本地副本)。
 fn snapshot(app: &TerminalApp, _cx: &App) -> SidebarSnapshot {
     let ws = app.workspace.as_ref().map(|ws| {
         let view = app.service_layer.sessions_view();
-        let projects = ws
-            .model
-            .projects
-            .iter()
-            .map(|p| {
-                let collapsed = ws.collapsed_projects.contains(&p.root);
-                let agents = if collapsed {
-                    Vec::new()
-                } else {
-                    view.map(|v| {
-                        v.sessions
-                            .iter()
-                            .filter(|s| s.project_root == p.root)
-                            .map(|s| AgentRow {
-                                id: s.id,
-                                name: s.name.clone(),
-                                status: s.status,
-                                is_active: app.active == Some(s.id),
+        let projects = app
+            .service_layer
+            .tree_view()
+            .map(|t| {
+                t.tree
+                    .projects
+                    .iter()
+                    .map(|p| {
+                        let collapsed = ws.collapsed_projects.contains(&p.root);
+                        let agents = if collapsed {
+                            Vec::new()
+                        } else {
+                            view.map(|v| {
+                                v.sessions
+                                    .iter()
+                                    .filter(|s| s.project_root == p.root)
+                                    .map(|s| AgentRow {
+                                        id: s.id,
+                                        name: s.name.clone(),
+                                        status: s.status,
+                                        is_active: app.active == Some(s.id),
+                                    })
+                                    .collect::<Vec<_>>()
                             })
-                            .collect::<Vec<_>>()
+                            .unwrap_or_default()
+                        };
+                        ProjectRow {
+                            root: p.root.to_string_lossy().into_owned(),
+                            name: p.name.clone(),
+                            collapsed,
+                            agents,
+                        }
                     })
-                    .unwrap_or_default()
-                };
-                ProjectRow {
-                    root: p.root.to_string_lossy().into_owned(),
-                    name: p.name.clone(),
-                    collapsed,
-                    agents,
-                }
+                    .collect::<Vec<_>>()
             })
-            .collect::<Vec<_>>();
+            .unwrap_or_default();
         let show_add_solution = projects.is_empty();
         WsView {
             display_name: ws.display_name().to_string(),

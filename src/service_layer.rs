@@ -20,8 +20,15 @@ use service_manager::{
     ContractId, Corr, Envelope, InstanceId, Listener, Payload, Route, Service, ServiceCtx,
     ServiceFuture, ServiceManager, ServiceState, StateChange, KIND_ROUTE_ERROR, KIND_STATE_CHANGE,
 };
+// change solution-service task 2.2: Solution/Project 域服务接入（design D1）。
+use solution_service::contract::{
+    OpError as SolOpError, OpResult as SolOpResult, SolutionContract, TreeChanged as SolTreeChanged,
+    TreeSnapshot, WatchReq as SolWatchReq, KIND_LOAD, KIND_OP_REPLY as KIND_SOLUTION_REPLY,
+    KIND_TREE_CHANGED as KIND_SOLUTION_CHANGED, KIND_WATCH as KIND_SOLUTION_WATCH,
+};
+use solution_service::service::solution_service_factory;
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 
@@ -153,6 +160,23 @@ pub struct ServiceLayer {
     /// agent 就绪一次性信号 (pump 见 Available 置位; app 据此补推主题 —
     /// 服务快照默认深色, 宿主主题为准 — task 3.2)。
     agent_ready: bool,
+    /// solution 域服务实例 id（change solution-service task 2.2；树路由目标）。
+    pub solution_id: InstanceId,
+    /// 项目树镜像（`tree_changed` 快照 + 操作回执自带快照；视图/交树渲染源）。
+    tree_view: Option<TreeSnapshot>,
+    /// 测试注入覆盖 (优先于真实镜像 — 无头测试不经真实 load 时的视图
+    /// 数据源; 服务首推空快照不得踩掉注入值)。
+    #[cfg(test)]
+    tree_view_override: Option<TreeSnapshot>,
+    /// solution watch 握手已发出（同 agent 的 loading 规避时序，task 2.2）。
+    solution_watch_sent: bool,
+    /// solution 操作台账: corr -> 标签（回执/route_error 配对）。
+    pending_sol_ops: HashMap<Corr, &'static str>,
+    /// solution load 台账: corr 集合（回执进 `load_results` 供打开链路拉取）。
+    pending_loads: HashSet<Corr>,
+    /// load 回执队列: corr -> 回执（打开链路轮询消费——pull 模式纪律：
+    /// 不 oneshot await，确定性测试调度器禁止外线程唤醒，design D8）。
+    load_results: Vec<(Corr, SolOpResult)>,
 }
 
 /// core.fake 契约类标记（change `singleton-per-contract`, design D1）：
@@ -192,18 +216,35 @@ impl ServiceLayer {
         let agent_id = manager
             .load(&"agent".into())
             .map_err(|e| format!("load agent: {e}"))?;
+        // change solution-service task 2.2: Solution/Project 域服务 (design D1)。
+        manager.register_contract("solution", ContractId::of::<SolutionContract>());
+        manager
+            .register_internal(
+                "solution",
+                solution_service_factory,
+                ContractId::of::<SolutionContract>(),
+            )
+            .map_err(|e| format!("register solution: {e}"))?;
+        let solution_id = manager
+            .load(&"solution".into())
+            .map_err(|e| format!("load solution: {e}"))?;
         // GUI = 普通参与者: 自己的 mailbox + 订阅 (= 往路由表加规则, D7/D9)
         // watch 握手不在这里发: 刚 load 的实例仍 loading, tell 会被 fail-fast
         // 拒 (target not available) — 由 pump 见 agent Available 事件时补发。
         let listener = manager.new_mailbox(64);
         manager.subscribe_state(core_id, &listener);
         manager.subscribe_state(agent_id, &listener);
+        manager.subscribe_state(solution_id, &listener);
         // 订阅时序补给 (竞态修复): driver 的 InitOk 翻转是异步任务, 可能抢在
         // subscribe_state 之前发布 — 订阅表还空, 启动状态事件被静默丢弃
         // (实测: 高负载并行下 watch 握手因此断链, 会话投影永不产生)。
         // 订阅后按快照补发等价事件: 与真事件同形 (from=Loading), 消费方幂等
         // (watch/agent_ready 均一次性守卫), 重复到达无害。
-        for (id, name) in [(core_id, "core.fake"), (agent_id, "agent")] {
+        for (id, name) in [
+            (core_id, "core.fake"),
+            (agent_id, "agent"),
+            (solution_id, "solution"),
+        ] {
             let Some(state) = manager.supervisor().state_of(id) else {
                 continue; // 未装载: 不可能 (上文刚 load)
             };
@@ -237,6 +278,14 @@ impl ServiceLayer {
             successes: Vec::new(),
             watch_sent: false,
             agent_ready: false,
+            solution_id,
+            tree_view: None,
+            #[cfg(test)]
+            tree_view_override: None,
+            solution_watch_sent: false,
+            pending_sol_ops: HashMap::new(),
+            pending_loads: HashSet::new(),
+            load_results: Vec::new(),
         })
     }
 
@@ -272,6 +321,21 @@ impl ServiceLayer {
                                 self.agent_ready = true; // 一次性: app 补推主题
                             }
                         }
+                        // change solution-service 2.2: solution watch 握手同款时序
+                        if !self.solution_watch_sent
+                            && change.instance == self.solution_id
+                            && change.to == ServiceState::Available
+                        {
+                            let watch = Envelope::new(
+                                Route::Instance(self.solution_id),
+                                watch_from.clone(),
+                                KIND_SOLUTION_WATCH,
+                                Payload::new(SolWatchReq),
+                            );
+                            if self.manager.tell(watch).is_ok() {
+                                self.solution_watch_sent = true;
+                            }
+                        }
                     }
                     self.events_seen += 1;
                 }
@@ -286,7 +350,19 @@ impl ServiceLayer {
                         Some((_, label)) => {
                             self.notices.push(format!("{label}失败: {msg}"));
                         }
-                        None => self.notices.push(format!("服务请求失败: {msg}")),
+                        None => {
+                            if let Some(c) = env.corr.filter(|c| self.pending_loads.remove(c)) {
+                                // load 链路: 路由失败也进回执队列 (打开流程统一收口)
+                                self.load_results.push((
+                                    c,
+                                    Err(SolOpError::Persist(format!(
+                                        "solution 服务请求失败: {msg}"
+                                    ))),
+                                ));
+                            } else {
+                                self.notices.push(format!("服务请求失败: {msg}"));
+                            }
+                        }
                     }
                 }
                 // ---- task 3.1: 分流 ----
@@ -317,6 +393,41 @@ impl ServiceLayer {
                         }
                     }
                 }
+                // ---- change solution-service 2.2: 树镜像 + 操作回执 ----
+                KIND_SOLUTION_CHANGED => {
+                    self.events_seen += 1;
+                    if let Ok(changed) = env.downcast::<SolTreeChanged>() {
+                        self.tree_view = Some(changed.0.clone());
+                    }
+                }
+                KIND_SOLUTION_REPLY => {
+                    self.events_seen += 1;
+                    let corr = env.corr;
+                    let is_load = corr.is_some_and(|c| self.pending_loads.remove(&c));
+                    let paired = corr.and_then(|c| self.pending_sol_ops.remove(&c));
+                    match env.downcast::<SolOpResult>() {
+                        Ok(res) => {
+                            let res = res.clone();
+                            if let Ok(snap) = &res {
+                                // 回执自带快照: 镜像零回程（对齐 SessionsChanged 纪律）
+                                self.tree_view = Some(snap.clone());
+                            }
+                            if is_load {
+                                // 打开链路: 落回执队列, 由 begin_open 的轮询拉取
+                                if let Some(c) = corr {
+                                    self.load_results.push((c, res));
+                                }
+                            } else if let (Err(e), Some(label)) = (&res, paired) {
+                                self.notices.push(format!("{label}失败: {e}"));
+                            }
+                        }
+                        Err(_) => {
+                            if let Some(label) = paired {
+                                self.notices.push(format!("{label}失败: 回执类型不匹配"));
+                            }
+                        }
+                    }
+                }
                 _ => {
                     self.events_seen += 1;
                 }
@@ -339,6 +450,65 @@ impl ServiceLayer {
         let corr = self.listener.submit(route, kind, payload)?;
         self.pending_ops.insert(corr, (op, label));
         Ok(corr)
+    }
+
+    /// solution 操作 ask 通道（change solution-service 2.2；D6 约定同
+    /// `submit_control`——用户操作一律 ask）：回执/route_error 由 `pump`
+    /// 配对，失败入 notice；成功回执自带树快照进镜像。
+    #[allow(dead_code)] // app 控制链在 5.x 接线
+    pub fn submit_solution_op(
+        &mut self,
+        kind: &'static str,
+        payload: Payload,
+        label: &'static str,
+    ) -> Result<Corr, service_manager::RouteError> {
+        let corr = self
+            .listener
+            .submit(Route::Service("solution".into()), kind, payload)?;
+        self.pending_sol_ops.insert(corr, label);
+        Ok(corr)
+    }
+
+    /// 当前项目树镜像（视图/交树渲染源；`tree_changed` 快照 + 操作回执）。
+    #[allow(dead_code)] // 视图读取在 5.x 接线
+    pub fn tree_view(&self) -> Option<&TreeSnapshot> {
+        #[cfg(test)]
+        if let Some(snap) = self.tree_view_override.as_ref() {
+            return Some(snap);
+        }
+        self.tree_view.as_ref()
+    }
+
+    /// 测试缝: 注入项目树镜像 (无头测试不经真实 load 时的视图数据源;
+    /// 优先于真实镜像, 不被服务首推空快照踩掉)。
+    #[cfg(test)]
+    pub(crate) fn set_tree_view_for_test(&mut self, snap: TreeSnapshot) {
+        self.tree_view_override = Some(snap);
+    }
+
+    /// solution load ask（打开链路；**pull 模式纪律**——回执经泵落
+    /// [`Self::take_load_result`] 由调用点轮询拉取，不经 oneshot await：
+    /// 确定性测试调度器禁止外线程唤醒，design D8）。
+    pub fn submit_solution_load(
+        &mut self,
+        payload: Payload,
+    ) -> Result<Corr, service_manager::RouteError> {
+        let corr = self
+            .listener
+            .submit(Route::Service("solution".into()), KIND_LOAD, payload)?;
+        self.pending_loads.insert(corr);
+        Ok(corr)
+    }
+
+    /// 按 corr 取走一条 load 回执（打开链路轮询）。
+    pub fn take_load_result(&mut self, corr: Corr) -> Option<SolOpResult> {
+        let ix = self.load_results.iter().position(|(c, _)| *c == corr)?;
+        Some(self.load_results.remove(ix).1)
+    }
+
+    /// 放弃一条 load（超时收尾：摘台账，迟到回执将被无主丢弃）。
+    pub fn abandon_load(&mut self, corr: Corr) {
+        self.pending_loads.remove(&corr);
     }
 
     /// 取走待转发帧（app 泵 → AgentTerminal.feed）。
@@ -445,7 +615,11 @@ mod tests {
         let dir = temp_scan("boot");
         let mut layer = ServiceLayer::bootstrap(&dir).expect("bootstrap");
         assert!(layer.manager.has_service(&"core.fake".into()), "Catalog 登记");
-        assert_eq!(layer.manager.instance_count(), 2, "core.fake + agent 均已装载");
+        assert_eq!(
+            layer.manager.instance_count(),
+            3,
+            "core.fake + agent + solution 均已装载"
+        );
 
         // init 完成 (loading → available 事件应达订阅者)
         assert!(
@@ -473,7 +647,7 @@ mod tests {
         let dir = temp_scan("agent-boot");
         let mut layer = ServiceLayer::bootstrap(&dir).expect("bootstrap");
         assert!(layer.manager.has_service(&"agent".into()), "Catalog 登记 agent");
-        assert_eq!(layer.manager.instance_count(), 2, "core.fake + agent");
+        assert_eq!(layer.manager.instance_count(), 3, "core.fake + agent + solution");
         assert_ne!(layer.agent_id, layer.core_id, "实例 id 独立分配");
 
         // loading → available 翻转经订阅路由到达 GUI mailbox
@@ -489,6 +663,98 @@ mod tests {
             layer.states
         );
         assert!(layer.events_seen >= 1, "状态事件被 pump 消费");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// change solution-service task 2.2 验证：create/configure 后树变更
+    /// 通知到达且镜像更新（含注册门控对 handoff 的收缩）。
+    #[test]
+    fn solution_tree_changed_reaches_mirror() {
+        use solution_service::contract::{
+            ConfigureReq, CreateReq, KIND_CONFIGURE, KIND_CREATE,
+        };
+
+        let dir = temp_scan("sol-mirror");
+        let mut layer = ServiceLayer::bootstrap(&dir).expect("bootstrap");
+        assert!(
+            layer.manager.has_service(&"solution".into()),
+            "Catalog 登记 solution"
+        );
+        assert_eq!(
+            layer.manager.instance_count(),
+            3,
+            "core.fake + agent + solution"
+        );
+
+        // solution Available + watch 握手 → 首推全量快照进镜像
+        assert!(
+            wait_until(
+                || {
+                    layer.pump();
+                    layer.tree_view.is_some()
+                },
+                Duration::from_secs(3)
+            ),
+            "watch 握手后首推快照进镜像: {:?}",
+            layer.states
+        );
+
+        // create: 真实项目目录（simple item 的 path 必须存在）
+        let proj = dir.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        layer
+            .submit_solution_op(
+                KIND_CREATE,
+                Payload::new(CreateReq {
+                    workspace_dir: dir.clone(),
+                    path: proj.clone(),
+                }),
+                "创建 solution",
+            )
+            .expect("submit create");
+        assert!(
+            wait_until(
+                || {
+                    layer.pump();
+                    matches!(layer.tree_view, Some(ref t) if t.tree.projects.len() == 1)
+                },
+                Duration::from_secs(3)
+            ),
+            "create 后树变更通知到达且镜像更新"
+        );
+        assert_eq!(
+            layer.tree_view.as_ref().unwrap().handoff.projects.len(),
+            1,
+            "默认双 true: 交树含新 project"
+        );
+
+        // configure: 关注册 → handoff 收缩, 全量集保留 (spec: Asset
+        // registration flag gates project handoff)
+        layer
+            .submit_solution_op(
+                KIND_CONFIGURE,
+                Payload::new(ConfigureReq {
+                    workspace_dir: dir.clone(),
+                    solution_path: proj,
+                    register_to_asset_manager: Some(false),
+                    git_enabled: None,
+                }),
+                "配置 solution",
+            )
+            .expect("submit configure");
+        assert!(
+            wait_until(
+                || {
+                    layer.pump();
+                    matches!(
+                        layer.tree_view,
+                        Some(ref t) if t.handoff.projects.is_empty() && t.tree.projects.len() == 1
+                    )
+                },
+                Duration::from_secs(3)
+            ),
+            "configure 后门控交树收缩, solution 的 project 集保留"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

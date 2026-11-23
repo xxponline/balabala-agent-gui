@@ -212,8 +212,10 @@
         touch(&p1.join("src/x.log"));
         touch(&p2.join("src/x.log"));
         let projects = vec![
-            Project::from_root(p1.clone()),
-            Project::from_root(p2.clone()),
+            // 供给前提: 项目 git 管理 → is_git 解析产出 = true (change
+            // solution-service 4.2: 判定来自标志, 不再运行时探测)
+            Project::from_root_with_git(p1.clone(), true),
+            Project::from_root_with_git(p2.clone(), true),
         ]
         .into_iter()
         .map(own)
@@ -582,29 +584,5 @@
             };
             let labels: Vec<&str> = nodes.iter().map(|n| n.label.as_str()).collect();
             assert_eq!(labels, ["alpha", "beta"], "保 solution 序");
-        });
-    }
-
-    /// 2.4: 增量注册按 `owner.root()` 幂等 — 同根二次注册被拒,
-    /// 首个源的行保留 (Level 2 记账走 trait 访问器)。
-    #[gpui_kit::test]
-    fn fake_owner_root_dedups_incremental_register(cx: &mut TestAppContext) {
-        let app = open_app(cx);
-        let manager = manager_of(cx, &app);
-        let ws = temp_dir("fake-dedup-ws");
-
-        // 先置 ws_dir (空注册) — register_project 仅在有 ws_dir 时启动枚举
-        manager.update(cx, |m, cx| m.register(ws, Vec::new(), cx));
-        let root = PathBuf::from("/fake-root");
-        manager.update(cx, |m, cx| m.register_project(Box::new(fake(&root, "first")), cx));
-        manager.update(cx, |m, cx| m.register_project(Box::new(fake(&root, "second")), cx));
-        cx.run_until_parked();
-        cx.update(|cx| {
-            let view = manager.read(cx).state();
-            let AssetState::Forest { nodes } = &view else {
-                panic!("应落地 Forest, got {view:?}")
-            };
-            assert_eq!(nodes.len(), 1, "同 root 幂等: 只留首个");
-            assert_eq!(nodes[0].label, "first");
         });
     }

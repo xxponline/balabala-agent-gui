@@ -72,9 +72,12 @@
 
     /// 注入一个以 `ws` 为根的注册项目 (真实 FileEnumerator 链)。
     /// 旧 `set_source` 测试缝的继任: 注册缝 (design D7 — 测试直连 manager)。
+    /// is_git 由 fixture 现算 (write_rules 建 `.git` = git 管理; change
+    /// solution-service 4.2: 判定来自解析标志, 不再运行时探测)。
     fn register_ws(app: &gpui_kit::Entity<TerminalApp>, ws: &Path, cx: &mut TestAppContext) {
         app.update(cx, |app, cx| {
-            let project = Project::from_root(ws.to_path_buf());
+            let project =
+                Project::from_root_with_git(ws.to_path_buf(), ws.join(".git").exists());
             app.asset_manager
                 .update(cx, |m, cx| m.register(ws.to_path_buf(), vec![Box::new(project) as Box<dyn EnumeratorOwner + Send>], cx));
         });
@@ -910,7 +913,11 @@
         // 规则在项目根 .gitignore (D9), 与 marker
         // 无涉 — 先建工作区文件后写规则即可
         crate::project_model::create_workspace_files(&ws1).unwrap();
-        crate::project_model::append_simple_solution(&ws1, ws1.clone()).unwrap();
+        std::fs::write(
+            crate::project_model::files::solutions_path(&ws1),
+            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, ws1.display()),
+        )
+        .unwrap();
         write_rules(&ws1, &["*.log"]);
 
         // 隔离历史: commit 会写历史, 不得污染进程共享的默认路径
@@ -973,15 +980,29 @@
         })
         .expect("update window");
 
-        // 加 solution (工作区外项目) → 增量注册, 无重启
+        // 加 solution (工作区外项目) → 增量注册, 无重启 (5.2: create ask)
         let p2 = temp_ws("chain-p2");
         std::fs::write(p2.join("second.rs"), "x").unwrap();
-        app.update(cx, |app, cx| {
-            let items =
-                crate::project_model::append_simple_solution(&ws1, p2.clone()).unwrap();
-            app.apply_add_solution(p2.clone(), Ok(items), cx);
-        });
-        cx.run_until_parked();
+        app.update(cx, |app, cx| app.request_create_solution(p2.clone(), cx));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            cx.run_until_parked();
+            app.update(cx, |app, cx| {
+                app.poll_sessions(cx);
+            });
+            let done = cx.update(|cx| {
+                app.read(cx)
+                    .service_layer
+                    .tree_view()
+                    .is_some_and(|t| t.tree.projects.iter().any(|p| p.root == p2))
+            });
+            if done {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "create p2 未落定");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        cx.run_until_parked(); // 注册枚举异步落地
         render(handle, cx);
         cx.update_window(handle, |_, window, _cx| {
             assert!(
@@ -1001,7 +1022,11 @@
         let ws2 = temp_ws("chain2");
         std::fs::write(ws2.join("only2.txt"), "x").unwrap();
         crate::project_model::create_workspace_files(&ws2).unwrap();
-        crate::project_model::append_simple_solution(&ws2, ws2.clone()).unwrap();
+        std::fs::write(
+            crate::project_model::files::solutions_path(&ws2),
+            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, ws2.display()),
+        )
+        .unwrap();
         app.update(cx, |app, cx| app.begin_open(ws2.clone(), cx));
         cx.run_until_parked();
         render(handle, cx);

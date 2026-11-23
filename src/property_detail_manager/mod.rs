@@ -84,7 +84,6 @@ mod tests {
     use super::*;
     use crate::app::TerminalApp;
     use crate::sidebar::SidebarEvent;
-    use crate::project_model::WorkspaceModel;
     use crate::workspace::Workspace;
     use gpui_kit::component::dock::BasePanel;
     use gpui_kit::component::dock::PanelHandle;
@@ -234,7 +233,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
         std::fs::create_dir_all(&ws).unwrap();
         app.update(cx, |app, cx| {
-            app.workspace = Some(Workspace::new(ws.clone(), WorkspaceModel::default()));
+            app.workspace = Some(Workspace::new(ws.clone()));
             app.notify_panels(cx);
         });
         let (id, shared) = test_sessions::create_session(cx, app, &ws);
@@ -1285,7 +1284,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
         std::fs::create_dir_all(&ws).unwrap();
         app.update(cx, |app, _cx| {
-            app.workspace = Some(Workspace::new(ws.clone(), WorkspaceModel::default()));
+            app.workspace = Some(Workspace::new(ws.clone()));
         });
         let (agent_id, _shared) =
             crate::service_layer::test_sessions::create_session(cx, &app, &ws);

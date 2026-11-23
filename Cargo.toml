@@ -28,6 +28,8 @@ contracts = { path = "crates/contracts" }
 service-manager = { path = "crates/service-manager" }
 # change agent-service task 1.3: GUI -> agent-service -> service-core (design D7)
 agent-service = { path = "crates/agent-service" }
+# change solution-service task 2.2: GUI -> solution-service (design D1/D7)
+solution-service = { path = "crates/solution-service" }
 
 [dev-dependencies]
 # 仅测试构建启用 (resolver 不会把 dev 特性并入 cargo build)：

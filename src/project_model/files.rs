@@ -10,8 +10,6 @@
 
 use std::path::{Path, PathBuf};
 
-use super::solution::SolutionItem;
-
 /// 工作区 marker 文件名 (身份 + 配置)。
 pub const MARKER_FILE: &str = ".balabala.workspace.json";
 /// solution 配置文件名。
@@ -99,34 +97,8 @@ pub fn create_workspace_files(workspace_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// 追加一个 `simple` solution item (保留既有 items 与顺序)。
-///
-/// solutions 文件缺失视作空数组 (spec: 缺失 = 合法空工作区)。
-/// 调用方负责写失败时的红条契约 (workspace-management: Persistence
-/// write failure surfacing)。
-pub fn append_simple_solution(
-    workspace_dir: &Path,
-    path: PathBuf,
-) -> Result<Vec<SolutionItem>, String> {
-    let mut items = load_solutions(workspace_dir)
-        .map_err(|e| format!("{}: {e}", solutions_path(workspace_dir).display()))?;
-    items.push(SolutionItem::Simple { path });
-    let json = serde_json::to_string_pretty(&items).map_err(|e| format!("serialize: {e}"))?;
-    std::fs::write(solutions_path(workspace_dir), json)
-        .map_err(|e| format!("write {}: {e}", solutions_path(workspace_dir).display()))?;
-    Ok(items)
-}
-
-/// 读 solution items: 文件缺失 → 空 (合法); 读/解析失败 → Err。
-pub(super) fn load_solutions(workspace_dir: &Path) -> Result<Vec<SolutionItem>, String> {
-    let path = solutions_path(workspace_dir);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let contents =
-        std::fs::read_to_string(&path).map_err(|e| format!("read {path:?}: {e}"))?;
-    serde_json::from_str(&contents).map_err(|e| format!("parse {path:?}: {e}"))
-}
+// solution items 的解析/追加已随 solution 服务迁移 (change
+// solution-service 5.2: 创建走服务 Create ask, 解析归服务 loader)。
 
 #[cfg(test)]
 mod tests {
@@ -155,7 +127,11 @@ mod tests {
             solutions_path(&dir).exists(),
             "solutions 应存在 (创建即写空数组)"
         );
-        assert_eq!(load_solutions(&dir).unwrap(), Vec::new());
+        assert_eq!(
+            fs::read_to_string(solutions_path(&dir)).unwrap().trim(),
+            "[]",
+            "创建即写空数组"
+        );
         match marker_status(&dir) {
             MarkerStatus::Valid(m) => assert_eq!(m.version, MARKER_VERSION),
             other => panic!("marker 应合法, got {other:?}"),
@@ -190,29 +166,6 @@ mod tests {
             matches!(marker_status(&dir), MarkerStatus::Corrupt(_)),
             "未知版本 = 不可解析 (错误契约)"
         );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn append_preserves_existing_items() {
-        let dir = temp_dir("append");
-        create_workspace_files(&dir).unwrap();
-        append_simple_solution(&dir, "/a/one".into()).unwrap();
-        append_simple_solution(&dir, "/a/two".into()).unwrap();
-        let items = load_solutions(&dir).unwrap();
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0], SolutionItem::Simple { path: "/a/one".into() });
-        assert_eq!(items[1], SolutionItem::Simple { path: "/a/two".into() });
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn append_works_when_solutions_file_missing() {
-        let dir = temp_dir("append-missing");
-        create_workspace_files(&dir).unwrap();
-        fs::remove_file(solutions_path(&dir)).unwrap();
-        append_simple_solution(&dir, "/a/x".into()).unwrap();
-        assert_eq!(load_solutions(&dir).unwrap().len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 }

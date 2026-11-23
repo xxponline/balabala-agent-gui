@@ -631,6 +631,7 @@ dependencies = [
  "serde",
  "serde_json",
  "service-manager",
+ "solution-service",
  "vt100",
  "windows-sys 0.61.2",
 ]
@@ -7479,6 +7480,15 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "solution-service"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "service-core",
 ]
 
 [[package]]

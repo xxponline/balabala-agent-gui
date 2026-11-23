@@ -19,13 +19,16 @@ use agent_service::contract::{
     KIND_INPUT_TEXT, KIND_INPUT_WHEEL, KIND_RESIZE, KIND_SELECT, KIND_THEME,
 };
 use service_manager::{Envelope, Payload, Route};
+// change solution-service 2.3/5.2: 打开链路 load + create 均走服务 ask (design D8)
+use solution_service::contract::{CreateReq as SolCreateReq, LoadReq, TreeSnapshot};
+use solution_service::contract::KIND_CREATE as KIND_SOLUTION_CREATE;
 
 use crate::service_layer::CtrlOp;
 use agent_service::terminal::{AgentTerminal, TerminalCopy, TerminalTab};
 use crate::property_detail_manager::{OpenObject, active_center_panel_id, handler_for};
 use crate::shell;
 use crate::assets::{AssetManager, AssetView, traits::EnumeratorOwner};
-use crate::project_model::{self, MarkerStatus, WorkspaceModel};
+use crate::project_model::{self, MarkerStatus};
 use crate::sidebar::{SidebarEvent, SidebarPanel};
 use crate::workspace::history::History;
 use crate::workspace::Workspace;
@@ -39,6 +42,9 @@ pub struct TerminalApp {
     /// 当前打开的工作区 (单实例, spec: Startup workspace restore;
     /// None = 空态, 等待目录选择器)
     pub workspace: Option<Workspace>,
+    /// 树镜像 → 资产注册的装配单点记忆 `(workspace path, snapshot)`:
+    /// 快照未变零动作 (change solution-service 5.4)。
+    last_handoff: Option<(PathBuf, TreeSnapshot)>,
     /// 打开代号: `begin_open` 自增, `commit_open` 校验 — 旧 load 的结果
     /// 直接丢弃 (design D5: 切换与在途加载的竞态)
     pub load_epoch: u64,
@@ -182,6 +188,7 @@ impl TerminalApp {
         });
         let mut app = Self {
             workspace: None,
+            last_handoff: None,
             load_epoch: 0,
             open_failure: None,
             notice: None,
@@ -530,8 +537,85 @@ impl TerminalApp {
                     .spawn(async move { probe_open(&p) })
                     .await
             };
-            match probe {
-                OpenProbe::Failure(msg) => {
+            // marker 探测后 solutions 加载归 solution 服务 (design D8:
+            // GUI 一律 ask; 回执 = Result<TreeSnapshot, OpError>)
+            let outcome = match probe {
+                OpenProbe::Empty => OpenOutcome::Empty,
+                OpenProbe::Failure(msg) => OpenOutcome::Failure(msg),
+                OpenProbe::Valid => {
+                    // pull 模式纪律 (D6/D8): submit + 泵拉取 — one-shot await
+                    // 会被确定性测试调度器判死 (外线程唤醒)。装载竞态 (loading
+                    // 期提交/路由失败) 限时限次重试, 每轮真实让时给服务线程
+                    // 调度窗口 (pdm 前科同款处置)。
+                    const SUBMIT_TRIES: u32 = 100; // 50ms x 100 = 5s
+                    const REPLY_TRIES: u32 = 1000; // 5ms x 1000 = 5s
+                    let mut last_err = "solution 服务不可达".to_string();
+                    let mut attempt = 0u32;
+                    let corr = loop {
+                        if attempt >= SUBMIT_TRIES {
+                            break None;
+                        }
+                        let submitted = this.update(cx, |app, _| {
+                            app.service_layer.submit_solution_load(Payload::new(LoadReq {
+                                workspace_dir: path.clone(),
+                            }))
+                        });
+                        match submitted {
+                            Ok(Ok(corr)) => break Some(corr),
+                            Ok(Err(e)) => last_err = format!("solution 服务不可达: {e}"),
+                            Err(_) => break None, // app 消亡
+                        }
+                        attempt += 1;
+                        cx.background_executor()
+                            .spawn(async {
+                                std::thread::sleep(Duration::from_millis(50));
+                            })
+                            .await;
+                    };
+                    let mut outcome = OpenOutcome::Failure(last_err);
+                    if let Some(corr) = corr {
+                        let mut waited = 0u32;
+                        loop {
+                            // 泵拉取 (mailbox pull — 无跨线程唤醒)
+                            let got = this.update(cx, |app, _| {
+                                app.service_layer.pump();
+                                app.service_layer.take_load_result(corr)
+                            });
+                            match got {
+                                Ok(Some(Ok(snap))) => {
+                                    outcome = OpenOutcome::Ready(snap);
+                                    break;
+                                }
+                                Ok(Some(Err(e))) => {
+                                    outcome = OpenOutcome::Failure(e.to_string());
+                                    break;
+                                }
+                                Ok(None) => {
+                                    waited += 1;
+                                    if waited >= REPLY_TRIES {
+                                        this.update(cx, |app, _| {
+                                            app.service_layer.abandon_load(corr);
+                                        })
+                                        .ok();
+                                        outcome =
+                                            OpenOutcome::Failure("solution 服务未响应".to_string());
+                                        break;
+                                    }
+                                    cx.background_executor()
+                                        .spawn(async {
+                                            std::thread::sleep(Duration::from_millis(5));
+                                        })
+                                        .await;
+                                }
+                                Err(_) => break, // app 消亡: outcome 保持 Failure
+                            }
+                        }
+                    }
+                    outcome
+                }
+            };
+            match outcome {
+                OpenOutcome::Failure(msg) => {
                     // epoch 检查与记录合一次 update; 对话框在 lease 外 (D8)
                     let fresh = this
                         .update(cx, |app, _| {
@@ -547,9 +631,9 @@ impl TerminalApp {
                         surface_fatal(&msg); // 正式: 错误框 + 退出; 测试: no-op
                     }
                 }
-                probe => {
+                outcome => {
                     this.update(cx, |app, cx| {
-                        app.commit_open(epoch, path, probe, cx);
+                        app.commit_open(epoch, path, outcome, cx);
                     })
                     .ok();
                 }
@@ -565,23 +649,23 @@ impl TerminalApp {
         &mut self,
         epoch: u64,
         path: PathBuf,
-        probe: OpenProbe,
+        outcome: OpenOutcome,
         cx: &mut Context<Self>,
     ) -> bool {
         if epoch != self.load_epoch {
             return false; // 过期结果 (4.2 竞态守卫)
         }
-        match probe {
+        match outcome {
             // 启动恢复目标失效 (目录没了/marker 没了) → 回空态, 不报错
-            OpenProbe::Empty => {
+            OpenOutcome::Empty => {
                 self.workspace = None;
                 self.active = None;
             }
-            OpenProbe::Failure(msg) => {
+            OpenOutcome::Failure(msg) => {
                 // 正式路径已在 begin_open 里 dialog+exit; 测试观测面
                 self.open_failure = Some(msg);
             }
-            OpenProbe::Ready(model) => {
+            OpenOutcome::Ready(_snap) => {
                 // 清场: 旧会话全部关停 (切换语义: exited 屏幕随切走丢弃,
                 // spec: confirmation … discarded; 活动会话已被门控拦下)
                 if let Some(old) = self.workspace.take() {
@@ -603,17 +687,10 @@ impl TerminalApp {
                 if let Err(e) = history.save_at(&self.history_path) {
                     eprintln!("workspace history save failed: {e}");
                 }
-                let projects = model.projects.clone();
-                self.workspace = Some(Workspace::new(path.clone(), model));
-                // 注册进 asset_manager (design D6: 打开 = 全量替换;
-                // 过滤规则由 Project 供给 — file-filter-prune D9)
-                let owners: Vec<Box<dyn EnumeratorOwner + Send>> =
-                    projects
-                        .into_iter()
-                        .map(|p| Box::new(p) as Box<dyn EnumeratorOwner + Send>)
-                        .collect();
-                self.asset_manager
-                    .update(cx, |m, cx| m.register(path, owners, cx));
+                // Solution/Project 域状态归服务镜像 (5.4: 视图读镜像,
+                // GUI 不持本地副本); 资产注册经装配单点 (handoff 交树)
+                self.workspace = Some(Workspace::new(path.clone()));
+                self.sync_asset_registration(cx);
             }
         }
         cx.notify();
@@ -622,68 +699,75 @@ impl TerminalApp {
     }
 
     /// 空工作区的 "+ add solution" (spec: Solution creation via path picker):
-    /// 选择目录 → 追加 simple item → project 行不重启出现。
-    /// 写失败: 红条 + **内存变更保留** (spec: in-memory state keeps the change)。
+    /// 选择目录 → 发 Create ask (change solution-service 5.2) → project 行
+    /// 不重启出现。写失败: notice 点名 + **内存变更保留** (spec: in-memory
+    /// state keeps the change — 服务侧保留, 镜像照发)。
     pub fn add_solution(&mut self, cx: &mut Context<Self>) {
-        let Some(ws_dir) = self.workspace.as_ref().map(|w| w.path.clone()) else {
-            return;
-        };
         let task = cx.spawn(async move |this, cx: &mut AsyncApp| {
             let Some(handle) = rfd::AsyncFileDialog::new().pick_folder().await else {
                 return; // 取消: 文件与视图均不变 (spec)
             };
             let picked = handle.path().to_path_buf();
             let path = std::fs::canonicalize(&picked).unwrap_or(picked);
-            // 先写盘; 内存变更不受写结果影响
-            let outcome = project_model::append_simple_solution(&ws_dir, path.clone());
-            this.update(cx, |app, cx| app.apply_add_solution(path.clone(), outcome, cx))
+            this.update(cx, |app, cx| app.request_create_solution(path, cx))
                 .ok();
         });
         self._dialog_task = Some(task);
     }
 
-    /// add-solution 完成后的同步合并 (从回调抽出的测试缝 — 5.3):
-    /// 写成功 → solutions 用落盘结果; 写失败 → 红条 + **内存变更保留**
-    /// (spec: in-memory state keeps the change)。两条路径都进 model。
-    pub(crate) fn apply_add_solution(
-        &mut self,
-        path: PathBuf,
-        outcome: Result<Vec<project_model::SolutionItem>, String>,
-        cx: &mut Context<Self>,
-    ) {
-        let write_err = match &outcome {
-            Ok(items) => {
-                if let Some(ws) = self.workspace.as_mut() {
-                    ws.model.solutions = items.clone();
-                }
-                None
-            }
-            Err(e) => {
-                if let Some(ws) = self.workspace.as_mut() {
-                    ws.model
-                        .solutions
-                        .push(project_model::SolutionItem::Simple { path: path.clone() });
-                }
-                Some(e.clone())
-            }
+    /// Create ask 发送点 (add_solution 的 picker 回调与测试共用缝;
+    /// change solution-service 5.2)。幂等前置检与 Server 同一
+    /// ValidChecker (design D6): 同 path 已存在 → 原样不变。
+    pub(crate) fn request_create_solution(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(ws_dir) = self.workspace.as_ref().map(|w| w.path.clone()) else {
+            return;
         };
-        // 两条路径都进内存 model (项目行立即可见)
-        let mut added: Option<project_model::Project> = None;
-        if let Some(ws) = self.workspace.as_mut() {
-            if !ws.model.projects.iter().any(|p| p.root == path) {
-                let project = project_model::Project::from_root(path.clone());
-                ws.model.projects.push(project.clone());
-                added = Some(project);
-            }
+        let dup = self.service_layer.tree_view().is_some_and(|t| {
+            solution_service::create_is_noop(&t.solutions, &path)
+                || t.tree.projects.iter().any(|p| p.root == path)
+        });
+        if dup {
+            return; // spec: Re-adding an existing solution changes nothing
         }
-        if let Some(e) = write_err {
-            self.save_error = Some(e);
+        let result = self.service_layer.submit_solution_op(
+            KIND_SOLUTION_CREATE,
+            Payload::new(SolCreateReq {
+                workspace_dir: ws_dir,
+                path,
+            }),
+            "添加 solution",
+        );
+        match result {
+            Ok(_) => self.kick_input_drain(cx), // 快泵: 回执尽快达
+            Err(e) => self.notice = Some(format!("添加 solution 失败: {e}")),
         }
-        // 增量注册 (design D6): add-solution → 新项目无重启入右树
-        if let Some(project) = added {
-            self.asset_manager
-                .update(cx, |m, cx| m.register_project(Box::new(project), cx));
+    }
+
+    /// 树镜像变更 → 资产注册 (handoff 交树 = 注册唯一来源, 全量替换语义;
+    /// change solution-service 5.1/5.2/5.4 装配单点)。快照未变 → 零动作
+    /// (O(1) 比对)。
+    fn sync_asset_registration(&mut self, cx: &mut Context<Self>) {
+        let Some(snap) = self.service_layer.tree_view().cloned() else {
+            return;
+        };
+        let Some(ws) = self.workspace.as_ref() else {
+            return;
+        };
+        if self.last_handoff.as_ref() == Some(&(ws.path.clone(), snap.clone())) {
+            return;
         }
+        self.last_handoff = Some((ws.path.clone(), snap.clone()));
+        let path = ws.path.clone();
+        let owners: Vec<Box<dyn EnumeratorOwner + Send>> = snap
+            .handoff
+            .projects
+            .iter()
+            .map(|d| {
+                Box::new(project_model::Project::from_desc(d)) as Box<dyn EnumeratorOwner + Send>
+            })
+            .collect();
+        self.asset_manager
+            .update(cx, |m, cx| m.register(path, owners, cx));
         cx.notify();
         self.notify_panels(cx);
     }
@@ -909,6 +993,8 @@ impl TerminalApp {
         if self.service_layer.pump() {
             changed = true;
         }
+        // 树镜像变更 → 资产注册同步 (5.2/5.4 装配单点: handoff 交树)
+        self.sync_asset_registration(cx);
         // 控制成功回执 → 中央切回 console (成功才切 — spec delta: 失败不切)
         if !self.service_layer.take_successes().is_empty() {
             self.switch_console_tab(cx);
@@ -987,13 +1073,25 @@ pub(crate) enum OpenProbe {
     /// 目录不存在 / marker 缺失 → 启动恢复回空态 (不报错; picker 流程
     /// 在此之前已走确认创建分支, 不会进这里)。
     Empty,
-    /// marker 合法且 model 加载成功。
-    Ready(WorkspaceModel),
-    /// marker 坏 / model 校验失败 → 错误框 + 退出 (spec)。
+    /// marker 坏 → 错误框 + 退出 (spec)。
     Failure(String),
+    /// marker 合法 — solutions 加载归 solution 服务 (design D8)。
+    Valid,
 }
 
-/// 后台探测: 目录 → marker → model 加载 (每步对应 spec 判定链)。
+/// 打开结果 (solution 服务 load 回执 → commit 载荷; spec: Solution load
+/// failures — 失败只有结构化 reason, 绝无部分树)。
+#[derive(Debug, Clone)]
+pub(crate) enum OpenOutcome {
+    /// 启动恢复目标失效 (目录没了/marker 没了) → 回空态, 不报错。
+    Empty,
+    /// 加载失败 (marker 坏 / solutions 解析失败 / 死 path) → 错误框 + 退出。
+    Failure(String),
+    /// 加载成功 — 载荷 = 服务交出的项目树快照 (含注册门控后的 handoff)。
+    Ready(TreeSnapshot),
+}
+
+/// 后台探测: 目录 → marker (solutions 加载归 solution 服务, design D8)。
 pub(crate) fn probe_open(path: &Path) -> OpenProbe {
     if !path.is_dir() {
         return OpenProbe::Empty;
@@ -1001,10 +1099,7 @@ pub(crate) fn probe_open(path: &Path) -> OpenProbe {
     match project_model::marker_status(path) {
         MarkerStatus::Missing => OpenProbe::Empty,
         MarkerStatus::Corrupt(msg) => OpenProbe::Failure(msg),
-        MarkerStatus::Valid(_) => match project_model::load(path) {
-            Ok(model) => OpenProbe::Ready(model),
-            Err(e) => OpenProbe::Failure(e.to_string()),
-        },
+        MarkerStatus::Valid(_) => OpenProbe::Valid,
     }
 }
 
@@ -1095,11 +1190,26 @@ mod tests {
     fn inject_test_workspace(app: &mut TerminalApp, tag: &str) -> String {
         let path = std::env::temp_dir().join(format!("bw-test-{tag}-{}", std::process::id()));
         let full = path.to_string_lossy().to_string();
-        let mut model = crate::project_model::WorkspaceModel::default();
-        model
-            .projects
-            .push(crate::project_model::Project::from_root(path.clone()));
-        app.workspace = Some(Workspace::new(path, model));
+        // 项目树经服务镜像注入 (5.4: 视图读镜像, 无本地副本 — 测试缝直写)
+        use solution_service::{ProjectDesc, ProjectTree, TreeSnapshot};
+        let desc = ProjectDesc {
+            name: path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "/".to_string()),
+            root: path.clone(),
+            is_git: false,
+        };
+        app.service_layer.set_tree_view_for_test(TreeSnapshot {
+            solutions: std::sync::Arc::from(vec![]),
+            tree: ProjectTree {
+                projects: std::sync::Arc::from(vec![desc.clone()]),
+            },
+            handoff: ProjectTree {
+                projects: std::sync::Arc::from(vec![desc]),
+            },
+        });
+        app.workspace = Some(Workspace::new(path));
         full
     }
 
@@ -1839,9 +1949,10 @@ mod tests {
     //  组 7: 全链路)。对话框 (rfd) 接线是正式构建胶水, 无头不触碰 —
     //  其决策点已拆成纯函数/同步方法被下面测试覆盖。
 
-    use super::{GateDecision, OpenProbe, switch_gate};
+    use super::{GateDecision, OpenOutcome, switch_gate};
+    use solution_service::contract::TreeSnapshot;
     use crate::assets::{AssetKind, AssetState, project_id};
-    use crate::project_model::{self, Project, SolutionItem, WorkspaceModel};
+    use crate::project_model::{self};
     use crate::workspace::history::History;
 
     /// hermetic 临时目录 (进程 + 纳秒隔离)。
@@ -1919,6 +2030,32 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "启动恢复未落定: {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// solution 操作落定轮询 (change solution-service 5.2): 回执经
+    /// mailbox 泵拉取 (pull 模式) — 每轮冲执行器 + 驱动 poll_sessions +
+    /// 真实让时给服务线程, 5s 未落定 panic (带 what)。
+    fn wait_sol_settled(
+        cx: &mut TestAppContext,
+        app: &gpui_kit::Entity<TerminalApp>,
+        mut pred: impl FnMut(&TerminalApp) -> bool,
+        what: &str,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            cx.run_until_parked();
+            app.update(cx, |app, cx| {
+                app.poll_sessions(cx);
+            });
+            if cx.update(|cx| pred(app.read(cx))) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "solution 操作未落定: {what}"
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -2069,7 +2206,7 @@ mod tests {
             let discarded = app.commit_open(
                 6,
                 "/old".into(),
-                OpenProbe::Ready(WorkspaceModel::default()),
+                OpenOutcome::Ready(TreeSnapshot::default()),
                 cx,
             );
             assert!(!discarded, "过期 epoch 必须返回 false 且不落状态");
@@ -2077,7 +2214,7 @@ mod tests {
             let landed = app.commit_open(
                 7,
                 "/new".into(),
-                OpenProbe::Ready(WorkspaceModel::default()),
+                OpenOutcome::Ready(TreeSnapshot::default()),
                 cx,
             );
             assert!(landed, "当前 epoch 提交成功");
@@ -2121,7 +2258,14 @@ mod tests {
         let project_dir = ws.join("foo");
         fs::create_dir_all(&project_dir).unwrap();
         project_model::create_workspace_files(&ws).unwrap();
-        project_model::append_simple_solution(&ws, project_dir.clone()).unwrap();
+        fs::write(
+            project_model::files::solutions_path(&ws),
+            format!(
+                r#"[{{"type": "simple", "path": "{}"}}]"#,
+                project_dir.display()
+            ),
+        )
+        .unwrap();
         let history = fresh_history_path();
         let mut h = History::default();
         h.push(ws.clone());
@@ -2140,9 +2284,10 @@ mod tests {
             assert!(app.open_failure.is_none(), "合法工作区不报错");
             let ws_view = app.workspace.as_ref().expect("应恢复最近工作区");
             assert_eq!(ws_view.path, ws);
-            assert_eq!(ws_view.model.projects.len(), 1);
-            assert_eq!(ws_view.model.projects[0].name, "foo");
-            assert_eq!(ws_view.model.projects[0].root, project_dir);
+            let tree = app.service_layer.tree_view().expect("镜像在场");
+            assert_eq!(tree.tree.projects.len(), 1);
+            assert_eq!(tree.tree.projects[0].name, "foo");
+            assert_eq!(tree.tree.projects[0].root, project_dir);
         });
     }
 
@@ -2230,46 +2375,71 @@ mod tests {
             assert!(app.open_failure.is_none());
             let ws_view = app.workspace.as_ref().expect("创建后应打开");
             assert_eq!(ws_view.path, ws);
-            assert!(ws_view.model.projects.is_empty(), "空 solutions = 零 project");
+            assert!(
+                app.service_layer
+                    .tree_view()
+                    .is_none_or(|t| t.tree.projects.is_empty()),
+                "空 solutions = 零 project"
+            );
             // 打开即写历史 (下次启动直开)
             History::load_at(&app.history_path)
         });
         assert_eq!(back.most_recent(), Some(ws.as_path()));
     }
 
-    /// 5.3: add-solution 合并 — Ok/Err 两支都进内存 model, Err 另落红条
-    /// (spec: in-memory state keeps the change)。
+    /// 5.2: create ask 合并 — 成功支进镜像 + 注册; 写失败支落 notice +
+    /// **内存变更保留** (spec: in-memory state keeps the change — 服务侧
+    /// 保留, 镜像照发; workspace-management: Save failure shown in UI)。
     #[gpui_kit::test]
     fn add_solution_merges_and_surfaces_write_failure(cx: &mut TestAppContext) {
         let history = fresh_history_path();
         let (_handle, app_entity) = open_app_with_history(cx, history);
-        let p1 = temp_dir("sol-one");
-        let p2 = temp_dir("sol-two");
-        app_entity.update(cx, |app, cx| {
-            inject_test_workspace(app, "add-sol"); // 零 project 起点会更贴 spec,
-            // 但合并逻辑对有无 project 同构 — 先清空模拟零 project
-            app.workspace.as_mut().unwrap().model.projects.clear();
-            let items = vec![SolutionItem::Simple { path: p1.clone() }];
-            app.apply_add_solution(p1.clone(), Ok(items.clone()), cx);
-            {
-                let ws = app.workspace.as_ref().unwrap();
-                assert_eq!(ws.model.projects.len(), 1);
-                assert_eq!(ws.model.projects[0].root, p1);
-                assert_eq!(ws.model.solutions, items);
-            }
-            assert!(app.save_error.is_none(), "成功写入无红条");
+        let ws = temp_dir("sol-merge");
+        fs::create_dir_all(&ws).unwrap();
+        project_model::create_workspace_files(&ws).unwrap();
+        let p1 = ws.join("one");
+        fs::create_dir_all(&p1).unwrap();
+        let p2 = ws.join("two");
+        fs::create_dir_all(&p2).unwrap();
+        app_entity.update(cx, |app, cx| app.begin_open(ws.clone(), cx));
+        wait_sol_settled(cx, &app_entity, |app| app.workspace.is_some(), "打开落定");
 
-            // 写失败: 红条 + 内存保留 (project 与 solution item 都在)
-            app.apply_add_solution(p2.clone(), Err("disk full".into()), cx);
-            {
-                let ws = app.workspace.as_ref().unwrap();
-                assert_eq!(ws.model.projects.len(), 2, "写失败仍进内存 (spec)");
-                assert!(ws.model.solutions.iter().any(|s| matches!(s, SolutionItem::Simple { path } if *path == p2)));
-            }
-            assert!(
-                app.save_error.as_deref().is_some_and(|e| e.contains("disk full")),
-                "写失败应落红条"
-            );
+        // 成功支: create p1 → 镜像 1 项, 无红条无 notice
+        app_entity.update(cx, |app, cx| app.request_create_solution(p1.clone(), cx));
+        wait_sol_settled(
+            cx,
+            &app_entity,
+            |app| {
+                app.service_layer
+                    .tree_view()
+                    .is_some_and(|t| t.tree.projects.len() == 1)
+            },
+            "create p1 落定",
+        );
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            let t = app.service_layer.tree_view().unwrap();
+            assert_eq!(t.tree.projects[0].root, p1);
+            assert!(app.save_error.is_none(), "成功写入无红条");
+            assert!(app.notice.is_none(), "成功无 notice");
+        });
+
+        // 写失败支: workspace 路径换成普通文件 → 服务落盘必败
+        let not_dir = ws.join("not-a-dir");
+        fs::write(&not_dir, "x").unwrap();
+        app_entity.update(cx, |app, cx| {
+            app.workspace.as_mut().unwrap().path = not_dir.clone();
+            app.request_create_solution(p2.clone(), cx);
+        });
+        wait_sol_settled(cx, &app_entity, |app| app.notice.is_some(), "写失败 notice");
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            let n = app.notice.clone().unwrap();
+            assert!(n.contains("添加 solution"), "notice 点名操作: {n}");
+            // 内存变更保留 (spec): 镜像仍含 p2
+            let t = app.service_layer.tree_view().unwrap();
+            assert_eq!(t.tree.projects.len(), 2, "写失败仍进内存 (spec)");
+            assert!(t.tree.projects.iter().any(|p| p.root == p2));
         });
     }
 
@@ -2285,12 +2455,16 @@ mod tests {
         let ws_path = app_entity.update(cx, |app, _cx| {
             inject_test_workspace(app, "grouping"); // project root1 = ws 目录
             let ws_path = app.workspace.as_ref().unwrap().path.clone();
-            app.workspace
-                .as_mut()
-                .unwrap()
-                .model
-                .projects
-                .push(Project::from_root(external.clone()));
+            // 工作区外 project 经镜像追加 (5.4: 视图读镜像)
+            let mut snap = app.service_layer.tree_view().unwrap().clone();
+            let mut projects = snap.tree.projects.to_vec();
+            projects.push(solution_service::ProjectDesc {
+                name: "external-project".into(),
+                root: external.clone(),
+                is_git: false,
+            });
+            snap.tree.projects = projects.into();
+            app.service_layer.set_tree_view_for_test(snap);
             ws_path
         });
         // 两个会话归两个 project 根 (cwd 分组) — 注入服务投影镜像
@@ -2419,7 +2593,7 @@ mod tests {
                 std::process::id(),
                 SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
             ));
-            app.workspace = Some(Workspace::new(path, WorkspaceModel::default()));
+            app.workspace = Some(Workspace::new(path));
         });
         let texts = render_texts(handle, cx);
         assert!(
@@ -2455,13 +2629,20 @@ mod tests {
             "工作区已打开"
         ));
 
-        // add-solution (同步合并缝)
+        // add-solution (5.2: create ask + 镜像/注册同步)
         let project_dir = ws.join("bar");
         fs::create_dir_all(&project_dir).unwrap();
-        app_entity.update(cx, |app, cx| {
-            let items = project_model::append_simple_solution(&ws, project_dir.clone()).unwrap();
-            app.apply_add_solution(project_dir.clone(), Ok(items), cx);
-        });
+        app_entity.update(cx, |app, cx| app.request_create_solution(project_dir.clone(), cx));
+        wait_sol_settled(
+            cx,
+            &app_entity,
+            |app| {
+                app.service_layer
+                    .tree_view()
+                    .is_some_and(|t| t.tree.projects.iter().any(|p| p.root == project_dir))
+            },
+            "add-solution 落定",
+        );
         let texts = render_texts(handle, cx);
         assert!(
             texts.iter().any(|t| t.contains("bar")),
@@ -2698,7 +2879,14 @@ mod tests {
         fs::create_dir_all(&project_dir).unwrap();
         fs::write(project_dir.join("lib.rs"), "x").unwrap();
         project_model::create_workspace_files(&ws).unwrap();
-        project_model::append_simple_solution(&ws, project_dir.clone()).unwrap();
+        fs::write(
+            project_model::files::solutions_path(&ws),
+            format!(
+                r#"[{{"type": "simple", "path": "{}"}}]"#,
+                project_dir.display()
+            ),
+        )
+        .unwrap();
 
         app_entity.update(cx, |app, cx| app.begin_open(ws.clone(), cx));
         cx.run_until_parked();
@@ -2711,6 +2899,145 @@ mod tests {
             assert_eq!(nodes.len(), 1);
             assert_eq!(nodes[0].id, project_id(&project_dir));
             assert_eq!(nodes[0].kind, AssetKind::Project);
+        });
+    }
+
+    // ===== change solution-service 2.3: 三个 load 边界的错误契约 =====
+
+    /// 启动 restore 边界 (spec: Solution load failures): corrupt solutions
+    /// → open_failure + 工作区不打开。
+    #[gpui_kit::test]
+    fn startup_restore_load_failure_shows_error_and_no_workspace(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let ws = temp_dir("load-fail-startup");
+        fs::create_dir_all(&ws).unwrap();
+        project_model::create_workspace_files(&ws).unwrap();
+        fs::write(project_model::files::solutions_path(&ws), "{oops").unwrap();
+        {
+            let mut h = crate::workspace::history::History::load_at(&history);
+            h.push(ws.clone());
+            h.save_at(&history).unwrap();
+        }
+        let (_handle, app_entity) = open_app_with_history(cx, history);
+        wait_startup_settled(
+            cx,
+            &app_entity,
+            |app| app.open_failure.is_some(),
+            "启动 restore 的 load 失败应记录 open_failure",
+        );
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            assert!(
+                app.open_failure
+                    .as_ref()
+                    .is_some_and(|m| m.contains("solution configuration invalid")),
+                "失败文案点名解析失败: {:?}",
+                app.open_failure
+            );
+            assert!(app.workspace.is_none(), "load 失败不得打开工作区");
+        });
+    }
+
+    /// 手动切换边界 (spec): unknown SolutionType → open_failure + 不打开。
+    #[gpui_kit::test]
+    fn switch_load_failure_shows_error_and_no_workspace(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let (_handle, app_entity) = open_app_with_history(cx, history);
+        let ws = temp_dir("load-fail-switch");
+        fs::create_dir_all(&ws).unwrap();
+        project_model::create_workspace_files(&ws).unwrap();
+        fs::write(
+            project_model::files::solutions_path(&ws),
+            r#"[{"type": "nope", "path": "/x"}]"#,
+        )
+        .unwrap();
+        // 切换流的 picker 确认后走同一入口 (begin_open) — 测试直驱该入口
+        app_entity.update(cx, |app, cx| app.begin_open(ws, cx));
+        wait_startup_settled(
+            cx,
+            &app_entity,
+            |app| app.open_failure.is_some(),
+            "切换 load 失败应记录 open_failure",
+        );
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            assert!(
+                app.open_failure
+                    .as_ref()
+                    .is_some_and(|m| m.contains("unknown solution type")),
+                "失败文案点名未知类型: {:?}",
+                app.open_failure
+            );
+            assert!(app.workspace.is_none(), "失败不打开工作区");
+        });
+    }
+
+    /// 显式 reload 边界 (spec): 一项合法 + 一项死 path → MissingPath,
+    /// 失败绝不缓存部分树 — 旧工作区原样保留 (不 2 不 0)。
+    #[gpui_kit::test]
+    fn reload_failure_keeps_previous_workspace_without_partial(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let (_handle, app_entity) = open_app_with_history(cx, history);
+        let ws = temp_dir("load-fail-reload");
+        let foo = ws.join("foo");
+        fs::create_dir_all(&foo).unwrap();
+        project_model::create_workspace_files(&ws).unwrap();
+        fs::write(
+            project_model::files::solutions_path(&ws),
+            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, foo.display()),
+        )
+        .unwrap();
+        app_entity.update(cx, |app, cx| app.begin_open(ws.clone(), cx));
+        wait_startup_settled(
+            cx,
+            &app_entity,
+            |app| app.workspace.is_some(),
+            "首次打开落定",
+        );
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            assert_eq!(
+                app.service_layer.tree_view().unwrap().tree.projects.len(),
+                1
+            );
+        });
+
+        // 显式 reload: solutions 改为 [合法 foo, 死 path] → MissingPath
+        let dead = ws.join("nope-never");
+        fs::write(
+            project_model::files::solutions_path(&ws),
+            format!(
+                r#"[{{"type": "simple", "path": "{}"}}, {{"type": "simple", "path": "{}"}}]"#,
+                foo.display(),
+                dead.display()
+            ),
+        )
+        .unwrap();
+        app_entity.update(cx, |app, cx| app.begin_open(ws.clone(), cx));
+        wait_startup_settled(
+            cx,
+            &app_entity,
+            |app| app.open_failure.is_some(),
+            "reload 失败应记录 open_failure",
+        );
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            assert!(
+                app.open_failure
+                    .as_ref()
+                    .is_some_and(|m| m.contains("solution path does not exist")),
+                "失败文案点名死 path: {:?}",
+                app.open_failure
+            );
+            app.workspace
+                .as_ref()
+                .expect("旧工作区保留 (失败不缓存部分树)");
+            let t = app.service_layer.tree_view().expect("旧镜像保留");
+            assert_eq!(
+                t.tree.projects.len(),
+                1,
+                "旧状态原样保留 — 无部分树 (不 2 不 0)"
+            );
         });
     }
 
@@ -2733,11 +3060,19 @@ mod tests {
         let pdir = ws.join("bar");
         fs::create_dir_all(&pdir).unwrap();
         fs::write(pdir.join("main.rs"), "x").unwrap();
-        app_entity.update(cx, |app, cx| {
-            let items = project_model::append_simple_solution(&ws, pdir.clone()).unwrap();
-            app.apply_add_solution(pdir.clone(), Ok(items), cx);
-        });
-        cx.run_until_parked();
+        // 5.2: create 走 ask (picker 之后的发送点), 回执/树变更经泵消费
+        app_entity.update(cx, |app, cx| app.request_create_solution(pdir.clone(), cx));
+        wait_sol_settled(
+            cx,
+            &app_entity,
+            |app| {
+                app.service_layer
+                    .tree_view()
+                    .is_some_and(|t| t.tree.projects.iter().any(|p| p.root == pdir))
+            },
+            "create 落定",
+        );
+        cx.run_until_parked(); // 注册枚举异步落地
         cx.update(|cx| {
             let app = app_entity.read(cx);
             let view = app.asset_manager.read(cx).state();
@@ -2759,12 +3094,20 @@ mod tests {
         let one = ws1.join("one");
         fs::create_dir_all(&one).unwrap();
         project_model::create_workspace_files(&ws1).unwrap();
-        project_model::append_simple_solution(&ws1, one.clone()).unwrap();
+        fs::write(
+            project_model::files::solutions_path(&ws1),
+            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, one.display()),
+        )
+        .unwrap();
         let ws2 = temp_dir("reg-switch-2");
         let two = ws2.join("two");
         fs::create_dir_all(&two).unwrap();
         project_model::create_workspace_files(&ws2).unwrap();
-        project_model::append_simple_solution(&ws2, two.clone()).unwrap();
+        fs::write(
+            project_model::files::solutions_path(&ws2),
+            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, two.display()),
+        )
+        .unwrap();
 
         app_entity.update(cx, |app, cx| app.begin_open(ws1, cx));
         cx.run_until_parked();

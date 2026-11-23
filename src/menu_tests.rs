@@ -4,7 +4,6 @@
 //! (app.rs / pdm tests 同款教训)。
 
 use crate::app::TerminalApp;
-use crate::project_model::WorkspaceModel;
 use crate::workspace::Workspace;
 use agent_service::terminal::{CellPos, CellRange, TerminalCopy};
 use gpui_kit::test::TestWindowExt;
@@ -53,7 +52,7 @@ fn inject_session(cx: &mut TestAppContext, app: &gpui_kit::Entity<TerminalApp>, 
     let _ = std::fs::remove_dir_all(&ws);
     std::fs::create_dir_all(&ws).unwrap();
     app.update(cx, |app, cx| {
-        app.workspace = Some(Workspace::new(ws.clone(), WorkspaceModel::default()));
+        app.workspace = Some(Workspace::new(ws.clone()));
         app.notify_panels(cx);
     });
     let (id, _shared) = test_sessions::create_session(cx, app, &ws);

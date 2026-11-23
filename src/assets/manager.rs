@@ -146,17 +146,8 @@ impl AssetManager {
         self.spawn_enumerate(cx);
     }
 
-    /// 增量注册 (add-solution): 保留旧视图直到新枚举落地
-    /// (spec: … previous content … until the enumeration lands)。
-    pub fn register_project(&mut self, owner: Box<dyn EnumeratorOwner + Send>, cx: &mut Context<Self>) {
-        if self.owners.iter().any(|o| o.root() == owner.root()) {
-            return; // 幂等: 同 `owner.root()` 不重复注册 (语义逐字冻结)
-        }
-        self.owners.push(owner);
-        if self.ws_dir.is_some() {
-            self.spawn_enumerate(cx);
-        }
-    }
+    // 增量注册已随 create ask 流退役 (change solution-service 5.2:
+    // add-solution 走全量替换重注册 — register 即增量语义, 不重启)。
 
     /// 显式刷新 (⟳): 重读规则 + supersede 在途; 代数入口 +1
     /// (spec: explicit refresh 是缓存失效输入之一)。

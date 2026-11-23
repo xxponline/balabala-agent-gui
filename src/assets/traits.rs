@@ -20,10 +20,12 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// 链上不携带过滤输入 — 过滤规则由 Project 在枚举需要 Module 时
 /// 构建并注入 (design D2/D8), 所有输入从 `root` 自身推导。
 pub trait EnumeratorOwner {
-    /// 身份根路径: 注册记账 "身份 = root" 与 reveal 语义的依据。
+    /// 身份根路径: 注册记账/ reveal 语义的依据。
     ///
     /// 输入: 无 (`&self`); 输出: 资产树根目录的绝对路径 (Project 根 /
-    /// 模块根)。
+    /// 模块根)。增量注册退役后暂无调用点 (change solution-service 5.2),
+    /// 作为身份契约保留。
+    #[allow(dead_code)]
     fn root(&self) -> &Path;
 
     /// 为该实体构造枚举执行体 (同步构造, 由调用方丢入后台 spawn)。

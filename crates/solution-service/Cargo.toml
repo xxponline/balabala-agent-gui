@@ -1,0 +1,13 @@
+[package]
+name = "solution-service"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+# design D7 依赖边: solution-service -> service-core (对齐 agent-service,
+# 不含 service-manager —— 骨架侧职责不进服务 crate)。
+service-core = { path = "../service-core" }
+# solutions 文件契约 (balabala.solutions.json) 的 serde 编解码 (design D8:
+# wire 载荷走 Payload::Typed 零拷贝, 仅文件 DTO 用 serde)。
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
