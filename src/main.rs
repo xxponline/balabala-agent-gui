@@ -14,6 +14,7 @@ mod debug;
 mod menu;
 mod project_model;
 mod service_layer;
+mod solution_config;
 mod property_detail_manager;
 mod shell;
 mod sidebar;

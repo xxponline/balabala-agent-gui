@@ -106,6 +106,13 @@ pub struct TerminalApp {
     /// key = 对象绝对路径字符串 (与 AssetNode.id 同一身份体系),
     /// value = 已开面板的 PanelId; 签关闭时经 `open_tab_removed` 摘除。
     pub(crate) open_tabs: HashMap<String, PanelId>,
+    /// SolutionConfig 表单签的面板实体（成功自关用 — dedup 真值仍以
+    /// `open_tabs` 为准, 此处只存 Entity 供 `remove_panel` 调用）。
+    pub(crate) sol_config_panel: Option<Entity<crate::solution_config::SolutionConfigPanel>>,
+    /// 表单签 Create ask 在途标记（回执成败的消费门 — spec delta 结果分支）。
+    pub(crate) sol_config_inflight: bool,
+    /// 表单签行内错误（submit/回执失败展示; 开签即清）。
+    pub(crate) sol_config_error: Option<String>,
     /// debug section 的 dedup 表 (specs/center-tabs delta): key = section id
     /// (**独立于**文件路径身份 — 同字符串互不干扰), 签关闭时经
     /// `debug_tab_removed` 摘除。跟着 `crate::debug` 的门控走 (release
@@ -206,6 +213,9 @@ impl TerminalApp {
             wheel_forwards: 0,
             click_forwards: 0,
             open_tabs: HashMap::new(),
+            sol_config_panel: None,
+            sol_config_inflight: false,
+            sol_config_error: None,
             #[cfg(debug_assertions)]
             debug_tabs: HashMap::new(),
             dock_area,
@@ -698,26 +708,11 @@ impl TerminalApp {
         true
     }
 
-    /// 空工作区的 "+ add solution" (spec: Solution creation via path picker):
-    /// 选择目录 → 发 Create ask (change solution-service 5.2) → project 行
-    /// 不重启出现。写失败: notice 点名 + **内存变更保留** (spec: in-memory
-    /// state keeps the change — 服务侧保留, 镜像照发)。
-    pub fn add_solution(&mut self, cx: &mut Context<Self>) {
-        let task = cx.spawn(async move |this, cx: &mut AsyncApp| {
-            let Some(handle) = rfd::AsyncFileDialog::new().pick_folder().await else {
-                return; // 取消: 文件与视图均不变 (spec)
-            };
-            let picked = handle.path().to_path_buf();
-            let path = std::fs::canonicalize(&picked).unwrap_or(picked);
-            this.update(cx, |app, cx| app.request_create_solution(path, cx))
-                .ok();
-        });
-        self._dialog_task = Some(task);
-    }
-
-    /// Create ask 发送点 (add_solution 的 picker 回调与测试共用缝;
-    /// change solution-service 5.2)。幂等前置检与 Server 同一
-    /// ValidChecker (design D6): 同 path 已存在 → 原样不变。
+    /// Create ask 发送点（表单签提交与测试共用缝; change solution-service
+    /// 5.2 / solution-config-tab 3.1）。幂等前置检与 Server 同一
+    /// ValidChecker（design D6）: 同 path 已存在 → 原样不变。提交入信箱
+    /// 即置 `sol_config_inflight`（回执成败由 `poll_sessions` 消费 → 行内
+    /// 错误 / 成功自关, specs/project-model delta 结果分支）。
     pub(crate) fn request_create_solution(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let Some(ws_dir) = self.workspace.as_ref().map(|w| w.path.clone()) else {
             return;
@@ -738,8 +733,16 @@ impl TerminalApp {
             "添加 solution",
         );
         match result {
-            Ok(_) => self.kick_input_drain(cx), // 快泵: 回执尽快达
-            Err(e) => self.notice = Some(format!("添加 solution 失败: {e}")),
+            Ok(_) => {
+                self.sol_config_inflight = true;
+                self.sol_config_error = None;
+                self.kick_input_drain(cx); // 快泵: 回执尽快达
+            }
+            Err(e) => {
+                self.sol_config_inflight = false;
+                self.sol_config_error = Some(format!("添加 solution 失败: {e}"));
+                self.notice = Some(format!("添加 solution 失败: {e}"));
+            }
         }
     }
 
@@ -887,7 +890,9 @@ impl TerminalApp {
                 return;
             }
             SidebarEvent::AddSolution => {
-                self.add_solution(cx);
+                // 入口动作 = 开应用内表单签 (specs/center-tabs delta; 旧 rfd
+                // 直连链已退役, task 2.2)
+                self.open_solution_config_tab(window, cx);
                 return;
             }
             SidebarEvent::ToggleProjectCollapse(root) => self.toggle_project_collapse(&root),
@@ -928,11 +933,17 @@ impl TerminalApp {
         let sidebar = self.sidebar.clone();
         let terminal = self.terminal.clone();
         let asset_view = self.asset_view.clone();
+        // 表单签: 预检读树镜像/行内错误读 app — 变更须随轮询重绘
+        // (solution-config-tab 3.1/3.3)
+        let sol_config = self.sol_config_panel.clone();
         cx.defer(move |cx| {
             sidebar.update(cx, |_, cx| cx.notify());
             terminal.update(cx, |_, cx| cx.notify());
             // 树面板不是裸 notify: 要走"根比对→按需重扫→同步 TreeState"
             asset_view.update(cx, |panel, cx| panel.on_data_changed(cx));
+            if let Some(panel) = sol_config {
+                panel.update(cx, |_, cx| cx.notify());
+            }
         });
     }
 
@@ -1000,8 +1011,25 @@ impl TerminalApp {
             self.switch_console_tab(cx);
             changed = true;
         }
-        // 控制失败 notice (spec delta: 点名失败操作; 取最新一条)
+        // solution Create 成功回执 → 表单签自关 (specs/project-model:
+        // Successful creation closes the tab)。defer 落关 — 直接 remove 会
+        // 在 on_removed 重入 TerminalApp (double-lease panic), 见
+        // solution_config::close_solution_config_tab 文档。无签在场 = 空操作
+        // (测试缝直调路径, inflight 照清)。
+        let sol_oks = self.service_layer.take_sol_successes();
+        if self.sol_config_inflight && sol_oks.contains(&"添加 solution") {
+            self.sol_config_inflight = false;
+            self.close_solution_config_tab(cx);
+            changed = true;
+        }
+        // 控制失败 notice (spec delta: 点名失败操作; 取最新一条)。表单签在
+        // 途且点名添加 solution → 同步行内错误 (spec delta: failure → error
+        // shown in the tab, 签保留)。
         if let Some(n) = self.service_layer.take_notices().pop() {
+            if self.sol_config_inflight && n.contains("添加 solution") {
+                self.sol_config_inflight = false;
+                self.sol_config_error = Some(n.clone());
+            }
             self.notice = Some(n);
             changed = true;
         }

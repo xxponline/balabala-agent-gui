@@ -154,6 +154,9 @@ pub struct ServiceLayer {
     pending_ops: HashMap<Corr, (CtrlOp, &'static str)>,
     /// 控制成功回执（task 3.2: app 据此切 console tab — 成功才切，spec delta）。
     successes: Vec<CtrlOp>,
+    /// solution 操作成功回执标签（非 load 的 Ok 配对；表单签自关消费 —
+    /// solution-config-tab 3.1）。
+    sol_successes: Vec<&'static str>,
     /// watch 握手已发出（bootstrap 时 agent 尚 loading 会被 fail-fast 拒 →
     /// 首个 Available 事件到达时补发，task 3.1）。
     watch_sent: bool,
@@ -276,6 +279,7 @@ impl ServiceLayer {
             notices: Vec::new(),
             pending_ops: HashMap::new(),
             successes: Vec::new(),
+            sol_successes: Vec::new(),
             watch_sent: false,
             agent_ready: false,
             solution_id,
@@ -417,8 +421,14 @@ impl ServiceLayer {
                                 if let Some(c) = corr {
                                     self.load_results.push((c, res));
                                 }
-                            } else if let (Err(e), Some(label)) = (&res, paired) {
-                                self.notices.push(format!("{label}失败: {e}"));
+                            } else if let Err(e) = &res {
+                                if let Some(label) = paired {
+                                    self.notices.push(format!("{label}失败: {e}"));
+                                }
+                            } else if let Some(label) = paired {
+                                // 非 load 的 Ok 配对标签 → 成功队列
+                                // (表单签自关, solution-config-tab 3.1)
+                                self.sol_successes.push(label);
                             }
                         }
                         Err(_) => {
@@ -526,6 +536,12 @@ impl ServiceLayer {
     /// 取走控制成功回执（app 据此切 console tab；失败已入 notice）。
     pub fn take_successes(&mut self) -> Vec<CtrlOp> {
         std::mem::take(&mut self.successes)
+    }
+
+    /// 取走 solution 操作成功回执标签（表单签自关消费 —
+    /// solution-config-tab 3.1）。
+    pub fn take_sol_successes(&mut self) -> Vec<&'static str> {
+        std::mem::take(&mut self.sol_successes)
     }
 
     /// 一次性: agent 首次就绪 (app 据此推主题快照)。
