@@ -11,21 +11,18 @@ pub mod store;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use agent_service::contract::SessionId;
-
-/// 当前打开的工作区: 目录 + 会话。
+/// 当前打开的工作区: 目录 + UI 折叠态。
 ///
-/// 会话平铺在 workspace 级 (poll/主题/resize 遍历零分组开销); 所属
-/// Project 由 `AgentEntity::project_root()` 即 cwd 决定 (spec: Session
-/// working directory — agent 在哪个项目下 = cwd 指向哪个项目根)。
+/// 会话与 active 不在此存 — 一律读 AgentService 投影
+/// (`sessions_view()`, change solution-overview); 所属 Project 由
+/// `AgentEntity::project_root()` 即 cwd 决定 (spec: Session working
+/// directory)。
 pub struct Workspace {
     /// 工作区目录绝对路径 (去重身份; 右树扫描根)。
     pub path: PathBuf,
-    /// 折叠的 Project 行 (易失, 不持久化 — 对齐"折叠态不持久化"立场)。
+    /// 折叠的 Project 行 (易失, 不持久化 — 对齐"折叠态不持久化"立场;
+    /// 纯 UI 层状态, 留本地 — 定案 2026-11-23)。
     pub collapsed_projects: HashSet<PathBuf>,
-    /// 该工作区下的全部会话 id (平铺; 会话本体归 AgentService 所有,
-    /// 此处仅 id 镜像 — change agent-service task 3.2, D4)。
-    pub agents: Vec<SessionId>,
 }
 
 impl Workspace {
@@ -33,7 +30,6 @@ impl Workspace {
         Self {
             path,
             collapsed_projects: HashSet::new(),
-            agents: Vec::new(),
         }
     }
 

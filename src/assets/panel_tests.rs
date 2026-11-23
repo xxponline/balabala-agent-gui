@@ -33,7 +33,6 @@
         // hermetic: 清空可能的恢复态 (注册制下树只认 manager)
         app.update(cx, |app, _| {
             app.workspace = None;
-            app.active = None;
         });
         (handle, app)
     }
@@ -215,7 +214,7 @@
 
         let (active, registered) = cx.update(|cx| {
             let app = app_entity.read(cx);
-            (app.active, app.workspace.is_some())
+            (app.active_session(), app.workspace.is_some())
         });
         assert!(active.is_none(), "无活动会话");
         assert!(!registered, "甚至无需工作区实体 — 注册即可显树");

@@ -72,7 +72,6 @@
         // hermetic: 清空可能的恢复态
         app.update(cx, |app, _| {
             app.workspace = None;
-            app.active = None;
         });
         app
     }

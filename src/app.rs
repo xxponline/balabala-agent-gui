@@ -53,9 +53,6 @@ pub struct TerminalApp {
     pub open_failure: Option<String>,
     /// 切换门控提示 (spec: notice naming the count of active sessions)
     pub notice: Option<String>,
-    /// 当前 active session 的稳定身份 (服务分配 SessionId; **镜像** —
-    /// 真值在 AgentService, 由 sessions_changed 投影驱动, task 3.2 / D4)
-    pub active: Option<SessionId>,
     /// 最近一次持久化失败的错误信息 (在 sidebar 顶部显示; spec:
     /// Persistence write failure surfacing — 配置写失败红条)
     pub save_error: Option<String>,
@@ -199,7 +196,6 @@ impl TerminalApp {
             load_epoch: 0,
             open_failure: None,
             notice: None,
-            active: None,
             save_error: None,
             history_path,
             _update_task: None,
@@ -302,11 +298,17 @@ impl TerminalApp {
     }
 
     /// 把一个键送给 active session (tell, D6 静默; 输入注入归服务)。
+    /// active 会话身份 — 一律读 sessions 投影 (change solution-overview:
+    /// 真值在服务, GUI 不再存本地字段; 服务未起 → None, 与旧字段初值同义)。
+    pub(crate) fn active_session(&self) -> Option<SessionId> {
+        self.service_layer.sessions_view().and_then(|v| v.active)
+    }
+
     pub(crate) fn send_key(&mut self, key: crossterm::event::KeyEvent, cx: &mut Context<Self>) {
         if key.code == crossterm::event::KeyCode::Tab {
             self.tab_forwards += 1; // 诊断/测试观测 (spec: Tab 转发边界)
         }
-        let Some(active) = self.active else {
+        let Some(active) = self.active_session() else {
             return;
         };
         // 代际基线 (t0 同时, 任务 2.1): 快泵窗/echo 口径共用——此刻尚未
@@ -328,7 +330,7 @@ impl TerminalApp {
 
     /// 把一段已提交文本（IME commit / 粘贴）送给 active session。
     pub(crate) fn send_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        let Some(active) = self.active else {
+        let Some(active) = self.active_session() else {
             return;
         };
         let _ = self.service_layer.manager.tell(Envelope::new(
@@ -346,7 +348,7 @@ impl TerminalApp {
     /// 把滚轮行数送给 active session (task 2.2)。无 active session 时不
     /// 计数不转发 (与 send_text 同款: 无收者即无动作)。
     pub(crate) fn send_wheel(&mut self, lines: i16, cx: &mut Context<Self>) {
-        let Some(active) = self.active else {
+        let Some(active) = self.active_session() else {
             return;
         };
         self.wheel_forwards += 1;
@@ -365,7 +367,7 @@ impl TerminalApp {
     /// 把左键单元格坐标送给 active session (task 2.2; 坐标系 = 会话帧
     /// 0-based, 命中在会话内部)。
     pub(crate) fn send_click(&mut self, x: u16, y: u16, cx: &mut Context<Self>) {
-        let Some(active) = self.active else {
+        let Some(active) = self.active_session() else {
             return;
         };
         self.click_forwards += 1;
@@ -669,7 +671,6 @@ impl TerminalApp {
             // 启动恢复目标失效 (目录没了/marker 没了) → 回空态, 不报错
             OpenOutcome::Empty => {
                 self.workspace = None;
-                self.active = None;
             }
             OpenOutcome::Failure(msg) => {
                 // 正式路径已在 begin_open 里 dialog+exit; 测试观测面
@@ -678,9 +679,16 @@ impl TerminalApp {
             OpenOutcome::Ready(_snap) => {
                 // 清场: 旧会话全部关停 (切换语义: exited 屏幕随切走丢弃,
                 // spec: confirmation … discarded; 活动会话已被门控拦下)
-                if let Some(old) = self.workspace.take() {
-                    // 会话本体归服务: 逐 id tell 关闭 (切换清场, D6 静默)
-                    for sid in old.agents.clone() {
+                if self.workspace.take().is_some() {
+                    // 会话本体归服务: 逐 id tell 关闭 (切换清场, D6 静默)。
+                    // id 清单改读投影 (solution-overview 2.1: 无本地 agents
+                    // 拷贝; 投影为活数据, 比旧 poll 拷贝更新鲜)
+                    let stale: Vec<SessionId> = self
+                        .service_layer
+                        .sessions_view()
+                        .map(|v| v.sessions.iter().map(|s| s.id).collect())
+                        .unwrap_or_default();
+                    for sid in stale {
                         let _ = self.service_layer.manager.tell(Envelope::new(
                             Route::Service("agent".into()),
                             self.service_layer.listener.address().clone(),
@@ -689,7 +697,6 @@ impl TerminalApp {
                         ));
                     }
                 }
-                self.active = None;
                 self.notice = None;
                 // 历史置顶 (便利数据: 失败仅日志, 不红条 — 非 workspace 配置)
                 let mut history = History::load_at(&self.history_path);
@@ -1037,20 +1044,10 @@ impl TerminalApp {
         if self.service_layer.take_agent_ready() {
             self.push_tui_theme(cx);
         }
-        // 投影镜像: active + id 清单 (D4 真值在服务, GUI 只读)
-        if let Some(view) = self.service_layer.sessions_view().cloned() {
-            if self.active != view.active {
-                self.active = view.active;
-                changed = true;
-            }
-            if let Some(ws) = self.workspace.as_mut() {
-                let ids: Vec<SessionId> = view.sessions.iter().map(|s| s.id).collect();
-                if ws.agents != ids {
-                    ws.agents = ids;
-                    changed = true;
-                }
-            }
-            // 镜像同步进面板 (design D7 入站: set_view)
+        // 镜像同步进面板 (design D7 入站: set_view) — active/id 清单不再
+        // 本地拷贝 (solution-overview: 一律读投影; 变化由 pump 消费服务
+        // 事件置 changed, 通知链不丢 — design D4)
+        if self.service_layer.sessions_view().is_some() {
             self.sync_terminal_view(cx);
         }
         // 帧 → AgentTerminal (本地 parser 喂养; 字节零拷贝透传)
@@ -1451,7 +1448,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(
-            cx.update(|cx| app_entity.read(cx).active),
+            cx.update(|cx| app_entity.read(cx).active_session()),
             Some(_agent_id),
             "投影镜像灌入 active"
         );
@@ -1477,7 +1474,7 @@ mod tests {
         let has_han = |cx: &mut TestAppContext| {
             cx.update(|cx| {
                 let app = app_entity.read(cx);
-                let active = app.active;
+                let active = app.active_session();
                 app.terminal
                     .read(cx)
                     .active_screen_text(active)
@@ -2515,7 +2512,8 @@ mod tests {
         );
         let (a_ws, a_ext) = (ids[0], ids[1]);
         app_entity.update(cx, |app, cx| {
-            app.active = Some(a_ext); // 状态栏显示外部 project 的 root
+            // 状态栏外部 root: 投影已置 active (服务新建即 active,
+            // create_session 自举已 sync_terminal_view — 无需直写)
             app.sidebar.update(cx, |_, cx| cx.notify());
             app.terminal.update(cx, |_, cx| cx.notify());
         });
@@ -2578,7 +2576,7 @@ mod tests {
         let (active_before, tab_before) = app_entity.update(cx, |app, _cx| {
             let area = app.dock_area.read(_cx);
             (
-                app.active,
+                app.active_session(),
                 crate::property_detail_manager::active_center_panel_id(area),
             )
         });
@@ -2593,7 +2591,7 @@ mod tests {
         let (active_after, tab_after) = app_entity.update(cx, |app, _cx| {
             let area = app.dock_area.read(_cx);
             (
-                app.active,
+                app.active_session(),
                 crate::property_detail_manager::active_center_panel_id(area),
             )
         });
@@ -2791,7 +2789,7 @@ mod tests {
         .expect("update window");
         wait_notice(cx, "切换会话失败");
         assert_eq!(
-            cx.update(|cx| app_entity.read(cx).active),
+            cx.update(|cx| app_entity.read(cx).active_session()),
             Some(agent_id),
             "失败 select 不动 active (spec delta 场景 2)"
         );
@@ -2867,7 +2865,10 @@ mod tests {
         let (id_a, shared_a) = test_sessions::create_session(cx, &app_entity, &ws_path);
         let (id_b, shared_b) = test_sessions::create_session(cx, &app_entity, &ws_path);
         assert_ne!(id_a, id_b);
-        assert_eq!(cx.update(|cx| app_entity.read(cx).active), Some(id_b));
+        assert_eq!(
+            cx.update(|cx| app_entity.read(cx).active_session()),
+            Some(id_b)
+        );
         let (ka, _, _, _) = test_sessions::counters(&shared_a.expect("会话 A"));
         let (kb, _, _, _) = test_sessions::counters(&shared_b.expect("会话 B"));
 

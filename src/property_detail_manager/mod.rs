@@ -115,7 +115,6 @@ mod tests {
         });
         app.update(cx, |app, _| {
             app.workspace = None;
-            app.active = None;
         });
         (handle, app)
     }
@@ -748,10 +747,25 @@ mod tests {
         });
         assert_eq!((wf, cf), (2, 1), "入口计数 = 转发次数");
 
-        // 无 active session: 不 panic、不计数、不转发 (task 2.2 边界)
+        // 无 active session: 不 panic、不计数、不转发 (task 2.2 边界) —
+        // 真关会话等投影归 None (solution-overview: 真值在服务, 不再
+        // 本地强清字段)
+        let sid = cx
+            .update(|cx| app.read(cx).active_session())
+            .expect("前段存在 active 会话");
+        app.update(cx, |app, cx| app.close_agent(sid, cx));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while cx.update(|cx| app.read(cx).active_session()).is_some() {
+            cx.run_until_parked();
+            app.update(cx, |app, cx| app.poll_sessions(cx));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "关闭后投影 active 未归 None"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         cx.update(|cx| {
             app.update(cx, |app, cx| {
-                app.active = None;
                 app.send_wheel(9, cx);
                 app.send_click(0, 0, cx);
             });

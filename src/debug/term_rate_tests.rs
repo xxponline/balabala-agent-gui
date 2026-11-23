@@ -86,7 +86,6 @@ fn open_app(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<TerminalApp>) {
     });
     app.update(cx, |app, _| {
         app.workspace = None;
-        app.active = None;
     });
     (handle, app)
 }

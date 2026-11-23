@@ -170,15 +170,9 @@ pub fn create_session(
         });
         if let Some(id) = found {
             let shared = sessions_of(root).last().cloned();
-            // 镜像自举: 主动同步 active/id 清单 (部分测试不跑 50ms 泵;
-            // pump 路径由 task 3.x 专项测试覆盖 — 此处仅定基准态)
+            // 面板视图同步 (部分测试不跑 50ms 泵) — active/id 清单一律
+            // 读投影, 无需本地字段自举 (solution-overview D5)
             app.update(cx, |app, cx| {
-                app.active = Some(id);
-                if let Some(ws) = app.workspace.as_mut() {
-                    if !ws.agents.contains(&id) {
-                        ws.agents.push(id);
-                    }
-                }
                 app.sync_terminal_view(cx);
             });
             return (id, shared);
@@ -257,7 +251,7 @@ pub fn inject_view(
             app.update(cx, |app, cx| {
                 app.poll_sessions(cx);
             });
-            if app.read_with(cx, |app, _| app.active) == Some(target) {
+            if app.read_with(cx, |app, _| app.active_session()) == Some(target) {
                 break;
             }
             assert!(

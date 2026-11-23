@@ -150,7 +150,7 @@ fn snapshot(app: &TerminalApp, _cx: &App) -> SidebarSnapshot {
                                         id: s.id,
                                         name: s.name.clone(),
                                         status: s.status,
-                                        is_active: app.active == Some(s.id),
+                                        is_active: v.active == Some(s.id),
                                     })
                                     .collect::<Vec<_>>()
                             })
