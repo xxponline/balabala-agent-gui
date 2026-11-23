@@ -625,12 +625,14 @@ dependencies = [
  "directories",
  "futures",
  "gpui-kit",
+ "libc",
  "pi-shell-rs",
  "rfd",
  "serde",
  "serde_json",
  "service-manager",
  "vt100",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

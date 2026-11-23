@@ -7,7 +7,11 @@
 
 mod app;
 mod assets;
+// 门控在模块文件内 (#![cfg(debug_assertions)]): release 下模块为空壳,
+// 注册表/section 代码不进二进制 (design D5)
+mod debug;
 
+mod menu;
 mod project_model;
 mod service_layer;
 mod property_detail_manager;

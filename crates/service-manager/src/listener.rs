@@ -64,6 +64,17 @@ impl Listener {
         &self.addr
     }
 
+    /// mailbox 积压 (task 7.2 观测): 未 poll 的通道内件 + 已 poll 未
+    /// drain 的本地件 — 只读, 不取件不改状态 (调试面板按秒读)。
+    pub fn len(&self) -> usize {
+        self.rx.len() + self.local.len()
+    }
+
+    /// 积压是否为空 ([`len`](Self::len) == 0)。
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// 一次消息循环迭代：把 mailbox 里的件灌入本地队列并刷新快照。
     ///
     /// 返回 `true` 表示**自上次 poll 以来**有新件（连续 N 次翻转合并为

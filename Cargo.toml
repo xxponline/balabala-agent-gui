@@ -35,3 +35,13 @@ agent-service = { path = "crates/agent-service" }
 gpui-kit = { version = "0.9.0", features = ["test-support"] }
 # service_layer 测试: 非 tokio executor await ask future (task 6.1)
 futures = "0.3"
+
+# debug-console change task 4.1: 进程线程数 OS 真值 (design D9)。
+# 两者均已在 Cargo.lock (传递依赖), 此处仅提升为直接依赖, 无新增下载面。
+[target.'cfg(target_os = "macos")'.dependencies]
+# proc_pidinfo(PROC_PIDTASKINFO) -> proc_taskinfo.pti_threadnum
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Toolhelp32 快照数本 pid 线程 (features 按 Win32_* 路径所需)
+windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_ToolHelp", "Win32_Foundation"] }

@@ -21,6 +21,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// drain 循环拍距。**25ms** (三次回改, 长文滚动验收驱动): 补采窗 (48ms)
@@ -34,6 +35,16 @@ const KIND_DRAIN_TICK: &str = "drain.tick";
 /// 循环自寻址载荷 (空; dispatch 按 kind 分发)。
 struct DrainTick;
 
+/// 进程级丢帧累计 (task 3.1, design D8 通路 1): 出口满被拒的帧数。
+/// 服务实例在 manager 内部构造, GUI 够不着实例 —— 计数挂进程全局,
+/// 经 [`dropped_frames`] 只读暴露 (debug section 消费)。
+static DROPPED_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// 读取进程级丢帧累计 (只读, 不重置)。
+pub fn dropped_frames() -> u64 {
+    DROPPED_FRAMES.load(Ordering::Relaxed)
+}
+
 /// 一次 drain tick 的产出：状态是否变化 + 各会话新字节（`Arc` 一次构造，
 /// 推帧时克隆引用 —— 零拷贝，D3）。
 #[allow(dead_code)] // task 2.6 drain 循环调用；帧已在 tick 内推送
@@ -43,7 +54,7 @@ pub(crate) struct TickOutcome {
 }
 
 /// 服务实例状态。
-#[allow(dead_code)] // factory/next_id/watcher/theme/dropped_frames 随 task 2.2-2.6 handler 接线读取
+#[allow(dead_code)] // factory/next_id/watcher/theme 随 task 2.2-2.6 handler 接线读取
 pub struct AgentService {
     ctx: ServiceCtx,
     factory: SessionFactory,
@@ -59,15 +70,6 @@ pub struct AgentService {
     /// per-project `pi-N` 名额计数（spec: N 每项目从 1 起、**永不复用**——
     /// 计数存服务侧，关闭不回退；创建失败也已消耗，与原 claim-then-spawn 一致）。
     counters: HashMap<PathBuf, u64>,
-    /// 推帧失败（mailbox 满）丢帧计数（观测面，D3）。
-    dropped_frames: u64,
-}
-
-impl AgentService {
-    /// 丢帧计数（观测面：出口满被拒的帧数）。
-    pub fn dropped_frames(&self) -> u64 {
-        self.dropped_frames
-    }
 }
 
 impl AgentService {
@@ -85,7 +87,6 @@ impl AgentService {
             watcher: None,
             theme: TuiTheme::default(),
             counters: HashMap::new(),
-            dropped_frames: 0,
         }
     }
 
@@ -181,7 +182,8 @@ impl AgentService {
                     }),
                 );
                 if self.ctx.messaging.tell(env).is_err() {
-                    self.dropped_frames += 1; // 出口满: 丢帧自愈, 不阻塞 drain
+                    // 出口满: 丢帧自愈, 不阻塞 drain (计数进程级, task 3.1)
+                    DROPPED_FRAMES.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -533,6 +535,10 @@ mod tests {
     use crate::testkit::{stub_factory, test_ctx, test_ctx_with, StubScript, StubSession, TestMessaging};
     use service_core::{Address, Corr, Envelope, Route};
     use std::sync::Mutex;
+
+    /// 丢帧计数是进程级全局 (task 3.1) — 并行测试共享同一计数,
+    /// 触碰它的测试持此锁 + delta 断言, 避免绝对值互扰。
+    static DROP_LOCK: Mutex<()> = Mutex::new(());
 
     /// 构造 ask 形态的控制信封（to 任意 — dispatch 是直调不查路由）。
     fn ctrl_env(kind: &'static str, payload: Payload, corr: u64) -> Envelope {
@@ -1086,12 +1092,50 @@ mod tests {
             "全推覆盖全部会话"
         );
 
-        // 出口满 → 丢帧计数, drain 不阻塞 (帧自含状态, 后帧自愈)
+        // 出口满 → 丢帧计数, drain 不阻塞 (帧自含状态, 后帧自愈)。
+        // 计数进程级 (task 3.1): 持锁读 delta, 不依赖绝对值
+        let _guard = DROP_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let before = dropped_frames();
         msg.set_fail_tells(true);
         script_a.lock().expect("script").pending_bytes = b"drop".to_vec();
         let out = svc.tick();
         assert_eq!(out.frames.len(), 1, "drain 照常, 不因出口失败阻塞");
-        assert_eq!(svc.dropped_frames(), 1, "丢帧计数递增");
+        assert_eq!(dropped_frames() - before, 1, "丢帧计数递增");
+    }
+
+    /// task 3.1 验证: 进程级丢帧计数经 `pub fn` 只读暴露 — 单次失败
+    /// tell → +1, 且读取不重置 (delta 断言 + 共享锁, 见 `DROP_LOCK`)。
+    #[test]
+    fn dropped_frames_reads_process_wide_count() {
+        let _guard = DROP_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let before = dropped_frames();
+
+        let script = Arc::new(Mutex::new(StubScript::default()));
+        let msg = Arc::new(TestMessaging::new(InstanceId(8)));
+        let mut svc = AgentService::with_factory(
+            test_ctx_with(Arc::clone(&msg)),
+            stub_factory(Arc::clone(&script)),
+        );
+        svc.insert_session(
+            "pi-1".into(),
+            PathBuf::from("/p1"),
+            Box::new(StubSession::new(Arc::clone(&script))),
+        );
+        svc.dispatch(Envelope::new(
+            Route::Instance(InstanceId(1)),
+            Address::instance(InstanceId(77)),
+            KIND_WATCH,
+            Payload::new(WatchReq),
+        ));
+
+        // 出口满 → 唯一帧的 tell 失败 → 计数 +1 (emit_sessions 的失败
+        // 不计 — 只有帧推送路径计数)
+        msg.set_fail_tells(true);
+        script.lock().expect("script").pending_bytes = b"x".to_vec();
+        svc.tick();
+
+        assert_eq!(dropped_frames() - before, 1, "失败 tell → 计数 +1");
+        assert_eq!(dropped_frames(), before + 1, "读取不重置计数");
     }
 
     /// task 2.1 验证: Starting → Running (首帧字节) → Exited (io 终止)，

@@ -100,6 +100,12 @@ pub struct TerminalApp {
     /// key = 对象绝对路径字符串 (与 AssetNode.id 同一身份体系),
     /// value = 已开面板的 PanelId; 签关闭时经 `open_tab_removed` 摘除。
     pub(crate) open_tabs: HashMap<String, PanelId>,
+    /// debug section 的 dedup 表 (specs/center-tabs delta): key = section id
+    /// (**独立于**文件路径身份 — 同字符串互不干扰), 签关闭时经
+    /// `debug_tab_removed` 摘除。跟着 `crate::debug` 的门控走 (release
+    /// 无此字段 — design D5 零成本)。
+    #[cfg(debug_assertions)]
+    pub(crate) debug_tabs: HashMap<String, PanelId>,
 }
 
 impl TerminalApp {
@@ -193,6 +199,8 @@ impl TerminalApp {
             wheel_forwards: 0,
             click_forwards: 0,
             open_tabs: HashMap::new(),
+            #[cfg(debug_assertions)]
+            debug_tabs: HashMap::new(),
             dock_area,
             sidebar,
             terminal,
@@ -204,6 +212,15 @@ impl TerminalApp {
         if let Some(path) = restore {
             app.begin_open(path, cx);
         }
+        // 内置 debug sections 装配期注册 (add-debug-console 8.1, design
+        // D11: 注册表先填充, 菜单后构建一次)。release 下 debug 模块为空壳
+        // → 调用点同 cfg (debug_tabs 字段同款)。
+        #[cfg(debug_assertions)]
+        crate::debug::register_builtin();
+        // 应用菜单栏 (add-debug-console 6.1/6.3, specs/app-menu-bar): 装配
+        // 完成后构建一次 (design D11) + 接 Debug 菜单项 action 分发 (6.3)。
+        // bind_keys 在前 — macOS 建菜单项时读 keymap 出快捷键提示 (⌘C)。
+        crate::menu::install(cx);
         Ok(app)
     }
 

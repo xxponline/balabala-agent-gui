@@ -2200,6 +2200,42 @@ mod rate_log {
     static LAG_SUM: AtomicU64 = AtomicU64::new(0);
     static LAG_MAX: AtomicU64 = AtomicU64::new(0);
 
+    /// 一份秒级汇总 (design D7 报告槽): 与 stderr 行**同源同值** —
+    /// GUI debug section 只读消费, 计数器仍由 rate_log 独占
+    /// (spec: Term-rate section reads without consuming)。
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct Report {
+        /// 输入→帧 (回显) 平均 ms
+        pub echo_avg_ms: u64,
+        /// 输入→帧 最大 ms
+        pub echo_max_ms: u64,
+        /// 回显样本数
+        pub echo_n: u64,
+        /// 回显超时 (>300ms) 次数
+        pub echo_miss: u64,
+        /// 帧→画 (paint lag) 平均 ms
+        pub paint_avg_ms: u64,
+        /// 帧→画 最大 ms
+        pub paint_max_ms: u64,
+        /// 帧→画样本数
+        pub paint_n: u64,
+        /// 每秒喂帧数
+        pub feed_per_s: u64,
+        /// 每秒绘制数
+        pub render_per_s: u64,
+        /// 平均帧 KB
+        pub frame_kb_avg: f64,
+        /// 最大帧 KB
+        pub frame_kb_max: f64,
+        /// 距上次喂帧 ms
+        pub since_feed_ms: u64,
+        /// 平均绘制耗时 ms
+        pub render_cost_avg_ms: f64,
+    }
+
+    /// 最新一份汇总 (单写者 = `maybe_print`; 读侧 clone 出去)。
+    static LATEST: Mutex<Option<Report>> = Mutex::new(None);
+
     /// echo 窗口账（change `2026-11-20-streaming-input-echo-latency` 任务 1.2，
     /// design Decisions 方案 A 口径）：只有**代际 > 基线**的首帧才算回显帧
     /// （输入效果所在的首帧）；流式帧（代际 ≤ 基线，字节产生于输入注入
@@ -2348,28 +2384,60 @@ mod rate_log {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take_stats();
+        // 报告槽 (design D7): 在静默门**之前**写 — section 可见时 console
+        // 常不渲染 (rn=0), 槽仍须每秒刷新 since_feed (spec: refreshed at
+        // least once per second while visible); stderr 静默行为不变。
+        let report = Report {
+            echo_avg_ms: if en > 0 { es / en } else { 0 },
+            echo_max_ms: emax,
+            echo_n: en,
+            echo_miss: miss,
+            paint_avg_ms: if ln > 0 { ls / ln } else { 0 },
+            paint_max_ms: lmax,
+            paint_n: ln,
+            feed_per_s: fn_,
+            render_per_s: rn,
+            frame_kb_avg: if fn_ > 0 { fb as f64 / fn_ as f64 / 1024.0 } else { 0.0 },
+            frame_kb_max: fbmax as f64 / 1024.0,
+            since_feed_ms: since,
+            render_cost_avg_ms: if rn > 0 { rs as f64 / rn as f64 / 1e6 } else { 0.0 },
+        };
+        *LATEST.lock().unwrap_or_else(|p| p.into_inner()) = Some(report.clone());
         if rn == 0 && fn_ == 0 && en == 0 {
             return; // 静默窗口 (纯闲置)
         }
-        eprintln!(
-            "[term-rate] 输入→帧 avg={}ms max={}ms (n={} miss={}) | 帧→画 avg={}ms max={}ms (n={}) | feed/s={fn_} render/s={rn} | 帧KB avg {:.1} max {:.1} | since_feed={}ms | render_cost avg {:.1}ms",
-            if en > 0 { es / en } else { 0 },
-            emax,
-            en,
-            miss,
-            if ln > 0 { ls / ln } else { 0 },
-            lmax,
-            ln,
-            if fn_ > 0 { fb as f64 / fn_ as f64 / 1024.0 } else { 0.0 },
-            fbmax as f64 / 1024.0,
-            since,
-            if rn > 0 { rs as f64 / rn as f64 / 1e6 } else { 0.0 },
-        );
+        eprintln!("{}", format_line(&report));
+    }
+
+    /// stderr 行格式 (单测锁死 — 改这里等于改 stderr 与 section 的共同口径)。
+    fn format_line(r: &Report) -> String {
+        format!(
+            "[term-rate] 输入→帧 avg={}ms max={}ms (n={} miss={}) | 帧→画 avg={}ms max={}ms (n={}) | feed/s={} render/s={} | 帧KB avg {:.1} max {:.1} | since_feed={}ms | render_cost avg {:.1}ms",
+            r.echo_avg_ms,
+            r.echo_max_ms,
+            r.echo_n,
+            r.echo_miss,
+            r.paint_avg_ms,
+            r.paint_max_ms,
+            r.paint_n,
+            r.feed_per_s,
+            r.render_per_s,
+            r.frame_kb_avg,
+            r.frame_kb_max,
+            r.since_feed_ms,
+            r.render_cost_avg_ms,
+        )
+    }
+
+    /// 读取最新一份汇总 (task 2.2): `None` = 启动后尚无任何窗口写过槽。
+    /// 只读: 返回拷贝, 不重置窗口 (spec: reads without consuming)。
+    pub fn latest_report() -> Option<Report> {
+        LATEST.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     #[cfg(test)]
     mod tests {
-        use super::EchoWindow;
+        use super::{EchoWindow, Report, format_line, latest_report, note_feed};
 
         /// 任务 1.2 验证: "连续流式帧 + 回显帧"序列只计回显帧。
         /// 流式帧 (代际 ≤ 基线, 字节产生于输入注入之前) 不计样本、不关窗;
@@ -2411,8 +2479,50 @@ mod rate_log {
             assert_eq!(w.note_feed(1110, 2), Some(10));
             assert_eq!(w.take_stats(), (1, 10, 10, 0));
         }
+
+        /// 任务 2.1 验证: 报告槽与 stderr 行同源同值 — format_line 输出
+        /// 与历史 eprintln 格式逐字节一致 (改格式 = 同步改两处口径)。
+        #[test]
+        fn report_line_matches_stderr_format() {
+            let r = Report {
+                echo_avg_ms: 9,
+                echo_max_ms: 20,
+                echo_n: 3,
+                echo_miss: 1,
+                paint_avg_ms: 4,
+                paint_max_ms: 12,
+                paint_n: 5,
+                feed_per_s: 6,
+                render_per_s: 7,
+                frame_kb_avg: 1.5,
+                frame_kb_max: 8.0,
+                since_feed_ms: 1500,
+                render_cost_avg_ms: 0.5,
+            };
+            assert_eq!(
+                format_line(&r),
+                "[term-rate] 输入→帧 avg=9ms max=20ms (n=3 miss=1) | 帧→画 avg=4ms max=12ms (n=5) | feed/s=6 render/s=7 | 帧KB avg 1.5 max 8.0 | since_feed=1500ms | render_cost avg 0.5ms"
+            );
+        }
+
+        /// 任务 2.2 验证: 无数据 None; note_feed 后 Some 且计数正确。
+        /// 本测试是 rate_log 全局态的唯一写者 (无其他测试触发
+        /// maybe_print — AgentTerminal 不在本 crate 测试中构造)。
+        #[test]
+        fn latest_report_none_until_first_feed() {
+            assert!(latest_report().is_none(), "尚无窗口时应为 None");
+            note_feed(1_000_000, 2048, 0); // 首个窗口: LAST_PRINT 初始 None 必过节流
+            let r = latest_report().expect("feed 后应有 Some");
+            assert_eq!(r.feed_per_s, 1, "单次 feed → 1/s");
+            assert_eq!(r.frame_kb_max, 2.0, "2048B = 2.0KB");
+            assert_eq!(r.echo_n, 0, "无在途回显");
+        }
     }
 }
+
+// task 2.2: agent-service 对外暴露报告槽读取面 (design D7 通路 1)。
+// GUI debug section 只读消费 — rate_log 本体保持私有, 计数器不外泄。
+pub use rate_log::{Report, latest_report};
 
 impl Render for AgentTerminal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2465,7 +2575,7 @@ impl Render for AgentTerminal {
         // defer 用快照: render 期已新鲜, paint 后不再碰实体状态 (除 panel 自身)
         let view_snapshot = self.view.clone();
         let bus = Arc::clone(&self.bus);
-        let __el = div()
+        let pane = div()
             .id("terminal-pane")
             .test_support() // 观测锚点 (无 test-support 特性时为 no-op)
             // 尺寸策略 (DockArea 装配后二分实测):
@@ -2481,10 +2591,20 @@ impl Render for AgentTerminal {
             .min_w(px(0.))
             .min_h(px(0.))
             .key_context("Terminal")
-            .track_focus(&self.focus)
-            .on_action(cx.listener(|this, _: &TerminalCopy, _window, cx| {
+            .track_focus(&self.focus);
+        // Copy 监听按选区条件挂载 (specs/app-menu-bar: "Copy disabled without
+        // a selection"): is_action_available 沿焦点路径查 on_action 监听,
+        // 无选区不挂 → 菜单灰显; 有选区挂上 → cmd-c 与菜单点击同一
+        // handle_copy 路径。哨兵已在 render 头清漂移选区, 此处 selection
+        // 即"当前有效选区"。
+        let pane = if selection.is_some() {
+            pane.on_action(cx.listener(|this, _: &TerminalCopy, _window, cx| {
                 this.handle_copy(cx);
             }))
+        } else {
+            pane
+        };
+        let __el = pane
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);
             }))
