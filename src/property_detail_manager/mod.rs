@@ -323,11 +323,13 @@ mod tests {
         assert!(range.is_some(), "拖选建立选区");
 
         // Cmd+C → 剪贴板 == 实时选区文本 (spec: 复制内容实时读, 哨兵保证一致)
+        // 按键串用 `secondary-c` — 与 `platform_binding` 同源 (task 4.1):
+        // `press` 内部走 `parse_with_os`, `cmd-c` 在 Windows 解析成 Win 键不匹配
         cx.update_window(handle, |_, window, cx| {
             let mut scope = window.within("terminal-pane");
-            scope.press("cmd-c", cx);
+            scope.press("secondary-c", cx);
         })
-        .expect("press cmd-c");
+        .expect("press secondary-c");
         cx.run_until_parked();
 
         let expected = cx.update(|cx| app.read(cx).terminal.read(cx).selection_text_now(cx));
@@ -361,9 +363,9 @@ mod tests {
         // 无选区按 Cmd+C → 剪贴板不变 (spec: SHALL NOT write to the clipboard)
         cx.update_window(handle, |_, window, cx| {
             let mut scope = window.within("terminal-pane");
-            scope.press("cmd-c", cx);
+            scope.press("secondary-c", cx);
         })
-        .expect("press cmd-c");
+        .expect("press secondary-c");
         cx.run_until_parked();
 
         let clip = cx.update(|cx| cx.read_from_clipboard())
@@ -1163,7 +1165,7 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
             let mut scope = window.within("md-pane");
-            scope.press("cmd-shift-m", cx);
+            scope.press("secondary-shift-m", cx);
         })
         .expect("press");
         cx.run_until_parked();

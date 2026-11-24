@@ -38,6 +38,13 @@ use crate::workspace::Workspace;
 // Terminal context 绑定胜出 (design D5, spike 已验证)。
 use crate::property_detail_manager::md_panel::ToggleMdView;
 
+/// 窗口内应用菜单栏 (spec: Application menu bar is always present — 非原生
+/// 平台渲染在 dock 之上) 的定高, 单位 px。
+///
+/// 初值取 28px: 菜单项是 `Button::small()` = `size_6` = 24px, `AppMenu`
+/// 又叠 `.py_0p5()` (design D5 Open Question — 真机目视后可调)。
+pub const MENU_BAR_HEIGHT: f32 = 28.;
+
 pub struct TerminalApp {
     /// 当前打开的工作区 (单实例, spec: Startup workspace restore;
     /// None = 空态, 等待目录选择器)
@@ -61,6 +68,15 @@ pub struct TerminalApp {
     /// DockArea 布局引擎 (design D1): 左|中|右三槽由它编排,
     /// 是 R3 外壳容器 (`render` 的根 div) 的子节点
     pub dock_area: Entity<DockArea>,
+    /// 窗口内应用菜单栏 (win-in-window-app-menu-bar, specs/app-menu-bar):
+    /// 非原生平台渲染在 dock 之上。`None` = 本平台走 OS 原生菜单
+    /// (macOS, design D6 — 窗口内再挂一条会双份)。装配期由
+    /// [`crate::menu::install`] 产出 (design D1: 先喂 GlobalState 再建)。
+    menu_bar: Option<Entity<gpui_kit::component::menu::AppMenuBar>>,
+    /// Copy 菜单项当前是否可用 = 有无选区 (design D2: 灰显只看选区, 焦点
+    /// 不参与)。`render` 内比对翻转, **翻转才**重建菜单 (design D3)。
+    /// 只存 bool 不存选区内容 — 重建的触发条件就是这个位的翻转。
+    copy_enabled: bool,
     /// sidebar 面板实体 (D2; notify 转发目标 — spike §10.5)
     pub sidebar: Entity<SidebarPanel>,
     /// 终端面板实体 (4.1; 焦点在其内, 一步切焦点/步骤 5 进 DockArea 中心)
@@ -118,6 +134,38 @@ pub struct TerminalApp {
     pub(crate) debug_tabs: HashMap<String, PanelId>,
 }
 
+/// 按**平台主修饰键**绑一个键位 (task 4.1/4.2, spec: Copy selection with
+/// Cmd+C)。
+///
+/// 不能用 [`KeyBinding::new`] —— 它走无 OS 的 `Keystroke::parse`，而
+/// `secondary` 分支必须有 OS 否则返回 `Err` → `new` 内的 `unwrap()` **panic**。
+/// [`KeyBinding::load`] 用 `parse_with_os(cx.platform_info().os)` + 平台
+/// keyboard mapper：`secondary` 解析成 macOS → `platform` (⌘)、
+/// Windows/Linux → `control` (Ctrl)，正是 spec 要的平台语义。
+///
+/// `context` 传 `Some("Terminal")` 时内部走 `KeyBindingContextPredicate::parse`
+/// 再 `into()` 成 `Rc<_>`（std blanket impl），与 `KeyBinding::new` 同款。
+fn platform_binding(
+    cx: &gpui_kit::App,
+    keys: &'static str,
+    action: impl gpui_kit::Action,
+    context: Option<&str>,
+) -> KeyBinding {
+    KeyBinding::load(
+        keys,
+        Box::new(action),
+        context.map(|c| {
+            gpui_kit::KeyBindingContextPredicate::parse(c)
+                .expect("静态 context 谓词应可解析")
+                .into()
+        }),
+        false,
+        None,
+        cx,
+    )
+    .expect("键位串应含合法修饰键与主键")
+}
+
 impl TerminalApp {
     /// 启动入口: 默认读全局历史文件 (design D4)。
     ///
@@ -138,16 +186,26 @@ impl TerminalApp {
     ) -> Result<Self, String> {
         // Terminal context 下的 tab 终端转发绑定 (Root 的焦点遍历
         // 绑定在更浅的 context, 被这条压过 — design D5)
-        cx.bind_keys([
-            KeyBinding::new("tab", TerminalTab, Some("Terminal")),
-            // 复制选区 (terminal-text-selection task 4.1, spec: Cmd+C):
-            // Terminal context 深于全局, 不与文本框的 cmd-c 抢;
-            // modifiers.platform 已被 handle_key_down 拦, 不漏给会话
-            KeyBinding::new("cmd-c", TerminalCopy, Some("Terminal")),
-            // md 查看切换 (md-viewer-toggle task 3.1): context=None 任意
-            // context 匹配 — MdPanel 无专属 key_context, 且无键位冲突
-            KeyBinding::new("cmd-shift-m", ToggleMdView, None),
-        ]);
+        //
+        // 数组先在 `&App` 借用域内建好, 出块后再 `bind_keys` (需 `&mut App`)
+        // — 避开同一次调用里 `&cx` / `&mut cx` 的重叠。
+        let key_bindings = {
+            let app: &gpui_kit::App = cx;
+            [
+                KeyBinding::new("tab", TerminalTab, Some("Terminal")),
+                // 复制选区 (terminal-text-selection task 4.1, spec: Copy
+                // selection with Cmd+C)。**用 `secondary-` 而非 `cmd-`**:
+                // 见 [`platform_binding`] — `KeyBinding::new` 遇 `secondary`
+                // 会 panic, 且 `cmd-` 在 Windows 解析成 Win 键而非 Ctrl。
+                // Terminal context 深于全局, 不与文本框的复制键抢;
+                // modifiers 已被 handle_key_down 拦, 不漏给会话。
+                platform_binding(app, "secondary-c", TerminalCopy, Some("Terminal")),
+                // md 查看切换 (md-viewer-toggle task 3.1): context=None 任意
+                // context 匹配 — MdPanel 无专属 key_context, 且无键位冲突
+                platform_binding(app, "secondary-shift-m", ToggleMdView, None),
+            ]
+        };
+        cx.bind_keys(key_bindings);
 
         #[allow(unused_mut)] // cfg(test) 不走 legacy 播种分支 → mut 不被用
         let mut history = History::load_at(&history_path);
@@ -215,6 +273,8 @@ impl TerminalApp {
             #[cfg(debug_assertions)]
             debug_tabs: HashMap::new(),
             dock_area,
+            menu_bar: None, // 装配尾部由 menu::install 填入 (design D1)
+            copy_enabled: false, // 装配期必无选区 (任务 3.2: 首帧即灰显)
             sidebar,
             terminal,
             asset_view,
@@ -233,7 +293,9 @@ impl TerminalApp {
         // 应用菜单栏 (add-debug-console 6.1/6.3, specs/app-menu-bar): 装配
         // 完成后构建一次 (design D11) + 接 Debug 菜单项 action 分发 (6.3)。
         // bind_keys 在前 — macOS 建菜单项时读 keymap 出快捷键提示 (⌘C)。
-        crate::menu::install(cx);
+        // win-in-window-app-menu-bar design D1: install 内先 set_app_menus
+        // 再建 AppMenuBar, 返回值存入字段 (macOS 恒 None)。
+        app.menu_bar = crate::menu::install(cx, app.copy_enabled);
         Ok(app)
     }
 
@@ -954,6 +1016,28 @@ impl TerminalApp {
         });
     }
 
+    /// 统一菜单重建 (win-in-window-app-menu-bar design D3) — 两步：
+    /// ① [`crate::menu::feed_global`] 把 `build()` 喂进 `GlobalState`；
+    /// ② `menu_bar.reload()` 让窗口内实体重读该 GlobalState。
+    ///
+    /// macOS `menu_bar` 恒 `None` (design D6: 走原生, 挂载会双份), 第 ② 步
+    /// no-op, 但第 ① 步照做 — 喂数据不做平台门控, 保持 macOS 侧单源。
+    ///
+    /// **调用方必须只在内容真正变化时调** (design D3): `reload()` 会重建
+    /// 全部 `AppMenu` 实体并把 `selected_index` 清成 `None` — 每帧无脑推
+    /// 等于“菜单一开就自关” (D2 自杀时序)。
+    ///
+    /// 先 clone 句柄再喂数据: 让 `&self` 的借用区在 `&mut App` (`feed_global`
+    /// / `Entity::update` 要的) 之前就结束, 不与 `cx` 活叠。
+    pub(crate) fn rebuild_menus(&self, cx: &mut Context<Self>) {
+        let bar = self.menu_bar.clone(); // `self` 借用到此为止
+        let copy_enabled = self.copy_enabled;
+        crate::menu::feed_global(cx, copy_enabled);
+        if let Some(bar) = bar {
+            bar.update(cx, |bar, cx| bar.reload(cx));
+        }
+    }
+
     /// 启动 50ms 节流的 poll 循环 (design D3): 每 tick drain 所有
     /// session, 只在消费了事件时 notify (替代旧的每帧全量重绘)。
     /// 输入后的快速 drain (design D7, 2026-11-10 headed 验收追加):
@@ -1172,15 +1256,61 @@ fn surface_fatal(_msg: &str) {}
 /// preedit (`replace_and_mark_text_in_range`) 按 spec 不转发。
 
 impl Render for TerminalApp {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 灰显翻转检测 (task 3.2, specs/app-menu-bar: Copy item enabled state
+        // follows selection changes; design D2 只看选区 + D3 翻转才重建)。
+        //
+        // **必须在构建元素树之前** —— 重建会 `AppMenuBar::reload()` 重建
+        // 全部 AppMenu 实体, 而子实体在本帧稍后才 render; 先重建本帧才画出
+        // 新状态。读 `terminal.selection` 是 pub 字段直读, 无订阅 —— 依赖
+        // AgentTerminal 的 `cx.notify()` 经 mark_view_dirty 把祖先链上的
+        // 本视图标脏 (design Risks 末条, task 3.3 验证)。
+        let copy_enabled = self.terminal.read(cx).selection.is_some();
+        if copy_enabled != self.copy_enabled {
+            self.copy_enabled = copy_enabled;
+            self.rebuild_menus(cx);
+        }
+
         // 外壳 (design R3): DockArea 承担左|中|右三槽 (D1), 是本容器的
         // 子节点; 未来 titlebar / 状态栏 / 覆盖层挂同一容器。
         // (行数据/终端块的渲染在各面板 entity 内 — 3.1/4.1)
+        //
+        // 两个 wrapper 是 win-in-window-app-menu-bar design D5 的硬性要求:
+        // 菜单栏 (AppMenuBar) 与 DockArea 的根节点都是 `size_full`
+        // (w:100% h:100%), 直接并列作 flex_col 兄弟会各要 100% 高 →
+        // 总高 200%, 菜单栏被压成半窗。故菜单栏位给定高 + 不收缩,
+        // dock 位改 flex_1 + min_h(0) 让出剩余全部空间 (assets/panel.rs
+        // 「flex 子项收缩 (pane 尺寸教训)」同款)。
         div()
             .size_full()
             .flex()
             .flex_col()
-            .child(self.dock_area.clone())
+            // 菜单栏位: 定高 + 不收缩, 内部子节点 size_full 落到该定高上
+            .child(
+                div()
+                    .h(px(MENU_BAR_HEIGHT))
+                    .w_full()
+                    .flex_shrink_0()
+                    .id("app-menu-bar-slot")
+                    // 观测锚点 (task 1.2): 无 test-support 特性时为 no-op
+                    .test_support()
+                    // 窗口内菜单栏实体 (task 2.2, spec: Application menu bar
+                    // is always present)。**平台门控落在 menu.rs 的实例创建
+                    // 处** (D6: macOS 走原生, `install` 恒返回 None) —
+                    // Option 迭代即空, 天然不挂第二条菜单栏, 单一事实源。
+                    // 相比把 cfg 分散到字段/字面量/赋值/挂载四处, 这里只判值。
+                    .children(self.menu_bar.clone()),
+            )
+            // dock 位: 吃掉菜单栏之外的全部剩余高度
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    // 观测锚点 (task 1.2): 无 test-support 特性时为 no-op
+                    .id("dock-slot")
+                    .test_support()
+                    .child(self.dock_area.clone()),
+            )
     }
 }
 
@@ -1669,6 +1799,118 @@ mod tests {
         app_entity.update(cx, |app, cx| app.close_agent(agent_id, cx));
         cx.run_until_parked();
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&ws_path);
+    }
+
+    /// win-in-window-app-menu-bar task 1.2 (spec: Windowed menu bar leaves
+    /// the dock its full remaining space): 菜单栏位定高占顶, dock 位吃掉剩余
+    /// 全部高度, 终端网格随之缩短但仍 >= 最小行数 —— 没有面板被挤出窗口。
+    ///
+    /// 与 `adaptive_grid_dispatch` 的关键区别: 那条写 `.pi_bin` 走真 spawn
+    /// (Windows 上 `fake-pi.sh` 无法执行 → 既有 A 类失败, 本机不可执行);
+    /// 本测试用无标记 root → `factory()` 产出进程内 `TestSession`, `feed`
+    /// 同步建 parser, **全程零 spawn**, 故本机可跑。
+    #[gpui_kit::test]
+    fn menu_bar_slot_leaves_full_height_to_dock(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, app_entity) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1000.), px(600.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动"))
+                },
+            )
+            .expect("open test window")
+        });
+
+        // 不写 `.pi_bin` → factory 走进程内 TestSession (零 spawn)
+        app_entity.update(cx, |app, _cx| {
+            inject_test_workspace(app, "menu-bar-slot");
+        });
+        let ws_path =
+            cx.update(|cx| app_entity.read(cx).workspace.as_ref().unwrap().path.clone());
+        fs::create_dir_all(&ws_path).unwrap();
+        let (agent_id, _) = test_sessions::create_session(cx, &app_entity, &ws_path);
+        // feed 同步建本地 parser → `terminal-grid` 才会渲染
+        app_entity.update(cx, |app, cx| {
+            app.terminal.update(cx, |t, cx| {
+                t.feed(
+                    agent_id,
+                    b"probe\r\n",
+                    agent_service::frame_gen::current(),
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        let _ = cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+        });
+        cx.run_until_parked();
+
+        let (win, slot, dock, grid, (_cell_w, line_h)) = cx
+            .update_window(handle.into(), |_, window, _cx| {
+                let win = window.bounds();
+                let slot = window.find("app-menu-bar-slot").bounds();
+                let dock = window.find("dock-slot").bounds();
+                let grid = window.find("terminal-grid").bounds();
+                let metrics = grid_metrics(window);
+                (win, slot, dock, grid, metrics)
+            })
+            .expect("update window");
+
+        let win_h = f32::from(win.size.height);
+        let menu_h = super::MENU_BAR_HEIGHT;
+        let eps = 1.; // 设备像素吸附容差
+
+        // 菜单栏位: 从窗口顶起, 恰为定高
+        assert!(
+            f32::from(slot.origin.y) <= eps,
+            "菜单栏位应贴窗口顶, 得 y={}",
+            f32::from(slot.origin.y)
+        );
+        assert!(
+            (f32::from(slot.size.height) - menu_h).abs() <= eps,
+            "菜单栏位应恰为 {menu_h}px, 得 {}",
+            f32::from(slot.size.height)
+        );
+
+        // dock 位: 紧接菜单栏之下, 一直铺到窗口底 (占满剩余空间)
+        assert!(
+            (f32::from(dock.origin.y) - menu_h).abs() <= eps,
+            "dock 位应从菜单栏下沿 ({menu_h}px) 起, 得 {}",
+            f32::from(dock.origin.y)
+        );
+        let dock_bottom = f32::from(dock.origin.y) + f32::from(dock.size.height);
+        assert!(
+            (dock_bottom - win_h).abs() <= eps,
+            "dock 位应铺到窗口底 (占满剩余空间): bottom={dock_bottom} win_h={win_h}"
+        );
+
+        // spec 场景: 网格随让出的高度缩短, 但仍容得下最小行数
+        assert!(
+            f32::from(grid.size.height) < win_h,
+            "网格高度应小于窗口高度 (菜单栏让位): grid={} win={}",
+            f32::from(grid.size.height),
+            win_h
+        );
+        let min_h = f32::from(MIN_GRID_ROWS) * f32::from(line_h);
+        assert!(
+            f32::from(grid.size.height) > min_h,
+            "网格高度应大于 {MIN_GRID_ROWS} 行 ({min_h}px), 得 {}",
+            f32::from(grid.size.height)
+        );
+
+        app_entity.update(cx, |app, cx| app.close_agent(agent_id, cx));
+        cx.run_until_parked();
         let _ = fs::remove_dir_all(&ws_path);
     }
 
