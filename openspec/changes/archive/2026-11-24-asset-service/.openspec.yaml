@@ -1,0 +1,5 @@
+schema: spec-driven
+created: 2026-11-24
+# asset-manager / file-tree 为能力级退役 (REMOVED-only delta) — 归档时
+# 需要此标记才走退役路径, 否则 sync 会把 REMOVED-only 判为 sync-blocked。
+retire_capabilities: true

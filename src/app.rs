@@ -15,21 +15,25 @@ use gpui_kit::base::dock::PanelId;
 
 use agent_service::contract::{
     CloseReq, CreateReq, InputClick, InputKey, InputText, InputWheel, ResizeReq, SelectReq,
-    SessionId, SessionStatus, ThemeReq, KIND_CLOSE, KIND_CREATE, KIND_INPUT_CLICK, KIND_INPUT_KEY,
+    SessionId, ThemeReq, KIND_CLOSE, KIND_CREATE, KIND_INPUT_CLICK, KIND_INPUT_KEY,
     KIND_INPUT_TEXT, KIND_INPUT_WHEEL, KIND_RESIZE, KIND_SELECT, KIND_THEME,
 };
 use service_manager::{Envelope, Payload, Route};
 // change solution-service 2.3/5.2: 打开链路 load + create 均走服务 ask (design D8)
-use solution_service::contract::{CreateReq as SolCreateReq, LoadReq, TreeSnapshot};
-use solution_service::contract::KIND_CREATE as KIND_SOLUTION_CREATE;
+// solution-overview 2.5/3.x: create 经 `solution.action` 单点 (design D6),
+// 回执按 action_id 路由 (design D7)
+use solution_service::contract::{
+    CreateReq as SolCreateReq, LoadReq, ProjectTree, TreeSnapshot,
+    ACTION_CREATE as SOL_ACTION_CREATE,
+};
 
 use crate::service_layer::CtrlOp;
 use agent_service::terminal::{AgentTerminal, TerminalCopy, TerminalTab};
 use crate::property_detail_manager::{OpenObject, active_center_panel_id, handler_for};
 use crate::shell;
-use crate::assets::{AssetManager, AssetView, traits::EnumeratorOwner};
+use asset_service::panel::AssetOverview;
 use crate::project_model::{self, MarkerStatus};
-use crate::sidebar::{SidebarEvent, SidebarPanel};
+use crate::solution_overview::{SolutionOverviewEvent, SolutionOverviewPanel};
 use crate::workspace::history::History;
 use crate::workspace::Workspace;
 
@@ -49,9 +53,13 @@ pub struct TerminalApp {
     /// 当前打开的工作区 (单实例, spec: Startup workspace restore;
     /// None = 空态, 等待目录选择器)
     pub workspace: Option<Workspace>,
-    /// 树镜像 → 资产注册的装配单点记忆 `(workspace path, snapshot)`:
-    /// 快照未变零动作 (change solution-service 5.4)。
-    last_handoff: Option<(PathBuf, TreeSnapshot)>,
+    /// 树镜像 → 资产注册的装配单点记忆 `(workspace path, handoff 投影)`:
+    /// 交树未变零动作 (change solution-service 5.4)。
+    ///
+    /// **只存交树投影而非整个快照** (change solution-overview D1): 描述符
+    /// 变了但交树没变时不该触发全量资产重枚举；同时省掉整份快照的两次
+    /// clone。
+    last_handoff: Option<(PathBuf, ProjectTree)>,
     /// 打开代号: `begin_open` 自增, `commit_open` 校验 — 旧 load 的结果
     /// 直接丢弃 (design D5: 切换与在途加载的竞态)
     pub load_epoch: u64,
@@ -60,7 +68,7 @@ pub struct TerminalApp {
     pub open_failure: Option<String>,
     /// 切换门控提示 (spec: notice naming the count of active sessions)
     pub notice: Option<String>,
-    /// 最近一次持久化失败的错误信息 (在 sidebar 顶部显示; spec:
+    /// 最近一次持久化失败的错误信息 (在 solution-overview 顶部显示; spec:
     /// Persistence write failure surfacing — 配置写失败红条)
     pub save_error: Option<String>,
     /// 历史文件路径 (测试缝: `new_inner` 注入; 正式 = 全局应用数据目录)
@@ -77,15 +85,13 @@ pub struct TerminalApp {
     /// 不参与)。`render` 内比对翻转, **翻转才**重建菜单 (design D3)。
     /// 只存 bool 不存选区内容 — 重建的触发条件就是这个位的翻转。
     copy_enabled: bool,
-    /// sidebar 面板实体 (D2; notify 转发目标 — spike §10.5)
-    pub sidebar: Entity<SidebarPanel>,
+    /// solution-overview 面板实体 (D2; notify 转发目标 — spike §10.5)
+    pub solution_overview: Entity<SolutionOverviewPanel>,
     /// 终端面板实体 (4.1; 焦点在其内, 一步切焦点/步骤 5 进 DockArea 中心)
     pub terminal: Entity<AgentTerminal>,
-    /// 文件树面板实体 (right-dock-file-tree; notify 转发名单成员)
-    pub asset_view: Entity<AssetView>,
-    /// 右槽数据服务层 (asset-manager-right-dock D1): 面板读视图/代数,
-    /// app 钩子做注册与刷新
-    pub asset_manager: Entity<AssetManager>,
+    /// 资产树面板实体 `asset-overview` (原右槽文件树, right-dock-file-tree;
+    /// notify 转发名单成员) —— change asset-service 5.1/5.3 改名
+    pub asset_overview: Entity<AssetOverview>,
     /// 服务总线接入 (service-management-framework 6.1): GUI = 拉模式参与
     /// 者 (自己的 Route + mailbox), 50ms 泵 poll; 无回调 (D9)
     pub service_layer: crate::service_layer::ServiceLayer,
@@ -171,18 +177,31 @@ impl TerminalApp {
     ///
     /// 打开失败不从这里返回 — 经后台探测回主线程记录 `open_failure`
     /// 并 (正式构建) 对话框+退出; 返回 Err 的旧路径保留给 main 的防御分支。
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Result<Self, String> {
-        Self::new_inner(window, cx, crate::workspace::history::default_path())
+    ///
+    /// `startup` = Launcher 交棒的 path (design D2): `Some` → 开窗即异步
+    /// 打开; `None` = 不启动打开流程 (测试缝 — 生产路径 Launcher 必给)。
+    pub fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        startup: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        Self::new_inner(
+            window,
+            cx,
+            crate::workspace::history::default_path(),
+            startup,
+        )
     }
 
-    /// 启动接线 (design D5): 主窗先行 → 有历史则异步 load 最近工作区
-    /// (带 epoch 防竞态), 无历史/目标失效 → 空态选择器 (spec: Startup
-    /// workspace restore)。`history_path` 是测试缝 (hermetic: 测试不碰
-    /// 真实应用数据目录)。
+    /// 启动接线 (design D2): **不再读历史、不再自动恢复** — 启动 path 由
+    /// Launcher 选定后传入 (spec: Startup opens the Launcher before any
+    /// workspace)。`history_path` 保留为写侧通道 (`commit_open` 的 push);
+    /// 它同时是测试缝 (hermetic: 测试不碰真实应用数据目录)。
     pub fn new_inner(
         window: &mut Window,
         cx: &mut Context<Self>,
         history_path: PathBuf,
+        startup: Option<PathBuf>,
     ) -> Result<Self, String> {
         // Terminal context 下的 tab 终端转发绑定 (Root 的焦点遍历
         // 绑定在更浅的 context, 被这条压过 — design D5)
@@ -207,33 +226,19 @@ impl TerminalApp {
         };
         cx.bind_keys(key_bindings);
 
-        #[allow(unused_mut)] // cfg(test) 不走 legacy 播种分支 → mut 不被用
-        let mut history = History::load_at(&history_path);
-        // legacy 播种: 正式构建一次性 (legacy_seeded 落盘后不再读);
-        // cfg(test) 关闭 — 仓库根可能残留 legacy 文件, 测试不得读外部状态
-        // (hermetic 教训, 2026-11-09)。播种逻辑本体见 store::seed_legacy。
-        #[cfg(not(test))]
-        if crate::workspace::store::seed_legacy(&mut history, &crate::workspace::store::legacy_path()) {
-            if let Err(e) = history.save_at(&history_path) {
-                eprintln!("workspace history save failed: {e}");
-            }
-        }
         // 服务层启动接线 (task 6.1): 扫 plugins/ 建 Catalog + 装载核心假
         // 服务 + GUI mailbox/订阅; 失败即启动失败 (扫描目录不存在 = 空, 不错)
         let service_layer = crate::service_layer::ServiceLayer::bootstrap(Path::new("plugins"))?;
 
-                let restore = history.most_recent().map(Path::to_path_buf);
         // 装配 DockArea 三槽 (shell::build; panel_handle 包装见其文档)
         let weak_app = cx.weak_entity();
-        // 右槽数据的服务层 (asset-manager-right-dock D1) — 先建以注入
         // 面板 (asset-package-merge design D7: 构造注入, 无兄弟跳)
-        let asset_manager = cx.new(|cx| AssetManager::new(weak_app.clone(), cx));
         let shell::ShellParts {
             dock_area,
-            sidebar,
+            solution_overview,
             terminal,
-            asset_view,
-        } = shell::build(&asset_manager, weak_app, window, cx);
+            asset_overview,
+        } = shell::build(weak_app, window, cx);
         // 主题跟随系统外观 (add-light-dark-theme D1): 启动同步一次,
         // 并订阅外观变化 → 每次变化重新 sync (Theme::change 内部会
         // refresh_windows, 全窗重渲即热切换生效), 并把新配色推给
@@ -275,14 +280,14 @@ impl TerminalApp {
             dock_area,
             menu_bar: None, // 装配尾部由 menu::install 填入 (design D1)
             copy_enabled: false, // 装配期必无选区 (任务 3.2: 首帧即灰显)
-            sidebar,
+            solution_overview,
             terminal,
-            asset_view,
-            asset_manager,
+            asset_overview,
             service_layer,
         };
-        // 有历史 → 异步恢复最近工作区; 无历史/失效 → 留空态 (不报错)
-        if let Some(path) = restore {
+        // Launcher 交棒的 path → 异步打开 (design D2/A1); `None` = 不启动
+        // 打开流程 (测试缝 — 生产路径 Launcher 必给, spec 不允许跳过)。
+        if let Some(path) = startup {
             app.begin_open(path, cx);
         }
         // 内置 debug sections 装配期注册 (add-debug-console 8.1, design
@@ -305,6 +310,16 @@ impl TerminalApp {
         if let Some(ws) = self.workspace.as_mut() {
             if !ws.collapsed_projects.remove(root) {
                 ws.collapsed_projects.insert(root.to_path_buf());
+            }
+        }
+    }
+
+    /// 用户点了 Solution 行: 只切该行折叠 (change solution-overview D2 —
+    /// 分组头左键 = 纯折叠, 无打开语义; 易失不持久化)。
+    pub fn toggle_solution_collapse(&mut self, solution_id: &str) {
+        if let Some(ws) = self.workspace.as_mut() {
+            if !ws.collapsed_solutions.remove(solution_id) {
+                ws.collapsed_solutions.insert(solution_id.to_string());
             }
         }
     }
@@ -503,104 +518,12 @@ impl TerminalApp {
         self.kick_input_drain(cx); // 快速 pump (design D5): 拖窗重排即显
     }
 
-    /// 空态选择器 / 顶栏切换入口共用的打开流程 (spec: Workspace opening
-    /// via directory picker); `gated` = 切换语义, 先过三支门控 (design D6):
-    /// 活动会话拦截出 notice, 仅 exited 需确认, 无会话直通 picker。
-    pub fn request_workspace_open(&mut self, gated: bool, cx: &mut Context<Self>) {
-        self.notice = None;
-        let gate = if gated {
-            let (active, exited) = self.count_sessions(cx);
-            switch_gate(active, exited)
-        } else {
-            GateDecision::Direct
-        };
-        if let GateDecision::Block(n) = gate {
-            self.notice = Some(format!(
-                "{n} session(s) still active — close them before switching"
-            ));
-            cx.notify();
-            self.notify_panels(cx);
-            return;
-        }
-        let needs_confirm = matches!(gate, GateDecision::Confirm);
-
-        // 不能用同步 rfd 对话框: 监听器/回调期间阻塞会撞上 50ms drain 的
-        // `weak.update` 重入 (design D8 实测崩溃) — 全异步。
-        let task = cx.spawn(async move |this, cx: &mut AsyncApp| {
-            if needs_confirm {
-                let ok = rfd::AsyncMessageDialog::new()
-                    .set_title("Switch workspace?")
-                    .set_description(
-                        "Exited sessions and their preserved terminal screens will be discarded.",
-                    )
-                    .set_level(rfd::MessageLevel::Warning)
-                    .set_buttons(rfd::MessageButtons::YesNo)
-                    .show()
-                    .await;
-                if !matches!(ok, rfd::MessageDialogResult::Yes) {
-                    return; // 取消: 工作区不变
-                }
-            }
-            let Some(handle) = rfd::AsyncFileDialog::new().pick_folder().await else {
-                return; // 取消 picker: 不变 (spec: Cancelling … unchanged)
-            };
-            let picked = handle.path().to_path_buf();
-            let path = std::fs::canonicalize(&picked).unwrap_or(picked);
-            match project_model::marker_status(&path) {
-                MarkerStatus::Corrupt(msg) => {
-                    // spec: 坏 marker → 错误框 + 退出 (无 update lease 时弹框,
-                    // D8: 阻塞调用不进事件监听器)
-                    this.update(cx, |app, _| {
-                        app.open_failure = Some(msg.clone());
-                    })
-                    .ok();
-                    surface_fatal(&msg);
-                }
-                MarkerStatus::Missing => {
-                    // spec: 非工作区目录 → 确认后创建
-                    let confirm = rfd::AsyncMessageDialog::new()
-                        .set_title("Not a workspace")
-                        .set_description(&format!(
-                            "{} has no workspace marker. Create a new workspace here?",
-                            path.display()
-                        ))
-                        .set_level(rfd::MessageLevel::Info)
-                        .set_buttons(rfd::MessageButtons::YesNo)
-                        .show()
-                        .await;
-                    if !matches!(confirm, rfd::MessageDialogResult::Yes) {
-                        return; // 拒绝: 无工作区被打开 (spec)
-                    }
-                    // fs 写在 update 外; 失败 → 红条 + 不打开 (spec:
-                    // Workspace creation … write failure … no workspace opened)
-                    let created = project_model::create_workspace_files(&path);
-                    let err = created.err();
-                    this.update(cx, |app, cx| {
-                        if let Some(e) = err {
-                            app.save_error = Some(e);
-                        } else {
-                            app.begin_open(path.clone(), cx);
-                        }
-                        cx.notify();
-                        app.notify_panels(cx);
-                    })
-                    .ok();
-                }
-                MarkerStatus::Valid(_) => {
-                    // 合法 → 异步加载 (epoch 由 begin_open 管)
-                    this.update(cx, |app, cx| {
-                        app.begin_open(path.clone(), cx);
-                    })
-                    .ok();
-                }
-            }
-        });
-        self._dialog_task = Some(task);
-    }
-
-    /// 发起一次工作区打开 (启动恢复 / picker 确认后): epoch++ 后台探测
+    /// 发起一次工作区打开 (Launcher 交棒 / picker 确认后): epoch++ 后台探测
     /// +加载, 回主线程按 epoch 提交 (design D5: 旧结果丢弃)。返回本次
     /// epoch (测试观测)。
+    ///
+    /// 原 `request_workspace_open` (picker + 三支门控) 已随切换口删除,
+    /// rfd 胶水归入 `crate::launcher` (launcher-startup 4.2)。
     pub fn begin_open(&mut self, path: PathBuf, cx: &mut Context<Self>) -> u64 {
         self.load_epoch += 1;
         let epoch = self.load_epoch;
@@ -614,7 +537,6 @@ impl TerminalApp {
             // marker 探测后 solutions 加载归 solution 服务 (design D8:
             // GUI 一律 ask; 回执 = Result<TreeSnapshot, OpError>)
             let outcome = match probe {
-                OpenProbe::Empty => OpenOutcome::Empty,
                 OpenProbe::Failure(msg) => OpenOutcome::Failure(msg),
                 OpenProbe::Valid => {
                     // pull 模式纪律 (D6/D8): submit + 泵拉取 — one-shot await
@@ -730,10 +652,6 @@ impl TerminalApp {
             return false; // 过期结果 (4.2 竞态守卫)
         }
         match outcome {
-            // 启动恢复目标失效 (目录没了/marker 没了) → 回空态, 不报错
-            OpenOutcome::Empty => {
-                self.workspace = None;
-            }
             OpenOutcome::Failure(msg) => {
                 // 正式路径已在 begin_open 里 dialog+exit; 测试观测面
                 self.open_failure = Some(msg);
@@ -777,28 +695,57 @@ impl TerminalApp {
         true
     }
 
+    /// 右键菜单项 → solution 动作 ask (change solution-overview 4.3)。
+    ///
+    /// - **label 取自描述符** (design D3: label 归服务) — 由面板透传。
+    /// - **args 现场构造** (design D4 修订 — 甲): 视图由 `checked` 取反,
+    ///   不预构建 `Payload`(D3: 预构建会冻结快照期的值)。
+    /// - 无参动作 `args = None`, 服务从自己持有的状态现算。
+    pub(crate) fn invoke_solution_action(
+        &mut self,
+        node: &str,
+        action_id: &str,
+        label: &str,
+        checked: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        let args = solution_service::configure_action_args(action_id, checked).map(Payload::new);
+        let result =
+            self.service_layer
+                .submit_action(action_id, Some(node.to_string()), args, label);
+        match result {
+            Ok(_) => self.kick_input_drain(cx), // 快泵: 回执尽快达
+            Err(e) => {
+                self.notice = Some(format!("{label}失败: {e}"));
+            }
+        }
+        cx.notify();
+        self.notify_panels(cx);
+    }
+
     /// Create ask 发送点（表单签提交与测试共用缝; change solution-service
     /// 5.2 / solution-config-tab 3.1）。幂等前置检与 Server 同一
     /// ValidChecker（design D6）: 同 path 已存在 → 原样不变。提交入信箱
     /// 即置 `sol_config_inflight`（回执成败由 `poll_sessions` 消费 → 行内
     /// 错误 / 成功自关, specs/project-model delta 结果分支）。
     pub(crate) fn request_create_solution(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let Some(ws_dir) = self.workspace.as_ref().map(|w| w.path.clone()) else {
+        // 落盘目标由服务持有的绑定给出 (design D5) — 这里只需确认有工作区。
+        if self.workspace.is_none() {
             return;
-        };
+        }
         let dup = self.service_layer.tree_view().is_some_and(|t| {
             solution_service::create_is_noop(&t.solutions, &path)
-                || t.tree.projects.iter().any(|p| p.root == path)
+                || t.tree().projects.iter().any(|p| p.root == path)
         });
         if dup {
             return; // spec: Re-adding an existing solution changes nothing
         }
-        let result = self.service_layer.submit_solution_op(
-            KIND_SOLUTION_CREATE,
-            Payload::new(SolCreateReq {
-                workspace_dir: ws_dir,
-                path,
-            }),
+        // 写入口单点 (design D6): create 也走 `solution.action`,
+        // `node = None` (workspace 级动作, D4), 参数在 `args`。
+        let result = self.service_layer.submit_action(
+            SOL_ACTION_CREATE,
+            None,
+            Some(Payload::new(SolCreateReq { path })),
             "添加 solution",
         );
         match result {
@@ -816,30 +763,36 @@ impl TerminalApp {
     }
 
     /// 树镜像变更 → 资产注册 (handoff 交树 = 注册唯一来源, 全量替换语义;
-    /// change solution-service 5.1/5.2/5.4 装配单点)。快照未变 → 零动作
-    /// (O(1) 比对)。
+    /// change solution-service 5.1/5.2/5.4 装配单点)。**交树投影**未变 →
+    /// 零动作 (O(1) 比对) — 层级里的描述符变化不进这个比对。
     fn sync_asset_registration(&mut self, cx: &mut Context<Self>) {
-        let Some(snap) = self.service_layer.tree_view().cloned() else {
+        // 投影现算后即脱离借用 — 后面要改 self.last_handoff
+        let Some(handoff) = self.service_layer.tree_view().map(|s| s.handoff()) else {
             return;
         };
-        let Some(ws) = self.workspace.as_ref() else {
+        let Some(path) = self.workspace.as_ref().map(|w| w.path.clone()) else {
             return;
         };
-        if self.last_handoff.as_ref() == Some(&(ws.path.clone(), snap.clone())) {
+        if matches!(&self.last_handoff, Some((p, h)) if *p == path && *h == handoff) {
             return;
         }
-        self.last_handoff = Some((ws.path.clone(), snap.clone()));
-        let path = ws.path.clone();
-        let owners: Vec<Box<dyn EnumeratorOwner + Send>> = snap
-            .handoff
+        // ---- Project → 纯结构 DTO（design D3 修订：只做字段映射，
+        // 不读文件、不带 filters —— 过滤集由服务每次枚举现场供给）----
+        let projects: Vec<asset_service::contract::ProjectRegistration> = handoff
             .projects
             .iter()
-            .map(|d| {
-                Box::new(project_model::Project::from_desc(d)) as Box<dyn EnumeratorOwner + Send>
-            })
+            .map(|d| project_model::Project::from_desc(d).to_registration())
             .collect();
-        self.asset_manager
-            .update(cx, |m, cx| m.register(path, owners, cx));
+        let reg = asset_service::contract::AssetRegistration {
+            workspace_dir: path.clone(),
+            projects,
+        };
+        // 提交失败（服务尚未 Available）⇒ **不记 last_handoff**，本函数
+        // 每个 pump 周期都会被调 ⇒ 下次自动重试（自愈，无需额外机制）。
+        if self.service_layer.submit_asset_register(reg).is_err() {
+            return; // 服务未 Available ⇒ 不记 last_handoff, 下次 pump 重试
+        }
+        self.last_handoff = Some((path.clone(), handoff));
         cx.notify();
         self.notify_panels(cx);
     }
@@ -848,23 +801,11 @@ impl TerminalApp {
     /// (规则重读 + supersede 在途; 保展开是面板侧的事 — spec: Refresh
     /// triggers and behavior)。落地通知由 manager 经 notify_panels 转发。
     pub fn refresh_assets(&mut self, cx: &mut Context<Self>) {
-        self.asset_manager.update(cx, |m, cx| m.refresh(cx));
+        // ⟳ = 显式刷新 ask：服务 supersede 在途并**重读 filter 源**
+        // （design D3：过滤集是每次枚举现场供给的函数，非快照）。
+        let _ = self.service_layer.submit_asset_refresh();
         cx.notify();
         self.notify_panels(cx);
-    }
-
-    /// 会话计数 (活动, exited) — 切换门控的输入 (design D6; 数据源 =
-    /// 服务投影镜像, change agent-service 3.2)。
-    fn count_sessions(&self, _cx: &App) -> (usize, usize) {
-        let Some(view) = self.service_layer.sessions_view() else {
-            return (0, 0);
-        };
-        let exited = view
-            .sessions
-            .iter()
-            .filter(|s| s.status == SessionStatus::Exited)
-            .count();
-        (view.sessions.len() - exited, exited)
     }
 
     /// 关闭右 dock（dock-layout spec: 关闭 + 焦点交回）：`toggle_dock`
@@ -934,39 +875,32 @@ impl TerminalApp {
         handle.focus(window, cx);
     }
 
-    /// sidebar 事件漏斗单一入口 (design D3): SidebarPanel 的所有交互
+    /// solution-overview 事件漏斗单一入口 (design D3): 面板的所有交互
     /// 经此进入 model；SelectAgent 的一步切焦点也收拢在此 (3.2, spec:
     /// one-step focus — 选中即把键盘/IME 焦点交给 pane)。
-    pub fn on_sidebar_event(
+    pub fn on_solution_overview_event(
         &mut self,
-        ev: SidebarEvent,
+        ev: SolutionOverviewEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // 焦点交回 active tab 面板 (design D6): dock 的左 TabGroup 会把
-        // sidebar 内的点击焦点抢给 sidebar 面板, 不交回则键盘/IME 全断。
+        // 面板内的点击焦点抢给 solution-overview, 不交回则键盘/IME 全断。
         // (console 切换已移至控制成功回执 — spec delta: 失败不切)
         self.focus_active_center_panel(window, cx);
         match ev {
-            SidebarEvent::OpenWorkspace => {
-                // 空态选择器: 无门控; 变更在异步回调里 (见 request_workspace_open)
-                self.request_workspace_open(false, cx);
-                return;
-            }
-            SidebarEvent::SwitchWorkspace => {
-                // 顶栏切换: 先过三支门控 (design D6); 通过后异步确认/picker
-                self.request_workspace_open(true, cx);
-                return;
-            }
-            SidebarEvent::AddSolution => {
+            SolutionOverviewEvent::AddSolution => {
                 // 入口动作 = 开应用内表单签 (specs/center-tabs delta; 旧 rfd
                 // 直连链已退役, task 2.2)
                 self.open_solution_config_tab(window, cx);
                 return;
             }
-            SidebarEvent::ToggleProjectCollapse(root) => self.toggle_project_collapse(&root),
-            SidebarEvent::NewAgent(root) => self.create_agent(&root, cx),
-            SidebarEvent::SelectAgent(id) => {
+            SolutionOverviewEvent::ToggleSolutionCollapse(id) => {
+                self.toggle_solution_collapse(&id)
+            }
+            SolutionOverviewEvent::ToggleProjectCollapse(root) => self.toggle_project_collapse(&root),
+            SolutionOverviewEvent::NewAgent(root) => self.create_agent(&root, cx),
+            SolutionOverviewEvent::SelectAgent(id) => {
                 // ask 经服务 (D6): 成功回执切 console + active 镜像由投影
                 // 驱动; 失败 notice 点名 (spec delta 场景 2)
                 let result = self.service_layer.submit_control(
@@ -981,35 +915,35 @@ impl TerminalApp {
                     Err(e) => self.notice = Some(format!("切换会话失败: {e}")),
                 }
             }
-            SidebarEvent::CloseAgent(id) => self.close_agent(id, cx),
+            SolutionOverviewEvent::CloseAgent(id) => self.close_agent(id, cx),
         }
         cx.notify();
         self.notify_panels(cx);
     }
 
     /// 数据变化 → notify 展示该数据的面板 (spike §10.5 实测: 面板自读不
-    /// 重建, 必须显式转发)。转发列表: sidebar (badge/列表) + terminal
-    /// (输出滚动) + tree (文件树: 拉视图/根比对/同步 TreeState —
+    /// 重建, 必须显式转发)。转发列表: solution-overview (badge/列表) + terminal
+    /// (输出滚动) + asset-overview (资产树: 读镜像/代数比对/同步 TreeState —
     /// right-dock-file-tree 3.2)。
     ///
     /// **必须 `cx.defer`**: 事件 listener 挂在面板 entity 上, listener
     /// 执行期间面板持有 update lease — 同步 `panel.update` 会重入 panic
-    /// (实测 crash: "cannot update SidebarPanel while it is already being
+    /// (实测 crash: "cannot update SolutionOverviewPanel while it is already being
     /// updated", entity_map lease)。`App::defer` 的 effect 只在**最外层**
     /// update 的 finish 时 flush (pending_updates 守卫), 此时面板 lease
     /// 已 end_lease → 安全。
     pub(crate) fn notify_panels(&self, cx: &mut Context<Self>) {
-        let sidebar = self.sidebar.clone();
+        let panel = self.solution_overview.clone();
         let terminal = self.terminal.clone();
-        let asset_view = self.asset_view.clone();
+        let asset_overview = self.asset_overview.clone();
         // 表单签: 预检读树镜像/行内错误读 app — 变更须随轮询重绘
         // (solution-config-tab 3.1/3.3)
         let sol_config = self.sol_config_panel.clone();
         cx.defer(move |cx| {
-            sidebar.update(cx, |_, cx| cx.notify());
+            panel.update(cx, |_, cx| cx.notify());
             terminal.update(cx, |_, cx| cx.notify());
             // 树面板不是裸 notify: 要走"根比对→按需重扫→同步 TreeState"
-            asset_view.update(cx, |panel, cx| panel.on_data_changed(cx));
+            asset_overview.update(cx, |panel, cx| panel.on_data_changed(cx));
             if let Some(panel) = sol_config {
                 panel.update(cx, |_, cx| cx.notify());
             }
@@ -1108,20 +1042,21 @@ impl TerminalApp {
         // solution_config::close_solution_config_tab 文档。无签在场 = 空操作
         // (测试缝直调路径, inflight 照清)。
         let sol_oks = self.service_layer.take_sol_successes();
-        if self.sol_config_inflight && sol_oks.contains(&"添加 solution") {
+        if self.sol_config_inflight && sol_oks.iter().any(|id| id == SOL_ACTION_CREATE) {
             self.sol_config_inflight = false;
             self.close_solution_config_tab(cx);
             changed = true;
         }
         // 控制失败 notice (spec delta: 点名失败操作; 取最新一条)。表单签在
-        // 途且点名添加 solution → 同步行内错误 (spec delta: failure → error
+        // 途且动作是 create → 同步行内错误 (spec delta: failure → error
         // shown in the tab, 签保留)。
-        if let Some(n) = self.service_layer.take_notices().pop() {
-            if self.sol_config_inflight && n.contains("添加 solution") {
+        // **路由按 action_id, 不按文案** (design D7) — 改 label 不改行为。
+        if let Some((action, text)) = self.service_layer.take_notices().pop() {
+            if self.sol_config_inflight && action.as_deref() == Some(SOL_ACTION_CREATE) {
                 self.sol_config_inflight = false;
-                self.sol_config_error = Some(n.clone());
+                self.sol_config_error = Some(text.clone());
             }
-            self.notice = Some(n);
+            self.notice = Some(text);
             changed = true;
         }
         // agent 首次就绪 → 补推主题 (服务快照默认深色, 宿主主题为准)
@@ -1179,10 +1114,8 @@ impl TerminalApp {
 /// — 无比较使用点, change file-filter-prune D2)。
 #[derive(Debug, Clone)]
 pub(crate) enum OpenProbe {
-    /// 目录不存在 / marker 缺失 → 启动恢复回空态 (不报错; picker 流程
-    /// 在此之前已走确认创建分支, 不会进这里)。
-    Empty,
-    /// marker 坏 → 错误框 + 退出 (spec)。
+    /// 目录不存在 / marker 缺失 / marker 坏 → 错误框 + 退出 (design D3/D4:
+    /// Launcher 已做过建议性预检, 主窗再失效只可能是交棒后的竞态)。
     Failure(String),
     /// marker 合法 — solutions 加载归 solution 服务 (design D8)。
     Valid,
@@ -1192,9 +1125,10 @@ pub(crate) enum OpenProbe {
 /// failures — 失败只有结构化 reason, 绝无部分树)。
 #[derive(Debug, Clone)]
 pub(crate) enum OpenOutcome {
-    /// 启动恢复目标失效 (目录没了/marker 没了) → 回空态, 不报错。
-    Empty,
     /// 加载失败 (marker 坏 / solutions 解析失败 / 死 path) → 错误框 + 退出。
+    ///
+    /// **唯一的 fatal 启动路径** (design D4): Launcher 已校验过的路径
+    /// 再失效只可能是交棒后的竞态, 此时主窗已开、无处可退。
     Failure(String),
     /// 加载成功 — 载荷 = 服务交出的项目树快照 (含注册门控后的 handoff)。
     Ready(TreeSnapshot),
@@ -1203,34 +1137,14 @@ pub(crate) enum OpenOutcome {
 /// 后台探测: 目录 → marker (solutions 加载归 solution 服务, design D8)。
 pub(crate) fn probe_open(path: &Path) -> OpenProbe {
     if !path.is_dir() {
-        return OpenProbe::Empty;
+        return OpenProbe::Failure(format!("{} does not exist", path.display()));
     }
     match project_model::marker_status(path) {
-        MarkerStatus::Missing => OpenProbe::Empty,
+        MarkerStatus::Missing => {
+            OpenProbe::Failure(format!("{} has no workspace marker", path.display()))
+        }
         MarkerStatus::Corrupt(msg) => OpenProbe::Failure(msg),
         MarkerStatus::Valid(_) => OpenProbe::Valid,
-    }
-}
-
-/// 切换门控决策 (design D6; spec: Gated workspace switching)。
-/// 纯函数 — 三支可独立无头测试。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GateDecision {
-    /// 有 Starting/Running 会话 → 拦截 (载荷 = 活动会话数, notice 文案用)
-    Block(usize),
-    /// 仅剩 Exited → 需确认 (屏幕将丢弃)
-    Confirm,
-    /// 无会话 → 直接进 picker
-    Direct,
-}
-
-pub(crate) fn switch_gate(active: usize, exited: usize) -> GateDecision {
-    if active > 0 {
-        GateDecision::Block(active)
-    } else if exited > 0 {
-        GateDecision::Confirm
-    } else {
-        GateDecision::Direct
     }
 }
 
@@ -1322,6 +1236,9 @@ mod tests {
     //! `gpui_kit::*` 把 `#[test]` 宏遮蔽掉)。
 
     use super::TerminalApp;
+    // 3.2 路由键测试: 直接发 action (绕过 request_create_solution 的固定文案)
+    use super::{SOL_ACTION_CREATE, SolCreateReq};
+    use service_manager::Payload;
     // (会话测试直构已随 task 3.2 迁服务工厂; 见 test_sessions)
     use crate::service_layer::test_sessions;
     use crate::workspace::Workspace;
@@ -1346,7 +1263,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("bw-test-{tag}-{}", std::process::id()));
         let full = path.to_string_lossy().to_string();
         // 项目树经服务镜像注入 (5.4: 视图读镜像, 无本地副本 — 测试缝直写)
-        use solution_service::{ProjectDesc, ProjectTree, TreeSnapshot};
+        use solution_service::{ProjectDesc, TreeSnapshot};
         let desc = ProjectDesc {
             name: path
                 .file_name()
@@ -1357,15 +1274,102 @@ mod tests {
         };
         app.service_layer.set_tree_view_for_test(TreeSnapshot {
             solutions: std::sync::Arc::from(vec![]),
-            tree: ProjectTree {
-                projects: std::sync::Arc::from(vec![desc.clone()]),
-            },
-            handoff: ProjectTree {
-                projects: std::sync::Arc::from(vec![desc]),
-            },
+            hierarchy: std::sync::Arc::from(vec![solution_service::SolutionNode {
+                item: solution_service::SolutionItem::Simple {
+                    path: path.clone(),
+                    register_to_asset_manager: true,
+                    git_enabled: false,
+                },
+                projects: std::sync::Arc::from(vec![solution_service::ProjectNode {
+                    desc,
+                    actions: std::sync::Arc::from([]),
+                }]),
+                actions: std::sync::Arc::from([]),
+            }]),
         });
         app.workspace = Some(Workspace::new(path));
         full
+    }
+
+    /// 1.5: 交树投影收窄 (change solution-overview D1) —
+    /// **仅描述符变化不触发**资产注册, 交树变化才触发。
+    ///
+    /// 起点故意把注册开关关掉: 此时 handoff 为空 → `register()` 因 owners
+    /// 空而不 spawn 枚举 ⇒ 没有在途异步落树, `view_generation` 的断言是
+    /// 确定性的, 不受后台枚举落地竞态影响。
+    #[gpui_kit::test]
+    fn asset_registration_ignores_action_descriptor_changes(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let (_handle, app_entity) = open_app(cx, history, None);
+
+        // 代数 = 镜像代数（服务落地才推进）。
+        let generation = |cx: &mut TestAppContext| -> u64 {
+            cx.update(|cx| {
+                app_entity
+                    .read(cx)
+                    .service_layer
+                    .asset_view()
+                    .map(|s| s.generation)
+                    .unwrap_or(0)
+            })
+        };
+        // 「不得启动枚举」的直接观测：`asset.register` 发送次数（GUI 侧
+        // O(1) 守卫 —— 交树投影未变 ⇒ 连消息都不发）。
+        let starts = |cx: &mut TestAppContext| -> u64 {
+            cx.update(|cx| app_entity.read(cx).service_layer.asset_register_sends as u64)
+        };
+        /// 改镜像里首个 solution 节点的某个字段后重跑装配单点。
+        fn mutate_and_sync(
+            cx: &mut TestAppContext,
+            app_entity: &gpui_kit::Entity<crate::app::TerminalApp>,
+            f: impl FnOnce(&mut solution_service::SolutionNode),
+        ) {
+            app_entity.update(cx, |app, cx| {
+                let mut snap = app.service_layer.tree_view().unwrap().clone();
+                let mut hierarchy = snap.hierarchy.to_vec();
+                f(&mut hierarchy[0]);
+                snap.hierarchy = hierarchy.into();
+                app.service_layer.set_tree_view_for_test(snap);
+                app.sync_asset_registration(cx);
+            });
+            // 总线异步: 把注册的回执/事件消费进镜像再返回 —— 否则
+            // base 快照可能在发布落地前取到 (A 会被晚到的发布踩脏)。
+            for _ in 0..8 {
+                cx.run_until_parked();
+                app_entity.update(cx, |app, cx| {
+                    app.poll_sessions(cx);
+                });
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        // 起点: 注入 workspace + 树镜像, 再把注册开关关掉
+        // → handoff 空 → register 被调但不 spawn 枚举
+        app_entity.update(cx, |app, _cx| inject_test_workspace(app, "handoff-narrow"));
+        mutate_and_sync(cx, &app_entity, |n| {
+            n.item.set_register_to_asset_manager(false)
+        });
+        let base_generation = generation(cx);
+        let base_starts = starts(cx);
+
+        // A. 只改描述符 — 交树投影不变 ⇒ 不得重枚举
+        mutate_and_sync(cx, &app_entity, |n| {
+            n.actions = std::sync::Arc::from(vec![solution_service::ActionDesc {
+                id: "configure.git_enabled".into(),
+                label: "git 管理".into(),
+                checked: Some(true),
+                execution: solution_service::ExecutedBy::Service,
+            }]);
+        });
+        assert_eq!(generation(cx), base_generation, "仅描述符变化不得触发资产注册");
+        assert_eq!(starts(cx), base_starts, "…且不得启动枚举");
+
+        // B. 交树变化 (注册开关打开) ⇒ 必须重枚举
+        mutate_and_sync(cx, &app_entity, |n| {
+            n.item.set_register_to_asset_manager(true)
+        });
+        assert!(generation(cx) > base_generation, "交树变化必须触发注册");
+        assert!(starts(cx) > base_starts, "交树变化必须启动枚举");
     }
 
 
@@ -1387,7 +1391,7 @@ mod tests {
                 },
                 cx,
                 |window, cx| {
-                    cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动"))
+                    cx.new(|cx| TerminalApp::new(window, cx, None).expect("app 启动"))
                 },
             )
             .expect("open test window")
@@ -1497,7 +1501,7 @@ mod tests {
                 },
                 cx,
                 |window, cx| {
-                    cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动"))
+                    cx.new(|cx| TerminalApp::new(window, cx, None).expect("app 启动"))
                 },
             )
             .expect("open test window")
@@ -1533,7 +1537,7 @@ mod tests {
                 },
                 cx,
                 |window, cx| {
-                    cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动"))
+                    cx.new(|cx| TerminalApp::new(window, cx, None).expect("app 启动"))
                 },
             )
             .expect("open test window")
@@ -1650,7 +1654,7 @@ mod tests {
                 },
                 cx,
                 |window, cx| {
-                    cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动"))
+                    cx.new(|cx| TerminalApp::new(window, cx, None).expect("app 启动"))
                 },
             )
             .expect("open test window")
@@ -1744,10 +1748,10 @@ mod tests {
         let (rows, cols) = screen;
         assert_eq!(cols, exp_cols, "会话列数 = floor(宽/cell_w)");
         assert_eq!(rows, exp_rows, "会话行数 = floor(高/line_h)");
-        // bounds 应排除 sidebar (240px) 与 chrome: 1000px 窗口下明显小于全宽
+        // bounds 应排除 solution-overview (240px) 与 chrome: 1000px 窗口下明显小于全宽
         assert!(
             f32::from(bounds.size.width) < 800.,
-            "网格 bounds 应排除 sidebar 等 chrome: {}",
+            "网格 bounds 应排除 solution-overview 等 chrome: {}",
             f32::from(bounds.size.width)
         );
 
@@ -1824,7 +1828,7 @@ mod tests {
                 },
                 cx,
                 |window, cx| {
-                    cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动"))
+                    cx.new(|cx| TerminalApp::new(window, cx, None).expect("app 启动"))
                 },
             )
             .expect("open test window")
@@ -1914,13 +1918,13 @@ mod tests {
         let _ = fs::remove_dir_all(&ws_path);
     }
 
-    /// 回归 (crash fix): sidebar 行点击的 listener 在**面板 lease 内**执行,
+    /// 回归 (crash fix): solution-overview 行点击的 listener 在**面板 lease 内**执行,
     /// funnel 的 notify_panels 必须 `cx.defer` — 同步 panel.update 会重入
-    /// panic/abort ("cannot update SidebarPanel while it is already being
+    /// panic/abort ("cannot update SolutionOverviewPanel while it is already being
     /// updated")。同时覆盖: 2.2 稳定身份载荷 +漏斗后面板确实重渲
     /// (defer 生效: 折叠后 [+ agent] 按钮从观测中消失)。
     #[gpui_kit::test]
-    fn sidebar_row_click_toggles_collapse(cx: &mut TestAppContext) {
+    fn solution_overview_row_click_toggles_collapse(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let (handle, app_entity) = cx.update(|cx| {
             gpui_kit::open_window(
@@ -1933,7 +1937,7 @@ mod tests {
                 },
                 cx,
                 |window, cx| {
-                    cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动"))
+                    cx.new(|cx| TerminalApp::new(window, cx, None).expect("app 启动"))
                 },
             )
             .expect("open test window")
@@ -1947,7 +1951,7 @@ mod tests {
             let app = app_entity.read(cx);
             let ws = app.workspace.as_ref().expect("注入的测试 workspace");
             // project root == workspace path (inject 约定); 初始未折叠
-            (ws.full_path_str(), ws.collapsed_projects.contains(&ws.path))
+            (ws.path.to_string_lossy().into_owned(), ws.collapsed_projects.contains(&ws.path))
         });
 
         let new_agent_id = format!("new-agent-label-{path}");
@@ -2010,7 +2014,7 @@ mod tests {
     /// 坑点: 点击 dock 内面板时 dock 机制可能在 frame-end 把焦点交给该
     /// 面板 (spike E2 实测) — 本测试用 run_until_parked 冲掉延迟任务后再断言。
     #[gpui_kit::test]
-    fn sidebar_select_grants_one_step_focus(cx: &mut TestAppContext) {
+    fn solution_overview_select_grants_one_step_focus(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let (handle, app_entity) = cx.update(|cx| {
             gpui_kit::open_window(
@@ -2023,14 +2027,14 @@ mod tests {
                 },
                 cx,
                 |window, cx| {
-                    cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动"))
+                    cx.new(|cx| TerminalApp::new(window, cx, None).expect("app 启动"))
                 },
             )
             .expect("open test window")
         });
 
         // 注入 workspace 拿 root: 会话 cwd 必须 == project root
-        // (spec: Session working directory), 否则 sidebar 分组键
+        // (spec: Session working directory), 否则 solution-overview 分组键
         // (project_root == root) 不命中, agent 行不渲染
         let ws_path = cx.update(|cx| {
             app_entity.update(cx, |app, _cx| inject_test_workspace(app, "one-step-focus"))
@@ -2049,7 +2053,7 @@ mod tests {
         cx.update(|cx| {
             let app = app_entity.update(cx, |app, cx| {
                 // 直接注入绕过 funnel, 面板需显式 notify 才会重渲 (§10.5)
-                app.sidebar.update(cx, |_, cx| cx.notify());
+                app.solution_overview.update(cx, |_, cx| cx.notify());
             });
             let _ = app;
         });
@@ -2117,7 +2121,7 @@ mod tests {
                 },
                 cx,
                 |window, cx| {
-                    cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动"))
+                    cx.new(|cx| TerminalApp::new(window, cx, None).expect("app 启动"))
                 },
             )
             .expect("open test window")
@@ -2146,7 +2150,7 @@ mod tests {
         cx.update(|cx| {
             app_entity.update(cx, |app, cx| {
                 // 直接注入绕过 funnel: 两个面板都需显式 notify (§10.5)
-                app.sidebar.update(cx, |_, cx| cx.notify());
+                app.solution_overview.update(cx, |_, cx| cx.notify());
                 app.terminal.update(cx, |_, cx| cx.notify());
             });
         });
@@ -2216,13 +2220,48 @@ mod tests {
     //  组 7: 全链路)。对话框 (rfd) 接线是正式构建胶水, 无头不触碰 —
     //  其决策点已拆成纯函数/同步方法被下面测试覆盖。
 
-    use super::{GateDecision, OpenOutcome, switch_gate};
+    use super::OpenOutcome;
     use solution_service::contract::TreeSnapshot;
-    use crate::assets::{AssetKind, AssetState, project_id};
+    use asset_service::contract::{AssetKind, AssetState, project_id};
     use crate::project_model::{self};
     use crate::workspace::history::History;
 
     /// hermetic 临时目录 (进程 + 纳秒隔离)。
+    /// 等资产镜像满足条件（总线异步落地 ⇒ 取代旧 `AssetManager` 的同步
+    /// 读；生产侧由 50ms 泵自愈，测试要显式泵到条件）。形态仿
+    /// `wait_sol_settled`。
+    fn wait_asset_settled(
+        cx: &mut TestAppContext,
+        app: &gpui_kit::Entity<TerminalApp>,
+        pred: impl Fn(&AssetState) -> bool,
+        what: &str,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            cx.run_until_parked();
+            app.update(cx, |app, cx| {
+                app.poll_sessions(cx);
+            });
+            if cx.update(|cx| pred(&asset_state(app.read(cx)))) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "资产镜像未落定: {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// 资产视图：读**服务推来的镜像**（change asset-service 4.5 ——
+    /// `AssetManager` 已退役，无镜像按空态）。
+    fn asset_state(app: &crate::app::TerminalApp) -> AssetState {
+        app.service_layer
+            .asset_view()
+            .map(|s| s.state.clone())
+            .unwrap_or(AssetState::Empty)
+    }
+
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "sw-{tag}-{}-{}",
@@ -2244,10 +2283,12 @@ mod tests {
         p
     }
 
-    /// 起带指定历史文件的 app (design D5: 主窗先行, 恢复异步)。
-    fn open_app_with_history(
+    /// 起 app 并**显式指定启动 path** (3.1: 自动恢复退场后的入口)。
+    /// `Some(path)` → `new_inner` 开窗即异步打开; `None` → 只装配不打开。
+    fn open_app(
         cx: &mut TestAppContext,
         history: PathBuf,
+        startup: Option<PathBuf>,
     ) -> (
         gpui_kit::AnyWindowHandle,
         gpui_kit::Entity<TerminalApp>,
@@ -2264,8 +2305,9 @@ mod tests {
                 },
                 cx,
                 |window, cx| {
-                    cx.new(|cx| {
-                        TerminalApp::new_inner(window, cx, history.clone())
+                    let startup = startup.clone();
+                    cx.new(move |cx| {
+                        TerminalApp::new_inner(window, cx, history.clone(), startup)
                             .expect("new_inner 启动 (打开失败走 open_failure, 非 Err)")
                     })
                 },
@@ -2328,6 +2370,15 @@ mod tests {
         }
     }
 
+    /// 让服务落盘必败 (design D5): 把 solutions 文件换成同名目录 →
+    /// `fs::write` 必 EISDIR。落盘目标由服务绑定, 不能再靠改 view 侧的
+    /// `workspace.path` 来影响写入位置。
+    fn break_persist(ws: &std::path::Path) {
+        let p = project_model::files::solutions_path(ws);
+        let _ = fs::remove_file(&p);
+        fs::create_dir_all(&p).unwrap();
+    }
+
     /// task 6.1: 服务总线接入 — 状态翻转经 50ms 主循环泵落到 GUI
     /// (Listener 接入 poll 门; 无回调, D9)。事件不早产: 主循环未 advance
     /// 时 pump 不跑, disable 事件必在 tick 时被消费 (确定性)。
@@ -2339,7 +2390,7 @@ mod tests {
     #[gpui_kit::test]
     fn service_state_flip_reaches_gui_via_update_loop(cx: &mut TestAppContext) {
         use std::time::{Duration, Instant};
-        let (handle, app_entity) = open_app_with_history(cx, fresh_history_path());
+        let (handle, app_entity) = open_app(cx, fresh_history_path(), None);
         let core_id = cx.update(|cx| app_entity.read(cx).service_layer.core_id);
         assert!(
             cx.update(|cx| app_entity.read(cx).service_layer.manager.has_service(&"core.fake".into())),
@@ -2420,54 +2471,11 @@ mod tests {
         .expect("update window")
     }
 
-    /// 4.1: 切换门控三支 — 纯函数逐支可测 (spec: Gated workspace switching)。
-    #[test]
-    fn switch_gate_three_branches() {
-        assert_eq!(switch_gate(2, 1), GateDecision::Block(2), "活动优先拦截");
-        assert_eq!(switch_gate(1, 0), GateDecision::Block(1));
-        assert_eq!(switch_gate(0, 3), GateDecision::Confirm);
-        assert_eq!(switch_gate(0, 0), GateDecision::Direct);
-    }
-
-    /// 4.1 wiring: 活动会话存在时请求切换 → notice 落地且不进 picker。
-    #[gpui_kit::test]
-    fn gated_switch_with_active_session_shows_notice(cx: &mut TestAppContext) {
-        let history = fresh_history_path();
-        let (handle, app_entity) = open_app_with_history(cx, history);
-        app_entity.update(cx, |app, _cx| {
-            inject_test_workspace(app, "gate-notice"); // 含同路径 root project
-        });
-        let ws_path = cx.update(|cx| app_entity.read(cx).workspace.as_ref().unwrap().path.clone());
-        // Running 状态 → 活动支: 注入服务投影镜像 (task 3.2 接缝)
-        test_sessions::inject_view(
-            cx,
-            &app_entity,
-            vec![(
-                ws_path,
-                "recorder".into(),
-                agent_service::contract::SessionStatus::Running,
-            )],
-            Some(0),
-        );
-        app_entity.update(cx, |app, cx| {
-            // 同步拦截, 不 spawn picker 对话框
-            app.request_workspace_open(true, cx);
-        });
-        cx.run_until_parked();
-        cx.update(|cx| {
-            let app = app_entity.read(cx);
-            let notice = app.notice.clone().expect("活动会话应落 notice");
-            assert!(notice.contains("1 session(s) still active"), "文案点名计数: {notice}");
-            assert!(app.workspace.is_some(), "拦截时工作区不变");
-        });
-        let _ = handle;
-    }
-
     /// 4.2: 过期 epoch 的提交必须被丢弃 (design D5 竞态守卫)。
     #[gpui_kit::test]
     fn stale_epoch_commit_is_discarded(cx: &mut TestAppContext) {
         let history = fresh_history_path();
-        let (_handle, app_entity) = open_app_with_history(cx, history);
+        let (_handle, app_entity) = open_app(cx, history, None);
         app_entity.update(cx, |app, cx| {
             app.load_epoch = 7;
             let discarded = app.commit_open(
@@ -2498,7 +2506,7 @@ mod tests {
         let ws_old = temp_dir("begin-old");
         let ws_new = temp_dir("begin-new");
         let history = fresh_history_path();
-        let (_handle, app_entity) = open_app_with_history(cx, history);
+        let (_handle, app_entity) = open_app(cx, history, None);
         app_entity.update(cx, |app, cx| {
             project_model::create_workspace_files(&ws_old).unwrap();
             project_model::create_workspace_files(&ws_new).unwrap();
@@ -2518,9 +2526,13 @@ mod tests {
         });
     }
 
-    /// 3.1: 启动恢复 — 历史最常打开且 marker+model 合法 → 异步载入落定。
+    /// 主窗侧: 显式启动 path → 打开该工作区并载入其树。
+    ///
+    /// "从历史里挑最近的"已随自动恢复退场 — 那一半归 Launcher
+    /// (`launcher::tests::history_entries_render_most_recent_first`);
+    /// 本条只验交棒之后主窗侧的打开与装载 (launcher-startup 6.1)。
     #[gpui_kit::test]
-    fn startup_restores_most_recent_workspace(cx: &mut TestAppContext) {
+    fn startup_opens_the_chosen_workspace(cx: &mut TestAppContext) {
         let ws = temp_dir("restore");
         let project_dir = ws.join("foo");
         fs::create_dir_all(&project_dir).unwrap();
@@ -2534,41 +2546,40 @@ mod tests {
         )
         .unwrap();
         let history = fresh_history_path();
-        let mut h = History::default();
-        h.push(ws.clone());
-        h.save_at(&history).unwrap();
 
-        let (_handle, app_entity) = open_app_with_history(cx, history);
-        // 恢复 probe 在真实后台线程 — 限时轮询等落定 (run_until_parked 不等它)
+        let (_handle, app_entity) = open_app(cx, history, Some(ws.clone()));
+        // probe 在真实后台线程 — 限时轮询等落定 (run_until_parked 不等它)
         wait_startup_settled(
             cx,
             &app_entity,
             |app| app.workspace.is_some(),
-            "恢复最近工作区",
+            "打开交棒的 path",
         );
         cx.update(|cx| {
             let app = app_entity.read(cx);
             assert!(app.open_failure.is_none(), "合法工作区不报错");
-            let ws_view = app.workspace.as_ref().expect("应恢复最近工作区");
+            let ws_view = app.workspace.as_ref().expect("应打开交棒的 path");
             assert_eq!(ws_view.path, ws);
             let tree = app.service_layer.tree_view().expect("镜像在场");
-            assert_eq!(tree.tree.projects.len(), 1);
-            assert_eq!(tree.tree.projects[0].name, "foo");
-            assert_eq!(tree.tree.projects[0].root, project_dir);
+            assert_eq!(tree.tree().projects.len(), 1);
+            assert_eq!(tree.tree().projects[0].name, "foo");
+            assert_eq!(tree.tree().projects[0].root, project_dir);
         });
     }
 
     /// 3.1: 坏 marker → open_failure 记录 (正式构建: 同点 dialog+exit)。
+    /// (启动期的 marker 预检已前移到 Launcher — 本条验的是主窗侧
+    ///  `probe_open` 的权威探测, 即 Launcher 交棒后的竞态路径)
     #[gpui_kit::test]
     fn startup_corrupt_marker_records_open_failure(cx: &mut TestAppContext) {
         let ws = temp_dir("corrupt-marker");
         fs::write(ws.join(project_model::files::MARKER_FILE), "{ nope").unwrap();
         let history = fresh_history_path();
         let mut h = History::default();
-        h.push(ws);
+        h.push(ws.clone());
         h.save_at(&history).unwrap();
 
-        let (_handle, app_entity) = open_app_with_history(cx, history);
+        let (_handle, app_entity) = open_app(cx, history, Some(ws));
         // 恢复 probe 在真实后台线程 — 限时轮询等失败落定 (单次冲执行器会
         // 在 probe 未跑完时误判 "未记录")
         wait_startup_settled(
@@ -2585,40 +2596,34 @@ mod tests {
         });
     }
 
-    /// 3.2: 恢复目标失效 (目录/ marker 不见了) → 回空态且不报错。
+    /// 3.2: 交棒后目录失效 → 记 open_failure 走 fatal, 而非静默回空态。
+    /// (design D3: `Empty` 并入 `Failure` — Launcher 已预检过, 主窗再失效
+    ///  只可能是竞态; `open_failure` 即错误框+退出路径的测试观测面)
     #[gpui_kit::test]
-    fn startup_missing_target_falls_back_to_empty_state(cx: &mut TestAppContext) {
+    fn startup_missing_target_is_fatal_not_empty_state(cx: &mut TestAppContext) {
         let ghost = std::env::temp_dir().join(format!("sw-ghost-{}", std::process::id()));
         let _ = fs::remove_dir_all(&ghost);
         let history = fresh_history_path();
         let mut h = History::default();
-        h.push(ghost);
+        h.push(ghost.clone());
         h.save_at(&history).unwrap();
 
-        let (_handle, app_entity) = open_app_with_history(cx, history);
-        cx.run_until_parked();
+        let (_handle, app_entity) = open_app(cx, history, Some(ghost));
+        wait_startup_settled(
+            cx,
+            &app_entity,
+            |app| app.open_failure.is_some(),
+            "交棒后目录失效应记 open_failure (fatal), 而非静默回空态",
+        );
         cx.update(|cx| {
             let app = app_entity.read(cx);
-            assert!(app.workspace.is_none(), "失效目标回空态");
-            assert!(app.open_failure.is_none(), "失效目标不是错误 (spec)");
+            assert!(app.workspace.is_none(), "失效路径不得打开工作区");
+            assert!(
+                app.open_failure.as_ref().is_some_and(|m| m.contains("does not exist")),
+                "错误点名目录不存在: {:?}",
+                app.open_failure
+            );
         });
-    }
-
-    /// 3.2: 空历史启动 → 窗内空态 + 目录选择器入口 (render 级)。
-    #[gpui_kit::test]
-    fn empty_state_renders_picker_affordance(cx: &mut TestAppContext) {
-        let history = fresh_history_path();
-        let (handle, _app) = open_app_with_history(cx, history);
-        cx.run_until_parked();
-        let texts = render_texts(handle, cx);
-        assert!(
-            texts.iter().any(|t| t.contains("no workspace open")),
-            "空态提示应渲染, 实际: {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|t| t.contains("open workspace…")),
-            "选择器入口应渲染, 实际: {texts:?}"
-        );
     }
 
     /// 3.3 core: 确认创建后 (两文件落盘) → 打开为空工作区。
@@ -2632,7 +2637,7 @@ mod tests {
         assert!(ws.join(project_model::files::SOLUTIONS_FILE).exists());
 
         let history = fresh_history_path();
-        let (_handle, app_entity) = open_app_with_history(cx, history);
+        let (_handle, app_entity) = open_app(cx, history, None);
         app_entity.update(cx, |app, cx| {
             app.begin_open(ws.clone(), cx);
         });
@@ -2645,7 +2650,7 @@ mod tests {
             assert!(
                 app.service_layer
                     .tree_view()
-                    .is_none_or(|t| t.tree.projects.is_empty()),
+                    .is_none_or(|t| t.tree().projects.is_empty()),
                 "空 solutions = 零 project"
             );
             // 打开即写历史 (下次启动直开)
@@ -2660,7 +2665,7 @@ mod tests {
     #[gpui_kit::test]
     fn add_solution_merges_and_surfaces_write_failure(cx: &mut TestAppContext) {
         let history = fresh_history_path();
-        let (_handle, app_entity) = open_app_with_history(cx, history);
+        let (_handle, app_entity) = open_app(cx, history, None);
         let ws = temp_dir("sol-merge");
         fs::create_dir_all(&ws).unwrap();
         project_model::create_workspace_files(&ws).unwrap();
@@ -2679,35 +2684,137 @@ mod tests {
             |app| {
                 app.service_layer
                     .tree_view()
-                    .is_some_and(|t| t.tree.projects.len() == 1)
+                    .is_some_and(|t| t.tree().projects.len() == 1)
             },
             "create p1 落定",
         );
         cx.update(|cx| {
             let app = app_entity.read(cx);
             let t = app.service_layer.tree_view().unwrap();
-            assert_eq!(t.tree.projects[0].root, p1);
+            assert_eq!(t.tree().projects[0].root, p1);
             assert!(app.save_error.is_none(), "成功写入无红条");
             assert!(app.notice.is_none(), "成功无 notice");
         });
 
-        // 写失败支: workspace 路径换成普通文件 → 服务落盘必败
-        let not_dir = ws.join("not-a-dir");
-        fs::write(&not_dir, "x").unwrap();
+        // 写失败支: 把 solutions 文件换成同名目录 → 服务落盘必败。
+        // (design D5 后落盘目标由服务绑定, 改 view 侧 `workspace.path`
+        //  已不再影响写入位置 — 只能从绑定的目标下手)
+        break_persist(&ws);
         app_entity.update(cx, |app, cx| {
-            app.workspace.as_mut().unwrap().path = not_dir.clone();
             app.request_create_solution(p2.clone(), cx);
         });
         wait_sol_settled(cx, &app_entity, |app| app.notice.is_some(), "写失败 notice");
         cx.update(|cx| {
             let app = app_entity.read(cx);
             let n = app.notice.clone().unwrap();
-            assert!(n.contains("添加 solution"), "notice 点名操作: {n}");
+            assert!(!n.is_empty(), "失败产生 notice: {n}");
+            // 路由按 action_id (design D7) — 落签即证明, 不再匹配文案
+            assert!(
+                app.sol_config_error.is_some(),
+                "失败按 action_id 路由到表单签"
+            );
             // 内存变更保留 (spec): 镜像仍含 p2
             let t = app.service_layer.tree_view().unwrap();
-            assert_eq!(t.tree.projects.len(), 2, "写失败仍进内存 (spec)");
-            assert!(t.tree.projects.iter().any(|p| p.root == p2));
+            assert_eq!(t.tree().projects.len(), 2, "写失败仍进内存 (spec)");
+            assert!(t.tree().projects.iter().any(|p| p.root == p2));
         });
+    }
+
+    /// 3.2: 路由键 = action_id — **改 label 文案不影响行内错误落签**。
+    /// (design D7: 之前靠对 notice 文案做子串匹配来路由 — 文案一改错误
+    ///  就静默漏掉; 现按 action_id)
+    #[gpui_kit::test]
+    fn inline_error_routing_ignores_label_wording(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app(cx, history, None);
+        cx.run_until_parked();
+
+        // 开表单签 (走真实入口)
+        cx.update_window(handle, |_, window, cx| {
+            app_entity.update(cx, |app, cx| app.open_solution_config_tab(window, cx));
+        })
+        .expect("open solution config tab");
+        cx.run_until_parked();
+
+        // 用一个与 "添加 solution" 毫无共同子串的 label 提交; 无工作区 →
+        // 服务回 "no workspace bound" 失败
+        let path = std::env::temp_dir().join(format!("lbl-fail-{}", std::process::id()));
+        app_entity.update(cx, |app, _cx| {
+            app.service_layer
+                .submit_action(
+                    SOL_ACTION_CREATE,
+                    None,
+                    Some(Payload::new(SolCreateReq { path })),
+                    "ZZZ-unrelated-wording",
+                )
+                .expect("submit create");
+            app.sol_config_inflight = true;
+        });
+        wait_sol_settled(
+            cx,
+            &app_entity,
+            |a| a.sol_config_error.is_some(),
+            "行内错误按 action_id 落签",
+        );
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            let err = app.sol_config_error.clone().expect("行内错误应落签");
+            assert!(
+                err.contains("ZZZ-unrelated-wording"),
+                "文案原样显示 (label 只管显示): {err}"
+            );
+            assert!(
+                app.sol_config_panel.is_some(),
+                "失败时签保留 (spec: the tab stays)"
+            );
+            assert!(!app.sol_config_inflight, "回执已消费");
+        });
+    }
+
+    /// 3.2: 路由键 = action_id — **改 label 文案不影响表单签自关**。
+    #[gpui_kit::test]
+    fn tab_auto_close_ignores_label_wording(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app(cx, history, None);
+        let ws = temp_dir("lbl-close");
+        fs::create_dir_all(&ws).unwrap();
+        project_model::create_workspace_files(&ws).unwrap();
+        app_entity.update(cx, |app, cx| app.begin_open(ws.clone(), cx));
+        wait_sol_settled(cx, &app_entity, |a| a.workspace.is_some(), "工作区打开");
+
+        cx.update_window(handle, |_, window, cx| {
+            app_entity.update(cx, |app, cx| app.open_solution_config_tab(window, cx));
+        })
+        .expect("open solution config tab");
+        cx.run_until_parked();
+
+        let target = ws.join("newproj");
+        fs::create_dir_all(&target).unwrap();
+        app_entity.update(cx, |app, _cx| {
+            app.service_layer
+                .submit_action(
+                    SOL_ACTION_CREATE,
+                    None,
+                    Some(Payload::new(SolCreateReq { path: target })),
+                    "ZZZ-unrelated-wording",
+                )
+                .expect("submit create");
+            app.sol_config_inflight = true;
+        });
+        wait_sol_settled(
+            cx,
+            &app_entity,
+            |a| !a.sol_config_inflight,
+            "成功回执清 inflight",
+        );
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            assert!(
+                app.sol_config_panel.is_none(),
+                "label 文案不同, 表单签仍自关 (路由按 action_id)"
+            );
+        });
+        let _ = fs::remove_dir_all(&ws);
     }
 
     /// 5.1+5.4: agent 按 project root 分组 (含工作区外项目) + 状态栏显示
@@ -2717,20 +2824,34 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let history = fresh_history_path();
-        let (handle, app_entity) = open_app_with_history(cx, history);
+        let (handle, app_entity) = open_app(cx, history, None);
         let external = temp_dir("external-project"); // 工作区外的 project
         let ws_path = app_entity.update(cx, |app, _cx| {
             inject_test_workspace(app, "grouping"); // project root1 = ws 目录
             let ws_path = app.workspace.as_ref().unwrap().path.clone();
-            // 工作区外 project 经镜像追加 (5.4: 视图读镜像)
+            // 工作区外 project 经镜像追加 (5.4: 视图读镜像)。
+            // tree() 从 hierarchy 派生 → 追加即塞一个 solution 节点
+            // (spec: Root outside the workspace is accepted — 外部目录本
+            //  就是一个合法 solution 的 project)。
             let mut snap = app.service_layer.tree_view().unwrap().clone();
-            let mut projects = snap.tree.projects.to_vec();
-            projects.push(solution_service::ProjectDesc {
-                name: "external-project".into(),
-                root: external.clone(),
-                is_git: false,
+            let mut hierarchy = snap.hierarchy.to_vec();
+            hierarchy.push(solution_service::SolutionNode {
+                item: solution_service::SolutionItem::Simple {
+                    path: external.clone(),
+                    register_to_asset_manager: true,
+                    git_enabled: false,
+                },
+                projects: std::sync::Arc::from(vec![solution_service::ProjectNode {
+                    desc: solution_service::ProjectDesc {
+                        name: "external-project".into(),
+                        root: external.clone(),
+                        is_git: false,
+                    },
+                    actions: std::sync::Arc::from([]),
+                }]),
+                actions: std::sync::Arc::from([]),
             });
-            snap.tree.projects = projects.into();
+            snap.hierarchy = hierarchy.into();
             app.service_layer.set_tree_view_for_test(snap);
             ws_path
         });
@@ -2756,7 +2877,7 @@ mod tests {
         app_entity.update(cx, |app, cx| {
             // 状态栏外部 root: 投影已置 active (服务新建即 active,
             // create_session 自举已 sync_terminal_view — 无需直写)
-            app.sidebar.update(cx, |_, cx| cx.notify());
+            app.solution_overview.update(cx, |_, cx| cx.notify());
             app.terminal.update(cx, |_, cx| cx.notify());
         });
         cx.run_until_parked();
@@ -2793,7 +2914,7 @@ mod tests {
     #[gpui_kit::test]
     fn project_row_click_keeps_active_session_and_tab(cx: &mut TestAppContext) {
         let history = fresh_history_path();
-        let (handle, app_entity) = open_app_with_history(cx, history);
+        let (handle, app_entity) = open_app(cx, history, None);
         app_entity.update(cx, |app, _cx| {
             inject_test_workspace(app, "row-keep");
         });
@@ -2810,7 +2931,7 @@ mod tests {
         );
         let agent_id = ids[0];
         app_entity.update(cx, |app, cx| {
-            app.sidebar.update(cx, |_, cx| cx.notify());
+            app.solution_overview.update(cx, |_, cx| cx.notify());
         });
         cx.run_until_parked();
         render_texts(handle, cx); // 首帧让行进观测注册表
@@ -2847,6 +2968,384 @@ mod tests {
         assert!(collapsed, "折叠态应被切换");
     }
 
+    /// 取中心槽的 (签列表, 活动下标) — 断言"没切 tab"用。
+    fn center_tabs(
+        cx: &mut TestAppContext,
+        app: &gpui_kit::Entity<TerminalApp>,
+    ) -> (Vec<gpui_kit::base::dock::PanelId>, usize) {
+        cx.update(|cx| {
+            let app = app.read(cx);
+            let area = app.dock_area.read(cx);
+            let tree = area
+                .layout(gpui_kit::component::dock::DockPlacement::Center)
+                .expect("center 槽在场");
+            let mut found = (Vec::new(), 0usize);
+            tree.root().walk(&mut |node| {
+                if let gpui_kit::base::dock::layout::PaneRef::Tabs { panels, active_ix } =
+                    node.kind()
+                {
+                    if found.0.is_empty() {
+                        found = (panels.to_vec(), active_ix);
+                    }
+                }
+            });
+            found
+        })
+    }
+
+    /// 取元素 id 列表 (文档序) 与 test_text 列表。
+    fn ids_and_texts(
+        handle: gpui_kit::AnyWindowHandle,
+        cx: &mut TestAppContext,
+    ) -> (Vec<String>, Vec<String>) {
+        use gpui_kit::test::TestQueryExt;
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let ids = window
+                .elements()
+                .iter()
+                .filter_map(|e| e.path().last().map(|id| id.to_string()))
+                .collect::<Vec<_>>();
+            let texts = gpui_kit::base::test_support::texts(window)
+                .iter()
+                .map(|t| t.text().to_string())
+                .collect::<Vec<_>>();
+            (ids, texts)
+        })
+        .expect("update window")
+    }
+
+    /// 2.5: 表单提交经 `ActionInvoke` → solution 行出现;
+    /// `create_is_noop` 前置检行为不变 (重复提交零变化)。
+    #[gpui_kit::test]
+    fn form_submit_creates_a_solution_row_via_action_invoke(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app(cx, history, None);
+
+        let ws = temp_dir("form-create");
+        fs::create_dir_all(&ws).unwrap();
+        project_model::create_workspace_files(&ws).unwrap();
+        let target = ws.join("newproj");
+        fs::create_dir_all(&target).unwrap();
+
+        app_entity.update(cx, |app, cx| app.begin_open(ws.clone(), cx));
+        wait_sol_settled(cx, &app_entity, |a| a.workspace.is_some(), "工作区打开");
+
+        // 提交 — 走 request_create_solution → `ActionInvoke` 单点 (design D6)
+        app_entity.update(cx, |app, cx| {
+            app.request_create_solution(target.clone(), cx)
+        });
+        wait_sol_settled(
+            cx,
+            &app_entity,
+            |a| {
+                a.service_layer
+                    .tree_view()
+                    .is_some_and(|t| t.hierarchy.len() == 1)
+            },
+            "create 落定",
+        );
+
+        let texts = render_texts(handle, cx);
+        assert!(
+            texts.iter().any(|t| t.contains("· simple")),
+            "提交后 solution 行出现, 实际: {texts:?}"
+        );
+
+        // create_is_noop 前置检 (design D6: view 与 Server 同一 ValidChecker)
+        app_entity.update(cx, |app, cx| {
+            app.request_create_solution(target.clone(), cx)
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let t = app_entity
+                .read(cx)
+                .service_layer
+                .tree_view()
+                .expect("镜像在场");
+            assert_eq!(t.hierarchy.len(), 1, "重复提交零变化 (create_is_noop)");
+            assert_eq!(t.tree().projects.len(), 1, "无重复 project");
+        });
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    /// 4.4: 空态条件 = **零 solution** (project-model delta) —
+    /// 零 solution 渲染 add-solution 入口, 有 solution 后消失。
+    #[gpui_kit::test]
+    fn add_solution_entry_disappears_once_a_solution_exists(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app(cx, history, None);
+
+        // workspace 已开但镜像里零 solution → 入口在场
+        app_entity.update(cx, |app, _cx| {
+            app.workspace = Some(Workspace::new(
+                std::env::temp_dir().join(format!("add-sol-empty-{}", std::process::id())),
+            ));
+        });
+        cx.run_until_parked();
+        let texts = render_texts(handle, cx);
+        assert!(
+            texts.iter().any(|t| t.contains("+ add solution")),
+            "零 solution 应渲染 add-solution 入口, 实际: {texts:?}"
+        );
+
+        // 镜像出现一个 solution → 入口消失
+        app_entity.update(cx, |app, _cx| inject_test_workspace(app, "add-sol-has"));
+        cx.run_until_parked();
+        let texts = render_texts(handle, cx);
+        assert!(
+            !texts.iter().any(|t| t.contains("+ add solution")),
+            "有 solution 后入口消失, 实际: {texts:?}"
+        );
+    }
+
+    /// 4.1: solution 行渲染 (change solution-overview D2) —
+    /// 位于其 project 之上、id 带 `solution://` 命名空间前缀、与 project
+    /// 行 id 不相等 (v1 两者 path 相同, 裸路径会撞)。
+    #[gpui_kit::test]
+    fn solution_row_renders_above_its_project_with_namespaced_id(
+        cx: &mut TestAppContext,
+    ) {
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app(cx, history, None);
+        app_entity.update(cx, |app, _cx| {
+            inject_test_workspace(app, "sol-row"); // ws 目录即 project root
+        });
+        cx.run_until_parked();
+
+        // 用内层 `*-name-*` 观测锚点 (外层 row div 无 test_support, 且
+        // 点击/观测都走内层 — 冒泡是本仓既定模式)
+        let (ids, texts) = ids_and_texts(handle, cx);
+        let sol_pos = ids
+            .iter()
+            .position(|i| i.starts_with("solution-name-solution://"))
+            .unwrap_or_else(|| panic!("solution 行应渲染, 实际 id: {ids:?}"));
+        let proj_pos = ids
+            .iter()
+            .position(|i| i.starts_with("project-name-/"))
+            .unwrap_or_else(|| panic!("project 行应渲染, 实际 id: {ids:?}"));
+
+        assert!(
+            sol_pos < proj_pos,
+            "solution 行在其 project 之上 (文档序), ids: {ids:?}"
+        );
+        let sol_id = &ids[sol_pos];
+        let proj_id = &ids[proj_pos];
+        assert!(
+            sol_id.contains("solution://"),
+            "solution 行 id 带命名空间前缀: {sol_id}"
+        );
+        assert_ne!(sol_id, proj_id, "两行 id 不相等 (D2: v1 path 相同)");
+
+        assert!(
+            texts.iter().any(|t| t.contains("· simple")),
+            "label 带类型标记 (与同名 project 行的唯一区分), 实际: {texts:?}"
+        );
+    }
+
+    /// 4.3: 右键 Solution 行 → 菜单**来自服务声明的 actions** (同步、零往返)
+    /// → 点击发 `ActionInvoke` → 服务处理 (交树收缩)。
+    /// (specs/node-actions: Menu is built from the snapshot;
+    ///  spec: Solution row context menu offers declared actions)
+    #[gpui_kit::test]
+    fn solution_row_context_menu_dispatches_declared_actions(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui_kit::Role;
+        use gpui_kit::test::{TestQueryExt, TestWindowExt};
+
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app(cx, history, None);
+
+        // 真实打开: 服务侧载入一个 register=true 的 simple solution
+        let ws = temp_dir("sol-menu");
+        fs::create_dir_all(&ws).unwrap();
+        project_model::create_workspace_files(&ws).unwrap();
+        let proj = ws.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(
+            project_model::files::solutions_path(&ws),
+            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, proj.display()),
+        )
+        .unwrap();
+        app_entity.update(cx, |app, cx| app.begin_open(ws.clone(), cx));
+        wait_sol_settled(cx, &app_entity, |a| a.workspace.is_some(), "工作区打开");
+        cx.run_until_parked();
+
+        // 期望 label 从**镜像的服务声明**取 — 不是视图自己的文案表
+        let expected: Vec<String> = cx.update(|cx| {
+            app_entity
+                .read(cx)
+                .service_layer
+                .tree_view()
+                .expect("镜像在场")
+                .hierarchy[0]
+                .actions
+                .iter()
+                .map(|a| a.label.clone())
+                .collect::<Vec<_>>()
+        });
+        assert!(!expected.is_empty(), "服务应声明至少一个动作");
+
+        let sol_id = format!("solution-name-solution://{}", proj.display());
+        let tabs_before = center_tabs(cx, &app_entity);
+
+        // 左键 = 纯折叠, 不打开任何签 (D2)
+        cx.update_window(handle, |_, window, cx| window.click(sol_id.clone(), cx))
+            .expect("left click solution row");
+        cx.run_until_parked();
+        assert_eq!(
+            center_tabs(cx, &app_entity),
+            tabs_before,
+            "左键不打开任何签"
+        );
+        // 再点展开, 以免折叠影响右键命中
+        cx.update_window(handle, |_, window, cx| window.click(sol_id.clone(), cx))
+            .expect("left click again");
+        cx.run_until_parked();
+
+        // 右键 → 菜单
+        cx.update_window(handle, |_, window, cx| window.right_click(sol_id, cx))
+            .expect("right click solution row");
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+
+        let labels = cx.update_window(handle, |_, window, _| {
+            window
+                .find_all_by_role(Role::MenuItem)
+                .iter()
+                .filter_map(|i| i.label().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .expect("menu items");
+        assert_eq!(
+            labels, expected,
+            "菜单项与服务声明的 label 一致 (label 归服务, design D3)"
+        );
+
+        // 点第一项 (注册到资产树, 当前 true → 翻 false) → 交树收缩
+        let item_id = cx.update_window(handle, |_, window, _| {
+            window.find_all_by_role(Role::MenuItem)[0]
+                .path()
+                .last()
+                .expect("菜单项路径")
+                .clone()
+        })
+        .expect("menu item id");
+        cx.update_window(handle, |_, window, cx| {
+            let mut menu = window.within("popup-menu");
+            menu.click(item_id, cx);
+        })
+        .expect("click menu item");
+        wait_sol_settled(
+            cx,
+            &app_entity,
+            |a| {
+                a.service_layer
+                    .tree_view()
+                    .is_some_and(|t| t.handoff().projects.is_empty())
+                },
+            "点击后交树收缩 (ActionInvoke 已被服务处理)",
+        );
+        // 零声明 → 无菜单 (specs/node-actions: A node with no declared
+        // actions has no menu): project 行不挂 context_menu
+        let proj_row = format!("project-name-{}", proj.display());
+        cx.update_window(handle, |_, window, cx| window.right_click(proj_row, cx))
+            .expect("right click project row");
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        let on_project = cx.update_window(handle, |_, window, _| {
+            window.find_all_by_role(Role::MenuItem).len()
+        })
+        .expect("menu items on project row");
+        assert_eq!(on_project, 0, "未声明动作的 project 行右键无菜单");
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    /// 4.2: Solution 行左键 = **纯折叠** (D2) — 隐藏子行, 不动 active
+    /// session、不切 tab、不抢焦点; 折叠态易失 (类型上就无持久化)。
+    #[gpui_kit::test]
+    fn solution_row_click_toggles_collapse_only(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app(cx, history, None);
+        let full = app_entity.update(cx, |app, _cx| {
+            inject_test_workspace(app, "sol-collapse")
+        });
+        cx.run_until_parked();
+
+        let sol_id = format!("solution-name-solution://{}", full);
+        let (ids_before, _) = ids_and_texts(handle, cx);
+        assert!(
+            ids_before.iter().any(|i| i.starts_with("project-name-/")),
+            "折叠前 project 行在场, 实际: {ids_before:?}"
+        );
+        let active_before = cx.update(|cx| {
+            app_entity
+                .read(cx)
+                .service_layer
+                .sessions_view()
+                .and_then(|v| v.active)
+        });
+        let tabs_before = center_tabs(cx, &app_entity);
+
+        // 点 solution 行 → 折叠
+        cx.update_window(handle, |_, window, cx| window.click(sol_id.clone(), cx))
+            .expect("click solution row");
+        cx.run_until_parked();
+
+        let (ids_after, _) = ids_and_texts(handle, cx);
+        assert!(
+            !ids_after.iter().any(|i| i.starts_with("project-name-/")),
+            "折叠隐藏子行, 实际: {ids_after:?}"
+        );
+        assert!(
+            ids_after.iter().any(|i| i.starts_with("solution-name-solution://")),
+            "分组头自身仍可见, 实际: {ids_after:?}"
+        );
+        let active_after = cx.update(|cx| {
+            app_entity
+                .read(cx)
+                .service_layer
+                .sessions_view()
+                .and_then(|v| v.active)
+        });
+        assert_eq!(active_after, active_before, "不切 active session");
+        assert_eq!(center_tabs(cx, &app_entity), tabs_before, "不切 tab");
+        assert!(
+            cx.update(|cx| {
+                app_entity
+                    .read(cx)
+                    .workspace
+                    .as_ref()
+                    .unwrap()
+                    .collapsed_solutions
+                    .contains(&format!("solution://{}", full))
+            }),
+            "折叠态记在 collapsed_solutions (键 = 节点 id)"
+        );
+
+        // 再点 → 展开
+        cx.update_window(handle, |_, window, cx| window.click(sol_id, cx))
+            .expect("click solution row again");
+        cx.run_until_parked();
+        let (ids_again, _) = ids_and_texts(handle, cx);
+        assert!(
+            ids_again.iter().any(|i| i.starts_with("project-name-/")),
+            "再点恢复子行, 实际: {ids_again:?}"
+        );
+
+        // 易失: 新建的 Workspace 不带折叠态 (类型上无持久化)
+        assert!(
+            crate::workspace::Workspace::new(std::path::PathBuf::from("/fresh"))
+                .collapsed_solutions
+                .is_empty(),
+            "折叠态不持久化 — 新 workspace 默认展开"
+        );
+    }
+
     /// 5.2: 零 project 工作区 → 只给 add-solution 动作, 不渲染 [+ agent]
     /// (spec: If no project exists yet, no [+ agent] button)。
     #[gpui_kit::test]
@@ -2854,7 +3353,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let history = fresh_history_path();
-        let (handle, app_entity) = open_app_with_history(cx, history);
+        let (handle, app_entity) = open_app(cx, history, None);
         app_entity.update(cx, |app, _| {
             let path = std::env::temp_dir().join(format!(
                 "sw-noproj-{}-{}",
@@ -2874,18 +3373,69 @@ mod tests {
         );
     }
 
-    /// 7.1 全链路: 空态 → 创建打开 → add-solution 出项目 → 建会话
-    /// (cwd=project root, 行入树, 状态栏正确) → 门控切换拦截。
+    /// 4.1: 切换入口与空态提示两块渲染已删 (launcher-startup 4.1)。
+    /// 按**元素 id** 断言 (文案会随文案改版漂移, id 不会)。
     #[gpui_kit::test]
-    fn full_chain_create_add_agent_and_gate(cx: &mut TestAppContext) {
+    fn solution_overview_renders_neither_switch_entry_nor_empty_hint(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui_kit::test::TestQueryExt;
+
+        fn element_ids(
+            cx: &mut TestAppContext,
+            handle: gpui_kit::AnyWindowHandle,
+        ) -> Vec<String> {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window
+                    .elements()
+                    .iter()
+                    .filter_map(|e| e.path().last().map(|id| id.to_string()))
+                    .collect()
+            })
+            .expect("update window")
+        }
+
         let history = fresh_history_path();
-        let (handle, app_entity) = open_app_with_history(cx, history);
+        let (handle, app_entity) = open_app(cx, history, None);
         cx.run_until_parked();
+
+        // 无 workspace: 原空态提示块
+        let ids = element_ids(cx, handle);
+        assert!(
+            !ids.iter().any(|i| i == "workspace-empty-hint"),
+            "空态提示块已删, 实际: {ids:?}"
+        );
+
+        // 有 workspace: 切换入口原本恒在 (空态与已开态都是同一个控件)
+        app_entity.update(cx, |app, _| {
+            let path = std::env::temp_dir().join(format!("sw-noswitch-{}", std::process::id()));
+            app.workspace = Some(Workspace::new(path));
+        });
+        let ids = element_ids(cx, handle);
+        assert!(
+            !ids.iter().any(|i| i == "workspace-switch"),
+            "切换入口块已删, 实际: {ids:?}"
+        );
+
+        // 不受影响: add-solution 动作照旧 (spec: Solution creation path picker)
         let texts = render_texts(handle, cx);
         assert!(
-            texts.iter().any(|t| t.contains("no workspace open")),
-            "链路起点: 空态"
+            texts.iter().any(|t| t.contains("+ add solution")),
+            "add-solution 动作仍在, 实际: {texts:?}"
         );
+    }
+
+    /// 7.1 全链路: 打开 → add-solution 出项目 → 建会话
+    /// (cwd=project root, 行入树, 状态栏正确)。
+    ///
+    /// 原链路起点的空态断言与门控尾部已随切换口删除
+    /// (launcher-startup 4.4 / 6.2 — 空态不可达)。
+    #[gpui_kit::test]
+    fn full_chain_create_add_agent(cx: &mut TestAppContext) {
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app(cx, history, None);
+        cx.run_until_parked();
 
         // 模拟确认创建 + 打开
         let ws = temp_dir("chain");
@@ -2907,7 +3457,7 @@ mod tests {
             |app| {
                 app.service_layer
                     .tree_view()
-                    .is_some_and(|t| t.tree.projects.iter().any(|p| p.root == project_dir))
+                    .is_some_and(|t| t.tree().projects.iter().any(|p| p.root == project_dir))
             },
             "add-solution 落定",
         );
@@ -2961,18 +3511,6 @@ mod tests {
             "状态栏显示 project root (cwd), 实际: {texts:?}"
         );
 
-        // 门控: Starting/Running 的会话挡住切换
-        app_entity.update(cx, |app, cx| app.request_workspace_open(true, cx));
-        cx.run_until_parked();
-        cx.update(|cx| {
-            let app = app_entity.read(cx);
-            assert!(
-                app.notice.as_deref().is_some_and(|n| n.contains("still active")),
-                "活动会话拦截切换 (spec)"
-            );
-            assert_eq!(app.workspace.as_ref().unwrap().path, ws, "工作区不变");
-        });
-
         let _ = fs::remove_dir_all(&stub_dir);
     }
 
@@ -2983,11 +3521,11 @@ mod tests {
     #[gpui_kit::test]
     fn control_failure_feedback_covers_delta_scenarios(cx: &mut TestAppContext) {
         use agent_service::contract::SessionId;
-        use crate::sidebar::SidebarEvent;
+        use crate::solution_overview::SolutionOverviewEvent;
         use std::time::{Duration, Instant};
 
         let history = fresh_history_path();
-        let (handle, app_entity) = open_app_with_history(cx, history);
+        let (handle, app_entity) = open_app(cx, history, None);
         app_entity.update(cx, |app, _cx| {
             inject_test_workspace(app, "delta-fail");
         });
@@ -3025,7 +3563,7 @@ mod tests {
         cx.update_window(handle, |_, window, cx| {
             app_entity.update(cx, |app, cx| {
                 app.notice = None;
-                app.on_sidebar_event(SidebarEvent::SelectAgent(SessionId(9999)), window, cx);
+                app.on_solution_overview_event(SolutionOverviewEvent::SelectAgent(SessionId(9999)), window, cx);
             });
         })
         .expect("update window");
@@ -3096,7 +3634,7 @@ mod tests {
         use agent_service::contract::KIND_INPUT_KEY;
 
         let history = fresh_history_path();
-        let (handle, app_entity) = open_app_with_history(cx, history);
+        let (handle, app_entity) = open_app(cx, history, None);
         app_entity.update(cx, |app, _cx| {
             inject_test_workspace(app, "envelope");
         });
@@ -3138,13 +3676,13 @@ mod tests {
         let _ = fs::remove_dir_all(&ws_path);
     }
 
-    // ===== 4.1: asset_manager 注册接线 =====
+    // ===== 4.1: 资产注册接线（现走总线 → 镜像）=====
 
     /// 打开工作区 → 项目全量注册落树 (commit_open 钩子)。
     #[gpui_kit::test]
     fn workspace_open_registers_projects_into_manager(cx: &mut TestAppContext) {
         let history = fresh_history_path();
-        let (_handle, app_entity) = open_app_with_history(cx, history);
+        let (_handle, app_entity) = open_app(cx, history, None);
         let ws = temp_dir("reg-open");
         let project_dir = ws.join("foo");
         fs::create_dir_all(&project_dir).unwrap();
@@ -3160,10 +3698,15 @@ mod tests {
         .unwrap();
 
         app_entity.update(cx, |app, cx| app.begin_open(ws.clone(), cx));
-        cx.run_until_parked();
+        wait_asset_settled(
+            cx,
+            &app_entity,
+            |state| matches!(state, AssetState::Forest { .. }),
+            "workspace 打开后注册落树",
+        );
         cx.update(|cx| {
             let app = app_entity.read(cx);
-            let view = app.asset_manager.read(cx).state();
+            let view = asset_state(app);
             let AssetState::Forest { nodes, .. } = &view else {
                 panic!("应注册落树, got {view:?}")
             };
@@ -3175,10 +3718,10 @@ mod tests {
 
     // ===== change solution-service 2.3: 三个 load 边界的错误契约 =====
 
-    /// 启动 restore 边界 (spec: Solution load failures): corrupt solutions
+    /// 启动边界 (spec: Solution load failures): corrupt solutions
     /// → open_failure + 工作区不打开。
     #[gpui_kit::test]
-    fn startup_restore_load_failure_shows_error_and_no_workspace(cx: &mut TestAppContext) {
+    fn startup_load_failure_shows_error_and_no_workspace(cx: &mut TestAppContext) {
         let history = fresh_history_path();
         let ws = temp_dir("load-fail-startup");
         fs::create_dir_all(&ws).unwrap();
@@ -3189,7 +3732,7 @@ mod tests {
             h.push(ws.clone());
             h.save_at(&history).unwrap();
         }
-        let (_handle, app_entity) = open_app_with_history(cx, history);
+        let (_handle, app_entity) = open_app(cx, history, Some(ws));
         wait_startup_settled(
             cx,
             &app_entity,
@@ -3213,7 +3756,7 @@ mod tests {
     #[gpui_kit::test]
     fn switch_load_failure_shows_error_and_no_workspace(cx: &mut TestAppContext) {
         let history = fresh_history_path();
-        let (_handle, app_entity) = open_app_with_history(cx, history);
+        let (_handle, app_entity) = open_app(cx, history, None);
         let ws = temp_dir("load-fail-switch");
         fs::create_dir_all(&ws).unwrap();
         project_model::create_workspace_files(&ws).unwrap();
@@ -3248,7 +3791,7 @@ mod tests {
     #[gpui_kit::test]
     fn reload_failure_keeps_previous_workspace_without_partial(cx: &mut TestAppContext) {
         let history = fresh_history_path();
-        let (_handle, app_entity) = open_app_with_history(cx, history);
+        let (_handle, app_entity) = open_app(cx, history, None);
         let ws = temp_dir("load-fail-reload");
         let foo = ws.join("foo");
         fs::create_dir_all(&foo).unwrap();
@@ -3268,7 +3811,7 @@ mod tests {
         cx.update(|cx| {
             let app = app_entity.read(cx);
             assert_eq!(
-                app.service_layer.tree_view().unwrap().tree.projects.len(),
+                app.service_layer.tree_view().unwrap().tree().projects.len(),
                 1
             );
         });
@@ -3305,7 +3848,7 @@ mod tests {
                 .expect("旧工作区保留 (失败不缓存部分树)");
             let t = app.service_layer.tree_view().expect("旧镜像保留");
             assert_eq!(
-                t.tree.projects.len(),
+                t.tree().projects.len(),
                 1,
                 "旧状态原样保留 — 无部分树 (不 2 不 0)"
             );
@@ -3317,7 +3860,7 @@ mod tests {
     #[gpui_kit::test]
     fn add_solution_registers_project_incrementally(cx: &mut TestAppContext) {
         let history = fresh_history_path();
-        let (_handle, app_entity) = open_app_with_history(cx, history);
+        let (_handle, app_entity) = open_app(cx, history, None);
         let ws = temp_dir("reg-add");
         project_model::create_workspace_files(&ws).unwrap();
         app_entity.update(cx, |app, cx| app.begin_open(ws.clone(), cx));
@@ -3325,7 +3868,7 @@ mod tests {
         // 零 solution → 空视图
         cx.update(|cx| {
             let app = app_entity.read(cx);
-            assert_eq!(app.asset_manager.read(cx).state(), AssetState::Empty);
+            assert_eq!(asset_state(app), AssetState::Empty);
         });
 
         let pdir = ws.join("bar");
@@ -3339,14 +3882,20 @@ mod tests {
             |app| {
                 app.service_layer
                     .tree_view()
-                    .is_some_and(|t| t.tree.projects.iter().any(|p| p.root == pdir))
+                    .is_some_and(|t| t.tree().projects.iter().any(|p| p.root == pdir))
             },
             "create 落定",
         );
-        cx.run_until_parked(); // 注册枚举异步落地
+        // 注册与枚举走总线 → 泵到镜像真的落树 (旧 manager 是同步的)
+        wait_asset_settled(
+            cx,
+            &app_entity,
+            |state| matches!(state, AssetState::Forest { .. }),
+            "增量注册后落树",
+        );
         cx.update(|cx| {
             let app = app_entity.read(cx);
-            let view = app.asset_manager.read(cx).state();
+            let view = asset_state(app);
             let AssetState::Forest { nodes, .. } = &view else {
                 panic!("增量注册后应落树, got {view:?}")
             };
@@ -3360,7 +3909,7 @@ mod tests {
     #[gpui_kit::test]
     fn switching_workspace_replaces_registration(cx: &mut TestAppContext) {
         let history = fresh_history_path();
-        let (_handle, app_entity) = open_app_with_history(cx, history);
+        let (_handle, app_entity) = open_app(cx, history, None);
         let ws1 = temp_dir("reg-switch-1");
         let one = ws1.join("one");
         fs::create_dir_all(&one).unwrap();
@@ -3381,21 +3930,33 @@ mod tests {
         .unwrap();
 
         app_entity.update(cx, |app, cx| app.begin_open(ws1, cx));
-        cx.run_until_parked();
+        wait_asset_settled(
+            cx,
+            &app_entity,
+            |state| matches!(state, AssetState::Forest { nodes } if nodes.iter().any(|n| n.id == project_id(&one))),
+            "ws1 落树",
+        );
         cx.update(|cx| {
             let app = app_entity.read(cx);
-            let AssetState::Forest { nodes, .. } = app.asset_manager.read(cx).state() else {
+            let AssetState::Forest { nodes, .. } = asset_state(app) else {
                 panic!("ws1 应落树")
             };
             assert_eq!(nodes[0].id, project_id(&one));
         });
 
         app_entity.update(cx, |app, cx| app.begin_open(ws2.clone(), cx));
-        cx.run_until_parked();
+        // 等「只剩 ws2 的注册」—— 仅等 Forest 会被 ws1 的旧树满足
+        wait_asset_settled(
+            cx,
+            &app_entity,
+            |state| matches!(state, AssetState::Forest { nodes }
+                if nodes.len() == 1 && nodes[0].id == project_id(&two)),
+            "ws2 替换落树",
+        );
         cx.update(|cx| {
             let app = app_entity.read(cx);
             assert_eq!(app.workspace.as_ref().unwrap().path, ws2);
-            let AssetState::Forest { nodes, .. } = app.asset_manager.read(cx).state() else {
+            let AssetState::Forest { nodes, .. } = asset_state(app) else {
                 panic!("ws2 应落树")
             };
             assert_eq!(nodes.len(), 1, "只剩 ws2 的注册");

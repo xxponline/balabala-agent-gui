@@ -20,7 +20,7 @@ use gpui_kit::{
 };
 
 use crate::app::TerminalApp;
-use crate::assets::AssetKind;
+use asset_service::contract::AssetKind;
 use crate::debug::panel::DebugSectionPanel;
 use crate::debug::{DebugSection, register};
 use crate::property_detail_manager::OpenObject;
@@ -64,7 +64,7 @@ fn open_app(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<TerminalApp>) {
                 ..Default::default()
             },
             cx,
-            |window, cx| cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动")),
+            |window, cx| cx.new(|cx| TerminalApp::new(window, cx, None).expect("app 启动")),
         )
         .expect("open test window")
     });

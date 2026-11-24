@@ -75,7 +75,7 @@ mod tests {
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
-    /// 每测试独立临时目录（沿用 asset_manager 的 temp_root 形状）。
+    /// 每测试独立临时目录（进程 id 隔离, 形状沿用历史 testkit）。
     pub fn temp_root(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "smf-scan-{tag}-{}-{}",

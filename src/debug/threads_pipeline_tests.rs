@@ -71,7 +71,7 @@ fn open_app(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<TerminalApp>) {
                 ..Default::default()
             },
             cx,
-            |window, cx| cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动")),
+            |window, cx| cx.new(|cx| TerminalApp::new(window, cx, None).expect("app 启动")),
         )
         .expect("open test window")
     });

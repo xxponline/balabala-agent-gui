@@ -12,10 +12,13 @@ menu when its content changes.
 ### Requirement: Application menu bar is always present
 
 The application SHALL install an application menu bar at startup in all build
-profiles. On platforms with a native application menu bar the menu SHALL be
-rendered by the operating system; on other platforms the menu bar SHALL be
-rendered inside the application window above the dock layout. The menu bar
-SHALL provide at least one menu at all times.
+profiles, including while the Launcher window is the only window open: during
+that phase at least one menu SHALL be present, and menus whose actions depend
+on the main window's application state SHALL be added once that state exists.
+On platforms with a native application menu bar the menu SHALL be rendered by
+the operating system; on other platforms the menu bar SHALL be rendered
+inside the application window above the dock layout. The menu bar SHALL
+provide at least one menu at all times.
 
 #### Scenario: Menu bar exists in release builds
 
@@ -27,6 +30,12 @@ SHALL provide at least one menu at all times.
 - **WHEN** the user runs a debug build of the application
 - **THEN** the application menu bar is present, including the Debug menu
 
+#### Scenario: Menu bar exists while the Launcher is open
+
+- **WHEN** the application is sitting at the Launcher with no workspace
+  chosen
+- **THEN** the application menu bar is present with at least one menu, and no
+  menu entry depends on main-window state that does not yet exist
 ### Requirement: Standard menus carry existing actions
 
 The menu bar SHALL include an Edit menu whose Copy item dispatches the

@@ -25,7 +25,7 @@ fn open_app(cx: &mut TestAppContext) -> (AnyWindowHandle, gpui_kit::Entity<Termi
                 ..Default::default()
             },
             cx,
-            |window, cx| cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动")),
+            |window, cx| cx.new(|cx| TerminalApp::new(window, cx, None).expect("app 启动")),
         )
         .expect("open test window")
     });
@@ -698,10 +698,11 @@ fn focus_outside_console_does_not_disable_copy(cx: &mut TestAppContext) {
     render(handle, cx);
     assert!(!copy_disabled(cx), "前置: 有选区 + 焦点在 console, Copy 应可用");
 
-    // 焦点移至 sidebar
-    let sidebar_focus = cx.update(|cx| app.read(cx).sidebar.read(cx).focus_handle(cx));
-    cx.update_window(handle, |_, window, cx| sidebar_focus.focus(window, cx))
-        .expect("focus sidebar");
+    // 焦点移至 solution-overview 面板 (原 sidebar, change solution-overview 5.1 改名)
+    let overview_focus =
+        cx.update(|cx| app.read(cx).solution_overview.read(cx).focus_handle(cx));
+    cx.update_window(handle, |_, window, cx| overview_focus.focus(window, cx))
+        .expect("focus solution-overview");
     render(handle, cx);
 
     // 反向对照: 动态可用性路径此刻报不可用 — 证明下面的断言非空转

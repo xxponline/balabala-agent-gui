@@ -15,7 +15,10 @@ pub mod valid_checker;
 mod testkit;
 
 pub use contract::{
-    LoadError, OpError, ProjectDesc, ProjectTree, SolutionItem, TreeSnapshot,
+    ActionDesc, ActionInvoke, ExecutedBy, LoadError, OpError, ProjectDesc, ProjectNode,
+    ProjectTree, SolutionItem, SolutionNode, TreeSnapshot, ACTION_CONFIGURE_GIT,
+    ACTION_CONFIGURE_REGISTER, ACTION_CREATE, SOLUTION_NODE_PREFIX, configure_action_args,
+    parse_solution_node, solution_actions, solution_node_id,
 };
 /// 幂等工具 crate 根导出（design D6: View/Server 共用同一实现）。
 pub use valid_checker::{configure_is_noop, create_is_noop};

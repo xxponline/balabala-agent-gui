@@ -23,6 +23,11 @@ pub struct Workspace {
     /// 折叠的 Project 行 (易失, 不持久化 — 对齐"折叠态不持久化"立场;
     /// 纯 UI 层状态, 留本地 — 定案 2026-11-23)。
     pub collapsed_projects: HashSet<PathBuf>,
+    /// 折叠的 Solution 行 (同上: 易失、不持久化)。
+    ///
+    /// 键 = `solution://<path>` 节点 id (change solution-overview D2 —
+    /// 与 project 行的裸路径键不同命名空间, 不会撞)。
+    pub collapsed_solutions: HashSet<String>,
 }
 
 impl Workspace {
@@ -30,19 +35,7 @@ impl Workspace {
         Self {
             path,
             collapsed_projects: HashSet::new(),
+            collapsed_solutions: HashSet::new(),
         }
-    }
-
-    /// 行内短名: 路径末段 (e.g. "foo" for "/Users/me/code/foo")。
-    pub fn display_name(&self) -> &str {
-        self.path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
-    }
-
-    /// tooltip 完整路径。
-    pub fn full_path_str(&self) -> String {
-        self.path.to_string_lossy().into_owned()
     }
 }

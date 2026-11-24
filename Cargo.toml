@@ -30,6 +30,9 @@ service-manager = { path = "crates/service-manager" }
 agent-service = { path = "crates/agent-service" }
 # change solution-service task 2.2: GUI -> solution-service (design D1/D7)
 solution-service = { path = "crates/solution-service" }
+# change asset-service task 2.2: GUI -> asset-service —— 资产枚举/过滤域
+# 已迁入, GUI 侧 Project 构建 filter 集并注入 Module (design D1/D3)
+asset-service = { path = "crates/asset-service" }
 
 [dev-dependencies]
 # 仅测试构建启用 (resolver 不会把 dev 特性并入 cargo build)：

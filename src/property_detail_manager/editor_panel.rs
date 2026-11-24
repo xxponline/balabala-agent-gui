@@ -19,7 +19,7 @@ use gpui_kit::{
 
 use crate::app::TerminalApp;
 use crate::property_detail_manager::{OpenHandler, OpenObject};
-use crate::assets::AssetKind;
+use asset_service::contract::AssetKind;
 use gpui_kit::component::dock::BasePanel;
 use gpui_kit::component::dock::Panel as ComponentPanel;
 

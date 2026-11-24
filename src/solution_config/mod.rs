@@ -62,7 +62,7 @@ impl Prechecks {
         let unique = not_empty
             && !tree.is_some_and(|t| {
                 solution_service::create_is_noop(&t.solutions, p)
-                    || t.tree.projects.iter().any(|proj| proj.root == p)
+                    || t.tree().projects.iter().any(|proj| proj.root == p)
             });
         let existing_dir = not_empty && std::fs::metadata(p).is_ok_and(|m| m.is_dir());
         Self {
@@ -242,7 +242,7 @@ impl Render for SolutionConfigPanel {
             format!("{label}: {}", status(ok))
         };
         // child 才是绘制, test_text 只是记录 (texts() 只收录 test_text) —
-        // 双挂: 真机有字 + 测试可断言 (sidebar 同款; 只挂 test_text 会
+        // 双挂: 真机有字 + 测试可断言 (solution-overview 同款; 只挂 test_text 会
         // 变空壳: 2026-11-23 headed 冒烟实测按钮无字)
         let row_empty = row("path not empty", pre.not_empty);
         let row_uniq = row("unique solution", pre.unique);
@@ -325,6 +325,11 @@ impl Render for SolutionConfigPanel {
                                     .and_then(|app| app.read(cx).sol_config_error.clone())
                                     .map(|err| {
                                         div()
+                                            // 观测锚点: 行内错误可见性按 **id**
+                                            // 断言, 不按文案 (design D7 — label
+                                            // 只是显示, 文案匹配是同一个坏味道)
+                                            .id("solution-config-error")
+                                            .test_support()
                                             .text_xs()
                                             .text_color(theme_danger)
                                             .child(div().test_text(err.clone()))

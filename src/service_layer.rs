@@ -22,15 +22,38 @@ use service_manager::{
 };
 // change solution-service task 2.2: Solution/Project 域服务接入（design D1）。
 use solution_service::contract::{
-    OpError as SolOpError, OpResult as SolOpResult, SolutionContract, TreeChanged as SolTreeChanged,
-    TreeSnapshot, WatchReq as SolWatchReq, KIND_LOAD, KIND_OP_REPLY as KIND_SOLUTION_REPLY,
+    ActionInvoke, OpError as SolOpError, OpResult as SolOpResult, SolutionContract,
+    TreeChanged as SolTreeChanged, TreeSnapshot, WatchReq as SolWatchReq, KIND_ACTION as KIND_SOL_ACTION,
+    KIND_LOAD, KIND_OP_REPLY as KIND_SOLUTION_REPLY,
     KIND_TREE_CHANGED as KIND_SOLUTION_CHANGED, KIND_WATCH as KIND_SOLUTION_WATCH,
 };
 use solution_service::service::solution_service_factory;
+// change asset-service task 3.4: 右槽资产域服务 (design D1)。
+use asset_service::contract::{
+    AssetContract, AssetRegistration, RefreshReq as AssetRefreshReq,
+    TreeChanged as AstTreeChanged, TreeSnapshot as AstTreeSnapshot,
+    WatchReq as AssetWatchReq, KIND_REFRESH as KIND_ASSET_REFRESH,
+    KIND_ACTION as KIND_ASSET_ACTION, KIND_REGISTER as KIND_ASSET_REGISTER, KIND_TREE_CHANGED as KIND_ASSET_CHANGED,
+    KIND_WATCH as KIND_ASSET_WATCH,
+};
+use asset_service::service::asset_service_factory;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
+
+/// 入失败 notice 队列 (design D7: 路由键 = action_id, 文案只显示)。
+///
+/// **自由函数而非 `&mut self` 方法**：调用点在 `pump` 的
+/// `self.listener.drain()` 循环内 — `&mut self` 方法会与 listener 的可变
+/// 借用冲突；借用**单个字段** `notices` 则与 `listener` 不相交，合法。
+fn push_notice(
+    notices: &mut Vec<(Option<String>, String)>,
+    action: Option<&str>,
+    text: String,
+) {
+    notices.push((action.map(str::to_string), text));
+}
 
 /// 控制操作类别（回执 downcast 分派；task 3.1）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -144,19 +167,23 @@ pub struct ServiceLayer {
     /// 单槽"最近翻转"会被后到的无关实例事件踩掉（实测: agent 启动事件迟到
     /// 覆盖 core 的 Offline）— 断言/消费方一律按实例查表。
     pub states: HashMap<InstanceId, ServiceState>,
-    /// `sessions_changed` 投影镜像（task 3.1；sidebar/active 渲染源）。
+    /// `sessions_changed` 投影镜像（task 3.1；solution-overview/active 渲染源）。
     pub sessions_view: Option<SessionView>,
     /// 待消费帧（task 3.1；app 泵转发给 AgentTerminal.feed）。
     frames: Vec<FrameBytes>,
-    /// 控制失败 notice 队列（spec delta: 点名失败操作）。
-    notices: Vec<String>,
+    /// 失败 notice 队列（spec delta: 点名失败操作）。
+    ///
+    /// **(action_id, 显示文案)** — 路由用前者、显示用后者 (design D7)。
+    /// `action = None` = 非动作触发的通用通知（agent 控制回执、无配对的
+    /// route error）。
+    notices: Vec<(Option<String>, String)>,
     /// 已发控制台账: corr -> (操作, 标签)（回执/route_error 配对）。
     pending_ops: HashMap<Corr, (CtrlOp, &'static str)>,
     /// 控制成功回执（task 3.2: app 据此切 console tab — 成功才切，spec delta）。
     successes: Vec<CtrlOp>,
-    /// solution 操作成功回执标签（非 load 的 Ok 配对；表单签自关消费 —
-    /// solution-config-tab 3.1）。
-    sol_successes: Vec<&'static str>,
+    /// solution 操作成功回执的 **action_id**（非 load 的 Ok 配对；表单签
+    /// 自关消费 — design D7: 路由按 id 不按文案）。
+    sol_successes: Vec<String>,
     /// watch 握手已发出（bootstrap 时 agent 尚 loading 会被 fail-fast 拒 →
     /// 首个 Available 事件到达时补发，task 3.1）。
     watch_sent: bool,
@@ -165,16 +192,45 @@ pub struct ServiceLayer {
     agent_ready: bool,
     /// solution 域服务实例 id（change solution-service task 2.2；树路由目标）。
     pub solution_id: InstanceId,
+    /// 资产域服务实例 id（change asset-service task 3.4；注册/刷新/状态
+    /// 路由目标 —— 见组 4 的 `asset.register`）。
+    #[allow(dead_code)] // 组 4 接线 `asset.register` 后读取（同 agent_id 先例）
+    pub asset_id: InstanceId,
+    /// asset watch 握手已发出（同 agent/solution 的 loading 规避时序；
+    /// 缺它则服务 `emit` 无订阅者 ⇒ 镜像永不更新 —— change asset-service 4.3）。
+    asset_watch_sent: bool,
+    /// 测试观测面：`asset.register` 发送次数 —— 用于钉死
+    /// 「交树投影未变 ⇒ 零注册」的 O(1) 守卫（spec: Data-change
+    /// notification is O(1) … no per-node traversal）。
+    #[cfg(test)]
+    pub(crate) asset_register_sends: usize,
+    /// 测试观测面：`asset.refresh` 发送次数（⟳ 在途是否仍发 = spec
+    /// *Explicit refresh still restarts* 的 GUI 侧判据）。
+    #[cfg(test)]
+    pub(crate) asset_refresh_sends: usize,
+    /// 测试观测面：`asset.action` 发送次数。
+    ///
+    /// asset 的两个动作全部 `ExecutedBy::View` ⇒ 视图本地执行、**不发
+    /// invoke** ⇒ 本计数恒 0（task 6.2 的不变量）。[`Self::submit_asset_action`]
+    /// 是服务侧动作未来的**唯一写入口** —— 谁加 invoke 谁就得递增它，
+    /// 于是那条断言会真的报警。
+    #[cfg(test)]
+    pub(crate) asset_action_sends: usize,
     /// 项目树镜像（`tree_changed` 快照 + 操作回执自带快照；视图/交树渲染源）。
     tree_view: Option<TreeSnapshot>,
+    /// **资产视图镜像**（change asset-service task 4.2）：`asset.tree_changed`
+    /// 快照 —— `AssetOverview` 的渲染源（服务拥有状态, GUI 只读镜像, 同构
+    /// solution 的 `tree_view`）。
+    asset_view: Option<AstTreeSnapshot>,
     /// 测试注入覆盖 (优先于真实镜像 — 无头测试不经真实 load 时的视图
     /// 数据源; 服务首推空快照不得踩掉注入值)。
     #[cfg(test)]
     tree_view_override: Option<TreeSnapshot>,
     /// solution watch 握手已发出（同 agent 的 loading 规避时序，task 2.2）。
     solution_watch_sent: bool,
-    /// solution 操作台账: corr -> 标签（回执/route_error 配对）。
-    pending_sol_ops: HashMap<Corr, &'static str>,
+    /// solution 操作台账: corr -> (action_id, 标签)（回执/route_error 配对）。
+    /// design D7: **id 用于路由, label 只进显示文案** — 改文案不得改行为。
+    pending_sol_ops: HashMap<Corr, (String, String)>,
     /// solution load 台账: corr 集合（回执进 `load_results` 供打开链路拉取）。
     pending_loads: HashSet<Corr>,
     /// load 回执队列: corr -> 回执（打开链路轮询消费——pull 模式纪律：
@@ -231,6 +287,19 @@ impl ServiceLayer {
         let solution_id = manager
             .load(&"solution".into())
             .map_err(|e| format!("load solution: {e}"))?;
+        // change asset-service task 3.4: 资产域服务 (design D1)。
+        // 注册/枚举/三态归服务端, GUI 只持镜像 (design D2)。
+        manager.register_contract("asset", ContractId::of::<AssetContract>());
+        manager
+            .register_internal(
+                "asset",
+                asset_service_factory,
+                ContractId::of::<AssetContract>(),
+            )
+            .map_err(|e| format!("register asset: {e}"))?;
+        let asset_id = manager
+            .load(&"asset".into())
+            .map_err(|e| format!("load asset: {e}"))?;
         // GUI = 普通参与者: 自己的 mailbox + 订阅 (= 往路由表加规则, D7/D9)
         // watch 握手不在这里发: 刚 load 的实例仍 loading, tell 会被 fail-fast
         // 拒 (target not available) — 由 pump 见 agent Available 事件时补发。
@@ -238,6 +307,7 @@ impl ServiceLayer {
         manager.subscribe_state(core_id, &listener);
         manager.subscribe_state(agent_id, &listener);
         manager.subscribe_state(solution_id, &listener);
+        manager.subscribe_state(asset_id, &listener);
         // 订阅时序补给 (竞态修复): driver 的 InitOk 翻转是异步任务, 可能抢在
         // subscribe_state 之前发布 — 订阅表还空, 启动状态事件被静默丢弃
         // (实测: 高负载并行下 watch 握手因此断链, 会话投影永不产生)。
@@ -247,6 +317,7 @@ impl ServiceLayer {
             (core_id, "core.fake"),
             (agent_id, "agent"),
             (solution_id, "solution"),
+            (asset_id, "asset"),
         ] {
             let Some(state) = manager.supervisor().state_of(id) else {
                 continue; // 未装载: 不可能 (上文刚 load)
@@ -281,9 +352,18 @@ impl ServiceLayer {
             successes: Vec::new(),
             sol_successes: Vec::new(),
             watch_sent: false,
+            asset_watch_sent: false,
+            #[cfg(test)]
+            asset_register_sends: 0,
+            #[cfg(test)]
+            asset_refresh_sends: 0,
+            #[cfg(test)]
+            asset_action_sends: 0,
             agent_ready: false,
             solution_id,
+            asset_id,
             tree_view: None,
+            asset_view: None,
             #[cfg(test)]
             tree_view_override: None,
             solution_watch_sent: false,
@@ -340,6 +420,21 @@ impl ServiceLayer {
                                 self.solution_watch_sent = true;
                             }
                         }
+                        // change asset-service 4.3: asset watch 握手同款时序
+                        if !self.asset_watch_sent
+                            && change.instance == self.asset_id
+                            && change.to == ServiceState::Available
+                        {
+                            let watch = Envelope::new(
+                                Route::Instance(self.asset_id),
+                                watch_from.clone(),
+                                KIND_ASSET_WATCH,
+                                Payload::new(AssetWatchReq),
+                            );
+                            if self.manager.tell(watch).is_ok() {
+                                self.asset_watch_sent = true;
+                            }
+                        }
                     }
                     self.events_seen += 1;
                 }
@@ -352,7 +447,7 @@ impl ServiceLayer {
                         .unwrap_or_else(|_| "route error".to_string());
                     match env.corr.and_then(|c| self.pending_ops.remove(&c)) {
                         Some((_, label)) => {
-                            self.notices.push(format!("{label}失败: {msg}"));
+                            push_notice(&mut self.notices, None, format!("{label}失败: {msg}"));
                         }
                         None => {
                             if let Some(c) = env.corr.filter(|c| self.pending_loads.remove(c)) {
@@ -364,7 +459,7 @@ impl ServiceLayer {
                                     ))),
                                 ));
                             } else {
-                                self.notices.push(format!("服务请求失败: {msg}"));
+                                push_notice(&mut self.notices, None, format!("服务请求失败: {msg}"));
                             }
                         }
                     }
@@ -392,7 +487,7 @@ impl ServiceLayer {
                             CtrlOp::Close => failed_of::<CloseOk>(&env),
                         };
                         match failed {
-                            Some(err) => self.notices.push(format!("{label}失败: {err}")),
+                            Some(err) => push_notice(&mut self.notices, None, format!("{label}失败: {err}")),
                             None => self.successes.push(op),
                         }
                     }
@@ -402,6 +497,13 @@ impl ServiceLayer {
                     self.events_seen += 1;
                     if let Ok(changed) = env.downcast::<SolTreeChanged>() {
                         self.tree_view = Some(changed.0.clone());
+                    }
+                }
+                // ---- change asset-service 4.2: 资产视图镜像 ----
+                KIND_ASSET_CHANGED => {
+                    self.events_seen += 1;
+                    if let Ok(changed) = env.downcast::<AstTreeChanged>() {
+                        self.asset_view = Some(changed.0.clone());
                     }
                 }
                 KIND_SOLUTION_REPLY => {
@@ -422,18 +524,22 @@ impl ServiceLayer {
                                     self.load_results.push((c, res));
                                 }
                             } else if let Err(e) = &res {
-                                if let Some(label) = paired {
-                                    self.notices.push(format!("{label}失败: {e}"));
+                                if let Some((action_id, label)) = &paired {
+                                    // 路由键 = action_id, label 只进文案 (D7)
+                                    push_notice(&mut self.notices, Some(action_id.as_str()), format!("{label}失败: {e}"));
                                 }
-                            } else if let Some(label) = paired {
-                                // 非 load 的 Ok 配对标签 → 成功队列
-                                // (表单签自关, solution-config-tab 3.1)
-                                self.sol_successes.push(label);
+                            } else if let Some((action_id, _)) = &paired {
+                                // 非 load 的 Ok 配对 → 成功队列 (表单签自关)
+                                self.sol_successes.push(action_id.clone());
                             }
                         }
                         Err(_) => {
-                            if let Some(label) = paired {
-                                self.notices.push(format!("{label}失败: 回执类型不匹配"));
+                            if let Some((action_id, label)) = &paired {
+                                push_notice(
+                                    &mut self.notices,
+                                    Some(action_id.as_str()),
+                                    format!("{label}失败: 回执类型不匹配"),
+                                );
                             }
                         }
                     }
@@ -462,20 +568,29 @@ impl ServiceLayer {
         Ok(corr)
     }
 
-    /// solution 操作 ask 通道（change solution-service 2.2；D6 约定同
-    /// `submit_control`——用户操作一律 ask）：回执/route_error 由 `pump`
-    /// 配对，失败入 notice；成功回执自带树快照进镜像。
-    #[allow(dead_code)] // app 控制链在 5.x 接线
-    pub fn submit_solution_op(
+    /// solution 动作 ask 通道（design D6 写入口单点 / D7 路由键）：
+    /// 统一发 `solution.action`，台账记 `(action_id, label)` — 回执配对后
+    /// **按 id 路由、label 只进显示文案**（改文案不得改行为）。
+    /// 回执/route_error 由 `pump` 配对，失败入 notice；成功回执自带树快照
+    /// 进镜像。
+    pub fn submit_action(
         &mut self,
-        kind: &'static str,
-        payload: Payload,
-        label: &'static str,
+        action_id: &str,
+        node: Option<String>,
+        args: Option<Payload>,
+        label: &str,
     ) -> Result<Corr, service_manager::RouteError> {
-        let corr = self
-            .listener
-            .submit(Route::Service("solution".into()), kind, payload)?;
-        self.pending_sol_ops.insert(corr, label);
+        let corr = self.listener.submit(
+            Route::Service("solution".into()),
+            KIND_SOL_ACTION,
+            Payload::new(ActionInvoke {
+                node,
+                action_id: action_id.to_string(),
+                args,
+            }),
+        )?;
+        self.pending_sol_ops
+            .insert(corr, (action_id.to_string(), label.to_string()));
         Ok(corr)
     }
 
@@ -488,6 +603,71 @@ impl ServiceLayer {
         }
         self.tree_view.as_ref()
     }
+
+    /// **资产视图镜像**（change asset-service task 4.2）——
+    /// `AssetOverview` 的唯一渲染源（服务发布, 本层只收不造）。
+    #[allow(dead_code)] // 任务 4.4 面板改读镜像后消费
+    pub fn asset_view(&self) -> Option<&AstTreeSnapshot> {
+        self.asset_view.as_ref()
+    }
+
+    /// 全量注册 ask（change asset-service 4.3）—— 取代对 `AssetManager`
+    /// 的直调。**提交失败（服务尚未 Available）返回 Err 且不记状态**，
+    /// 调用方下次 pump 重试（`sync_asset_registration` 的 `last_handoff`
+    /// 守卫按"成功才记"实现 ⇒ 天然自愈）。
+    pub fn submit_asset_register(
+        &mut self,
+        reg: AssetRegistration,
+    ) -> Result<Corr, service_manager::RouteError> {
+        #[cfg(test)]
+        {
+            self.asset_register_sends += 1;
+        }
+        self.listener.submit(
+            Route::Service("asset".into()),
+            KIND_ASSET_REGISTER,
+            Payload::new(reg),
+        )
+    }
+
+    /// 显式刷新 ask（⟳；supersede 在途、重读 filter 源）。
+    pub fn submit_asset_refresh(
+        &mut self,
+    ) -> Result<Corr, service_manager::RouteError> {
+        #[cfg(test)]
+        {
+            self.asset_refresh_sends += 1;
+        }
+        self.listener.submit(
+            Route::Service("asset".into()),
+            KIND_ASSET_REFRESH,
+            Payload::new(AssetRefreshReq),
+        )
+    }
+
+    /// 服务侧资产动作的 ask 通道（`KIND_ASSET_ACTION`）。
+    ///
+    /// **当前无调用方**：asset 的两个动作都标 `ExecutedBy::View`，视图
+    /// 本地执行即可（design D5）。保留为未来服务侧动作的**唯一写入口**，
+    /// 好让 `asset_action_sends == 0` 这条不变量有确定的递增点。
+    #[allow(dead_code)] // 服务侧资产动作落地后由视图调用
+    pub fn submit_asset_action(
+        &mut self,
+        node: Option<String>,
+        action_id: String,
+    ) -> Result<Corr, service_manager::RouteError> {
+        #[cfg(test)]
+        {
+            self.asset_action_sends += 1;
+        }
+        self.listener.submit(
+            Route::Service("asset".into()),
+            KIND_ASSET_ACTION,
+            Payload::new(asset_service::contract::ActionInvoke { node, action_id }),
+        )
+    }
+
+
 
     /// 测试缝: 注入项目树镜像 (无头测试不经真实 load 时的视图数据源;
     /// 优先于真实镜像, 不被服务首推空快照踩掉)。
@@ -527,20 +707,23 @@ impl ServiceLayer {
         std::mem::take(&mut self.frames)
     }
 
-    /// 取走失败 notice（app 消费 → `app.notice`）。
+    /// 取走失败 notice `(action_id, 文案)`（app 消费 → `app.notice`;
+    /// action_id 供表单签行内错误路由 — design D7）。
     #[allow(dead_code)] // task 3.2 app.notice 接线
-    pub fn take_notices(&mut self) -> Vec<String> {
+    pub fn take_notices(&mut self) -> Vec<(Option<String>, String)> {
         std::mem::take(&mut self.notices)
     }
+
+
 
     /// 取走控制成功回执（app 据此切 console tab；失败已入 notice）。
     pub fn take_successes(&mut self) -> Vec<CtrlOp> {
         std::mem::take(&mut self.successes)
     }
 
-    /// 取走 solution 操作成功回执标签（表单签自关消费 —
-    /// solution-config-tab 3.1）。
-    pub fn take_sol_successes(&mut self) -> Vec<&'static str> {
+    /// 取走 solution 操作成功回执的 **action_id**（表单签自关消费 —
+    /// design D7: 按 id 配对, 不按 label 文案）。
+    pub fn take_sol_successes(&mut self) -> Vec<String> {
         std::mem::take(&mut self.sol_successes)
     }
 
@@ -549,8 +732,8 @@ impl ServiceLayer {
         std::mem::take(&mut self.agent_ready)
     }
 
-    /// 当前会话投影镜像（sidebar/active 渲染源）。
-    #[allow(dead_code)] // task 3.2 sidebar/active 接线
+    /// 当前会话投影镜像（solution-overview/active 渲染源）。
+    #[allow(dead_code)] // task 3.2 solution-overview/active 接线
     pub fn sessions_view(&self) -> Option<&SessionView> {
         self.sessions_view.as_ref()
     }
@@ -631,10 +814,11 @@ mod tests {
         let dir = temp_scan("boot");
         let mut layer = ServiceLayer::bootstrap(&dir).expect("bootstrap");
         assert!(layer.manager.has_service(&"core.fake".into()), "Catalog 登记");
+        assert!(layer.manager.has_service(&"asset".into()), "Catalog 登记 asset");
         assert_eq!(
             layer.manager.instance_count(),
-            3,
-            "core.fake + agent + solution 均已装载"
+            4,
+            "core.fake + agent + solution + asset 均已装载"
         );
 
         // init 完成 (loading → available 事件应达订阅者)
@@ -657,13 +841,145 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// change asset-service task 3.4: 资产域服务注册/装载 + 状态翻转到达
+    /// pump。（验证替代 `cargo run`：无头环境无法断言 GUI 内的 running。）
+    #[test]
+    fn asset_service_loads_and_reports_state() {
+        let dir = temp_scan("asset-boot");
+        let mut layer = ServiceLayer::bootstrap(&dir).expect("bootstrap");
+
+        assert!(layer.manager.has_service(&"asset".into()), "Catalog 登记 asset");
+        assert_eq!(
+            layer.manager.instance_count(),
+            4,
+            "core.fake + agent + solution + asset 均已装载"
+        );
+        assert!(
+            wait_until(
+                || {
+                    layer.pump();
+                    layer.states.get(&layer.asset_id) == Some(&ServiceState::Available)
+                },
+                Duration::from_secs(3)
+            ),
+            "asset 状态翻转经订阅到达 GUI mailbox: {:?}",
+            layer.states
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// change asset-service task 4.2: `asset.tree_changed` 收包 → 镜像可读
+    /// 且内容完整（**端到端**：真实服务真枚举、经 watch 推达）。
+    #[test]
+    fn asset_tree_changed_fills_the_mirror() {
+        use asset_service::contract::{
+            AssetRegistration, AssetState, ModuleRegistration, ProjectRegistration, WatchReq,
+            KIND_WATCH,
+        };
+
+        let dir = temp_scan("asset-mirror");
+        let proj = dir.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("main.rs"), "fn main() {}").unwrap();
+
+        let mut layer = ServiceLayer::bootstrap(&dir).expect("bootstrap");
+        assert!(
+            wait_until(
+                || {
+                    layer.pump();
+                    layer.states.get(&layer.asset_id) == Some(&ServiceState::Available)
+                },
+                Duration::from_secs(3)
+            ),
+            "asset 服务应可用"
+        );
+
+        // watch 握手（`from` = GUI mailbox ⇒ 服务记为订阅者）
+        let watch = Envelope::new(
+            Route::Instance(layer.asset_id),
+            layer.listener.address().clone(),
+            KIND_WATCH,
+            Payload::new(WatchReq),
+        );
+        layer.manager.tell(watch).expect("watch tell");
+
+        // 全量注册一个真实项目根
+        let reg = AssetRegistration {
+            workspace_dir: dir.clone(),
+            projects: vec![ProjectRegistration {
+                name: "proj".into(),
+                root: proj.clone(),
+                is_git: false,
+                // 纯结构 — 过滤集由服务按 is_git+root 现场供给 (design D3)
+                modules: vec![ModuleRegistration {
+                    name: "proj".into(),
+                    root: proj.clone(),
+                    children: Vec::new(),
+                }],
+            }],
+        };
+        layer
+            .listener
+            .submit(
+                Route::Service("asset".into()),
+                asset_service::contract::KIND_REGISTER,
+                Payload::new(reg),
+            )
+            .expect("register submit");
+
+        // 枚举落地 → tell → pump → 镜像
+        assert!(
+            wait_until(
+                || {
+                    layer.pump();
+                    matches!(
+                        layer.asset_view().map(|v| &v.state),
+                        Some(AssetState::Forest { .. })
+                    )
+                },
+                Duration::from_secs(5)
+            ),
+            "枚举落地后镜像应可读, 当前 = {:?}",
+            layer.asset_view().map(|v| &v.state)
+        );
+
+        let snap = layer.asset_view().expect("镜像存在");
+        match &snap.state {
+            AssetState::Forest { nodes } => {
+                assert_eq!(nodes.len(), 1, "根节点数 = 注册的项目数");
+                assert_eq!(nodes[0].label, "proj");
+                assert!(nodes[0].id.ends_with("proj"), "根 = 项目目录");
+                let mut found = false;
+                fn walk(n: &asset_service::contract::AssetNode, hit: &mut bool) {
+                    if n.label == "main.rs" {
+                        *hit = true;
+                    }
+                    for c in &n.children {
+                        walk(c, hit);
+                    }
+                }
+                for root_node in nodes {
+                    walk(root_node, &mut found);
+                }
+                assert!(
+                    found,
+                    "内容完整 — 枚举产物应含 main.rs, 实为 {:?}",
+                    nodes[0].children
+                );
+            }
+            other => panic!("应为 Forest, 实为 {other:?}"),
+        }
+        assert!(snap.generation >= 2, "失效 +1、落地 +1");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// change agent-service task 1.3: agent 薄服务注册/装载 + 状态事件到 pump。
     #[test]
     fn agent_service_loads_and_reports_state() {
         let dir = temp_scan("agent-boot");
         let mut layer = ServiceLayer::bootstrap(&dir).expect("bootstrap");
         assert!(layer.manager.has_service(&"agent".into()), "Catalog 登记 agent");
-        assert_eq!(layer.manager.instance_count(), 3, "core.fake + agent + solution");
+        assert_eq!(layer.manager.instance_count(), 4, "core.fake + agent + solution + asset");
         assert_ne!(layer.agent_id, layer.core_id, "实例 id 独立分配");
 
         // loading → available 翻转经订阅路由到达 GUI mailbox
@@ -687,7 +1003,7 @@ mod tests {
     #[test]
     fn solution_tree_changed_reaches_mirror() {
         use solution_service::contract::{
-            ConfigureReq, CreateReq, KIND_CONFIGURE, KIND_CREATE,
+            ConfigureReq, CreateReq, LoadReq, ACTION_CONFIGURE_REGISTER, ACTION_CREATE,
         };
 
         let dir = temp_scan("sol-mirror");
@@ -698,8 +1014,8 @@ mod tests {
         );
         assert_eq!(
             layer.manager.instance_count(),
-            3,
-            "core.fake + agent + solution"
+            4,
+            "core.fake + agent + solution + asset"
         );
 
         // solution Available + watch 握手 → 首推全量快照进镜像
@@ -715,16 +1031,33 @@ mod tests {
             layer.states
         );
 
+        // 绑定工作区 (design D5): create 的落盘目标来自 load 绑定,
+        // 不再随请求带 workspace_dir — 不先 load 就 create 会拿到
+        // "no workspace bound"。
+        let load_corr = layer
+            .submit_solution_load(Payload::new(LoadReq {
+                workspace_dir: dir.clone(),
+            }))
+            .expect("submit load");
+        assert!(
+            wait_until(
+                || {
+                    layer.pump();
+                    layer.take_load_result(load_corr).is_some()
+                },
+                Duration::from_secs(3)
+            ),
+            "load 落定 (绑定)"
+        );
+
         // create: 真实项目目录（simple item 的 path 必须存在）
         let proj = dir.join("proj");
         std::fs::create_dir_all(&proj).unwrap();
         layer
-            .submit_solution_op(
-                KIND_CREATE,
-                Payload::new(CreateReq {
-                    workspace_dir: dir.clone(),
-                    path: proj.clone(),
-                }),
+            .submit_action(
+                ACTION_CREATE,
+                None,
+                Some(Payload::new(CreateReq { path: proj.clone() })),
                 "创建 solution",
             )
             .expect("submit create");
@@ -732,14 +1065,14 @@ mod tests {
             wait_until(
                 || {
                     layer.pump();
-                    matches!(layer.tree_view, Some(ref t) if t.tree.projects.len() == 1)
+                    matches!(layer.tree_view, Some(ref t) if t.tree().projects.len() == 1)
                 },
                 Duration::from_secs(3)
             ),
             "create 后树变更通知到达且镜像更新"
         );
         assert_eq!(
-            layer.tree_view.as_ref().unwrap().handoff.projects.len(),
+            layer.tree_view.as_ref().unwrap().handoff().projects.len(),
             1,
             "默认双 true: 交树含新 project"
         );
@@ -747,14 +1080,14 @@ mod tests {
         // configure: 关注册 → handoff 收缩, 全量集保留 (spec: Asset
         // registration flag gates project handoff)
         layer
-            .submit_solution_op(
-                KIND_CONFIGURE,
-                Payload::new(ConfigureReq {
-                    workspace_dir: dir.clone(),
-                    solution_path: proj,
+            .submit_action(
+                ACTION_CONFIGURE_REGISTER,
+                // 目标单源 = node (design D4); 值在 args
+                Some(solution_service::solution_node_id(&proj)),
+                Some(Payload::new(ConfigureReq {
                     register_to_asset_manager: Some(false),
                     git_enabled: None,
-                }),
+                })),
                 "配置 solution",
             )
             .expect("submit configure");
@@ -764,7 +1097,7 @@ mod tests {
                     layer.pump();
                     matches!(
                         layer.tree_view,
-                        Some(ref t) if t.handoff.projects.is_empty() && t.tree.projects.len() == 1
+                        Some(ref t) if t.handoff().projects.is_empty() && t.tree().projects.len() == 1
                     )
                 },
                 Duration::from_secs(3)
@@ -868,11 +1201,11 @@ mod tests {
 
         let notices = layer.take_notices();
         assert!(
-            notices[0].contains("切换会话"),
+            notices[0].1.contains("切换会话"),
             "notice 点名操作: {notices:?}"
         );
         assert!(
-            notices[0].contains("no such session"),
+            notices[0].1.contains("no such session"),
             "携带服务错误文案: {notices:?}"
         );
 

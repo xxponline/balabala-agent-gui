@@ -2,22 +2,21 @@
 
 ## Purpose
 
-Owns the window's left and right dock slots: the left dock carries the sidebar
-and can be resized by dragging, while the right dock is a reservable panel slot
-that renders by default, can be resized, and can be closed — restored only by
-restarting the application — providing the layout contract the next feature
-module will fill.
+Owns the window's left and right dock slots: the left dock carries the
+solution-overview and can be resized by dragging, while the right dock is a
+reservable panel slot that renders by default, can be resized, and can be
+closed — restored only by restarting the application — providing the layout
+contract the next feature module will fill.
 
 ## Requirements
-
-
 
 ### Requirement: Left dock draggable resize
 
 The left dock SHALL be resizable by dragging its right edge, clamped to a safe
-minimum width and a maximum that keeps the center pane usable. The sidebar
-content SHALL reflow into the new width, and the terminal grid SHALL recompute
-its columns and rows from the changed available area in the same step.
+minimum width and a maximum that keeps the center pane usable. The
+solution-overview content SHALL reflow into the new width, and the terminal
+grid SHALL recompute its columns and rows from the changed available area in
+the same step.
 
 #### Scenario: Drag widens the sidebar
 
@@ -31,7 +30,7 @@ its columns and rows from the changed available area in the same step.
 ### Requirement: Left dock is not closable
 
 The system SHALL NOT offer any control that closes or hides the left dock, so
-the sidebar's controls (workspace switch entry, `[+ agent]`, close buttons)
+the left slot's controls (`[+ agent]`, close buttons, add-solution action)
 remain reachable at all times.
 
 #### Scenario: No close affordance on left dock
@@ -40,16 +39,16 @@ remain reachable at all times.
 - **THEN** no close or hide control is present for the left dock
 ### Requirement: Right dock renders by default
 
-On startup the right dock SHALL be visible and render the file tree panel: a
-header carrying the panel title, a refresh control, and a close button, plus
-a body area that shows the asset tree of registered projects or its empty
-state. The panel SHALL register through the dock's standard panel path so
-resize and close mechanics apply to it unchanged.
+On startup the right dock SHALL be visible and render the asset-overview
+panel: a header carrying the panel title, a refresh control, and a close
+button, plus a body area that shows the asset tree of registered projects or
+its empty state. The panel SHALL register through the dock's standard panel
+path so resize and close mechanics apply to it unchanged.
 
 #### Scenario: Right dock visible on startup
 
 - **WHEN** the application window opens for the first time in a session
-- **THEN** the right dock occupies its slot at the window's right edge showing the file tree panel
+- **THEN** the right dock occupies its slot at the window's right edge showing the asset-overview panel
 
 #### Scenario: Header chrome present
 
@@ -86,4 +85,4 @@ only by restarting the application.
 #### Scenario: Restart restores the right dock
 
 - **WHEN** the user closes the right dock and then restarts the application
-- **THEN** the right dock is visible again at its default width showing the file tree panel
+- **THEN** the right dock is visible again at its default width showing the asset-overview panel

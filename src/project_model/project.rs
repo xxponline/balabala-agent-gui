@@ -3,10 +3,10 @@
 //! `.gitignore`、构建 filter 集并注入枚举时现建的 Module。
 
 use std::fmt;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 
-use super::filter::{DotFilter, FileFilter, GitIgnoreFilter};
+use asset_service::contract::{ModuleRegistration, ProjectRegistration};
+use asset_service::enumerate::{Enumerator, EnumeratorOwner};
 
 /// 模块树节点。引用 (跨 module/project 的 DAG 边) 当前不产生
 /// (v1 simple 单节点输出), 结构位留给后续 solution 类型。
@@ -23,11 +23,6 @@ pub struct Module {
     pub root: PathBuf,
     /// 子模块 (树形; DAG 校验针对引用边, 见 `validate::check_dag`)。
     pub children: Vec<Module>,
-    /// 过滤集 (design D2 注入点): Project 枚举时构建 — 默认
-    /// [`DotFilter`] + 项目根 git 时的 [`GitIgnoreFilter`] (D8)。
-    /// `pub(super)`: project_model 子树内可见 (enumerate 消费),
-    /// 资产侧 (`crate::assets`) 不可见 — 注入只发生在构建期。
-    pub(super) filters: Vec<Arc<dyn FileFilter>>,
 }
 
 impl Module {
@@ -36,7 +31,6 @@ impl Module {
             name: name.into(),
             root,
             children: Vec::new(),
-            filters: Vec::new(),
         }
     }
 }
@@ -53,7 +47,7 @@ impl fmt::Debug for Module {
 
 /// 一个项目: 名字 + 根目录 + 模块树。
 ///
-/// 身份 = `root` 路径 (design D2: sidebar 事件载荷/会话挂载键)。
+/// 身份 = `root` 路径 (design D2: solution-overview 事件载荷/会话挂载键)。
 /// 会话命名 (`pi-N`) 真值在 AgentService (change agent-service 3.2,
 /// 需求归属 agent-shell spec) — model 层不持计数 (change solution-service
 /// 5.3 退役遗留锚点)。
@@ -101,34 +95,42 @@ impl Project {
         Self::from_root_with_git(desc.root.clone(), desc.is_git)
     }
 
-    /// 供给 filter 集 (design D8; spec: Filter provisioning from the
-    /// project root): 恒含默认 [`DotFilter`];仅当解析产出的 `is_git`
-    /// (root 是 git 目录 AND solution.git_enabled) 时读 `root/.gitignore`
-    /// 追加 [`GitIgnoreFilter`] — 非 git 标志不探测任何 ignore 文件,
-    /// 读失败 best-effort 跳过。
-    fn provision_filters(&self) -> Vec<Arc<dyn FileFilter>> {
-        let mut filters: Vec<Arc<dyn FileFilter>> = vec![Arc::new(DotFilter)];
-        if self.is_git
-            && let Ok(text) = std::fs::read_to_string(self.root.join(".gitignore"))
-        {
-            filters.push(Arc::new(GitIgnoreFilter::from_text(&text)));
+    /// `Project` → 注册 DTO（change asset-service design D3 修订, task 2.6）。
+    ///
+    /// **纯字段映射 —— 不读文件、不构造过滤集**。过滤集由服务在每次
+    /// 枚举时按 `is_git` + `root` 现场供给（`ProjectRegistration::
+    /// provision_filters`），因此 ⟳ 天然重读规则；DTO 里也就没有
+    /// `filters` 字段了（原「转换必须留本子树读 `pub(super)`」的约束
+    /// 随之整条消失）。
+    pub(crate) fn to_registration(&self) -> ProjectRegistration {
+        ProjectRegistration {
+            name: self.name.clone(),
+            root: self.root.clone(),
+            is_git: self.is_git,
+            modules: self.modules.iter().cloned().map(module_to_reg).collect(),
         }
-        filters
+    }
+}
+
+/// `Module` → DTO（递归；纯结构）。
+fn module_to_reg(m: Module) -> ModuleRegistration {
+    ModuleRegistration {
+        name: m.name,
+        root: m.root,
+        children: m.children.into_iter().map(module_to_reg).collect(),
+    }
+}
+
+/// GUI 侧的 `Project` 仍可直接当枚举源装箱（`app.rs` 的 owner 装配点）——
+/// 内部**先转 DTO 再枚举**，枚举实现只认 DTO（task 2.5/2.6）。
+impl EnumeratorOwner for Project {
+    fn root(&self) -> &Path {
+        &self.root
     }
 
-    /// 枚举时调用 (design D2): 判定 git、读 `.gitignore`、构建 filter
-    /// 集并**注入现建的 Module 副本**。IO 在调用方的 bg task 内;
-    /// 每次枚举重建 → 刷新天然重读 (spec: Refresh re-reads filter rules)。
-    pub(super) fn modules_for_enumeration(&self) -> Vec<Module> {
-        let filters = self.provision_filters();
-        self.modules
-            .iter()
-            .cloned()
-            .map(|mut module| {
-                module.filters = filters.clone();
-                module
-            })
-            .collect()
+    fn enumerator(&self) -> Box<dyn Enumerator> {
+        // 现算 DTO ⇒ 每次 `enumerator()` 都重读 .gitignore（刷新重供给）
+        self.to_registration().enumerator()
     }
 }
 
@@ -154,6 +156,32 @@ mod tests {
         assert_eq!(p.modules[0].name, p.name);
     }
 
+    /// task 2.6: DTO 不得丢字段 —— `Project`/`Module` 每个字段都要落到
+    /// 注册 DTO，否则服务侧枚举出的树会与 GUI 侧认知不一致。
+    #[test]
+    fn registration_carries_every_project_and_module_field() {
+        let mut p = Project::from_root("/Users/me/code/foo".into());
+        p.is_git = true; // 单独验 is_git 不被掉（它只影响过滤供给）
+        let reg = p.to_registration();
+
+        // ---- Project 四字段 ----
+        assert_eq!(reg.name, p.name, "name 进 DTO");
+        assert_eq!(reg.root, p.root, "root 进 DTO");
+        assert_eq!(reg.is_git, p.is_git, "is_git 进 DTO");
+        assert_eq!(reg.modules.len(), p.modules.len(), "modules 进 DTO");
+
+        // ---- Module 四字段 ----
+        let m = &p.modules[0];
+        let r = &reg.modules[0];
+        assert_eq!(r.name, m.name, "Module.name 进 DTO");
+        assert_eq!(r.root, m.root, "Module.root 进 DTO");
+        assert_eq!(r.children.len(), m.children.len(), "Module.children 进 DTO");
+
+        // ---- 过滤集**不进 DTO**（design D3 修订: 服务现场供给）----
+        // 本测试只钉「结构字段无一遗漏」；过滤供给由
+        // `provision_filters` 的四个 spec 场景测试覆盖。
+    }
+
     /// spec: Module root mirrors the project root.
     #[test]
     fn root_module_mirrors_project_root() {
@@ -161,126 +189,4 @@ mod tests {
         assert_eq!(p.modules[0].root, PathBuf::from("/a/bar"));
     }
 
-    // ===== filter 供给 (design D8; spec: Filter provisioning) =====
-
-    /// 每测试独立 temp 根 (进程 id + 名字, 平行安全)。
-    fn temp_root(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "provision-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    /// spec: Git-managed project applies its root gitignore —
-    /// `[Dot, GitIgnore]` 供给并注入枚举时现建的 Module。
-    #[test]
-    fn git_project_provisions_dot_and_gitignore() {
-        let root = temp_root("git");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::write(root.join(".gitignore"), "*.tmp\n").unwrap();
-        std::fs::write(root.join("cache.tmp"), "x").unwrap();
-
-        let p = Project::from_root_with_git(root.clone(), true);
-        let filters = p.provision_filters();
-        // 行为对 (替代计数断言): Dot 命中 .env + gitignore 命中 cache.tmp
-        // → 两种规则都在且都生效。
-        assert!(
-            filters.iter().any(|f| f.is_ignored(".env", false)),
-            "默认 Dot 在列"
-        );
-        assert!(
-            filters.iter().any(|f| f.is_ignored("cache.tmp", false)),
-            "根 .gitignore 生效 (spec 场景: cache.tmp 不出现)"
-        );
-
-        let modules = p.modules_for_enumeration();
-        assert_eq!(modules.len(), 1, "现建 Module");
-        assert!(
-            modules[0].filters.iter().any(|f| f.is_ignored("cache.tmp", false)),
-            "注入的 filter 对条目生效"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// spec: Non-git project does not read its gitignore — 非 git 根不
-    /// 探测, 只供默认 Dot。
-    #[test]
-    fn non_git_project_reads_nothing_but_dot() {
-        let root = temp_root("non-git");
-        std::fs::write(root.join(".gitignore"), "*.tmp\n").unwrap();
-        std::fs::write(root.join("cache.tmp"), "x").unwrap();
-
-        let p = Project::from_root(root.clone());
-        let filters = p.provision_filters();
-        // 行为对 (替代计数断言): Dot 命中 + gitignore 规则不命中 → 仅 Dot。
-        assert!(
-            filters.iter().any(|f| f.is_ignored(".env", false)),
-            "默认 Dot 在列"
-        );
-        assert!(
-            !filters.iter().any(|f| f.is_ignored("cache.tmp", false)),
-            "非 git 根的 .gitignore 不生效 (spec 场景: cache.tmp 仍出现)"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// git 项目但无 `.gitignore` → 只挂 Dot (读取 best-effort)。
-    #[test]
-    fn git_project_without_gitignore_only_dot() {
-        let root = temp_root("git-empty");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::write(root.join("notes.log"), "x").unwrap();
-
-        let p = Project::from_root_with_git(root.clone(), true);
-        let filters = p.provision_filters();
-        // 行为对 (替代计数断言): Dot 命中 .env + 无 gitignore 规则命中。
-        assert!(filters.iter().any(|f| f.is_ignored(".env", false)));
-        assert!(
-            !filters.iter().any(|f| f.is_ignored("notes.log", false)),
-            "无 .gitignore → 无 gitignore 规则命中 (仅默认 Dot)"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// **行为变化钉死** (change solution-service 4.2, spec: Git directory
-    /// with git management disabled does not read gitignore): 有 `.git`
-    /// 但 solution 关 git 管理 → 仅 Dot, `.gitignore` 不生效。
-    #[test]
-    fn git_dir_with_git_management_disabled_reads_no_gitignore() {
-        let root = temp_root("git-disabled");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::write(root.join(".gitignore"), "*.tmp\n").unwrap();
-        std::fs::write(root.join("cache.tmp"), "x").unwrap();
-
-        let p = Project::from_root_with_git(root.clone(), false);
-        let filters = p.provision_filters();
-        assert!(filters.iter().any(|f| f.is_ignored(".env", false)), "默认 Dot 在列");
-        assert!(
-            !filters.iter().any(|f| f.is_ignored("cache.tmp", false)),
-            "关 git 管理 ⇒ 有 .git/.gitignore 也不读 (行为变化)"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Clone 链 (manager spawn 路径): Module 克隆后 filter 同源 (Arc)。
-    #[test]
-    fn module_clone_keeps_filters_via_arc() {
-        let root = temp_root("clone");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
-
-        let p = Project::from_root_with_git(root.clone(), true);
-        let modules = p.modules_for_enumeration();
-        let cloned = modules[0].clone();
-        assert_eq!(cloned.filters.len(), modules[0].filters.len());
-        assert!(
-            std::sync::Arc::ptr_eq(&cloned.filters[0], &modules[0].filters[0]),
-            "克隆共享同一 filter 实例 (Arc 引用计数)"
-        );
-        let _ = p.clone(); // Project: Clone 不回归
-        let _ = std::fs::remove_dir_all(&root);
-    }
 }

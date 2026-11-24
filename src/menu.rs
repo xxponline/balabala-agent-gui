@@ -13,6 +13,16 @@ use crate::app::TerminalApp;
 use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::{Entity, Menu, MenuItem};
 
+/// Launcher 期的菜单 (launcher-startup 5.1, design D5)。
+///
+/// 只有 `Edit` — `Debug` 子菜单的 action 监听要 `cx.weak_entity::<
+/// TerminalApp>()` (`install` 内), 而 Launcher 阶段主窗尚未构造。
+/// 主窗装配完成时会整根 `set_menus` 重推带 Debug 的完整版
+/// (spec: Menu content rebuild on change)。
+pub fn build_launcher() -> Vec<Menu> {
+    vec![Menu::new("Edit").items([MenuItem::action("Copy", TerminalCopy)])]
+}
+
 /// 当前应用菜单 (task 6.1: Edit/Copy; 6.2 追加 cfg 门控的 Debug 子菜单)。
 ///
 /// `copy_enabled` 只驱动 Copy 项的**静态**灰显位 (design D2: 灰显只看选区,
