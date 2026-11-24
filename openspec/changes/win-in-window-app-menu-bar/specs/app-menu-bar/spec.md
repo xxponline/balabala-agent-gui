@@ -5,10 +5,13 @@
 ### Requirement: Application menu bar is always present
 
 The application SHALL install an application menu bar at startup in all build
-profiles. On platforms with a native application menu bar the menu SHALL be
-rendered by the operating system; on other platforms the menu bar SHALL be
-rendered inside the application window above the dock layout. The menu bar
-SHALL provide at least one menu at all times.
+profiles, including while the Launcher window is the only window open: during
+that phase at least one menu SHALL be present, and menus whose actions depend
+on the main window's application state SHALL be added once that state exists.
+On platforms with a native application menu bar the menu SHALL be rendered by
+the operating system; on other platforms the menu bar SHALL be rendered
+inside the application window above the dock layout. The menu bar SHALL
+provide at least one menu at all times.
 
 #### Scenario: Menu bar exists in release builds
 
@@ -19,6 +22,13 @@ SHALL provide at least one menu at all times.
 
 - **WHEN** the user runs a debug build of the application
 - **THEN** the application menu bar is present, including the Debug menu
+
+#### Scenario: Menu bar exists while the Launcher is open
+
+- **WHEN** the application is sitting at the Launcher with no workspace
+  chosen
+- **THEN** the application menu bar is present with at least one menu, and no
+  menu entry depends on main-window state that does not yet exist
 
 #### Scenario: Windowed menu bar is visible above the dock on Windows
 
@@ -75,24 +85,6 @@ alone: the focused element SHALL NOT be part of that determination.
   shown beside Copy
 - **THEN** the shown shortcut is the one actually bound to the copy action on
   that platform, and pressing it performs the same copy as clicking the item
-
-### Requirement: Menu content rebuild on change
-
-Whenever the set of menu items the application exposes changes (for example a
-debug section being registered or a dynamic item's label changing), the system
-SHALL rebuild the platform menu so the displayed contents match the current
-set. Rebuilding SHALL NOT drop items that are still present nor change their
-order.
-
-#### Scenario: Registered section appears in the menu
-
-- **WHEN** a debug section is registered after startup
-- **THEN** the rebuilt menu bar lists that section's menu item
-
-#### Scenario: Rebuild preserves unchanged items
-
-- **WHEN** the menu is rebuilt after one item's label changes
-- **THEN** all other items remain present in their original order
 
 ## ADDED Requirements
 

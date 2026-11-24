@@ -197,19 +197,30 @@ div().size_full().flex().flex_col()
   notify 向上标脏使祖先 `TerminalApp` 进 `dirty_views`；若实测不触发，退路是
   在选区变化处显式 `cx.notify()` 于 `TerminalApp`（tasks 中留验证项）。
 - [本机 `cargo test` 基线本身不绿，「全绿」不可达] → **验收基准改为「相对
-  基线零新增失败」**。Windows 上既有 19 个失败（已 stash 改动跑基线对照，
-  失败集合逐条 IDENTICAL），三类根因均与本 change 无关：
-  **A 类（5 个，`test_sessions.rs:211`）** —— `write_stub` 产出的
-  `fake-pi.sh` 是 `#!/bin/sh` 脚本，Windows 无法 spawn（`%1 is not a valid
-  Win32 application`，可执行位也只在 `#[cfg(unix)]` 设置）；
-  **B 类（7 个，`gpui-kit test.rs:142`）** —— 测试用
+  基线零新增失败」**。Windows 上既有失败**三类根因均与本 change 无关**：
+  **A 类（`test_sessions.rs:211`）** —— `write_stub` 产出的 `fake-pi.sh`
+  是 `#!/bin/sh` 脚本，Windows 无法 spawn（`%1 is not a valid Win32
+  application`，可执行位也只在 `#[cfg(unix)]` 设置）；
+  **B 类（`gpui-kit test.rs:142`）** —— 测试用
   `format!("cell-{}/stub-dir", ws.display())` 拼 ElementId 写死 `/`，
   Windows 实际路径分隔符为 `\`，`find` 找不到；
-  **C 类（7 个）** —— `启动恢复未落定` 超时、`try_find_by_label("top.rs")`、
+  **C 类** —— `启动恢复未落定` 超时、`try_find_by_label("top.rs")`、
   solutions json 断言等，部分疑似 A 类下游。
   修复 Windows 测试可移植性是**正交的既有问题，不在本 change 范围**；
   本 change 的验证改为：`cargo test` 失败集合与基线 diff 为空 + 新增测试通过。
   ⚠️ 1.1 点名的 `app::tests::adaptive_grid_dispatch` 属 A 类，本机不可执行。
+  **基线数字随集成演进（三轮均验 IDENTICAL）**：
+  1. 本 change 落地时（基线 `56db4dc`，stash 对照）：19 个；
+  2. 与并行 change `92cdc9e`（asset-service 43/43）**merge 后**基线变为
+     **22 个** —— 远程重构改了测试名（`assets::panel::*` →
+     `shell::asset_overview_tests::*`、`sidebar_*` → `solution_overview_*`、
+     `startup_restores_*` → `startup_opens_the_chosen_*`）并新增
+     `solution_row_*` 三个，**旧基线无法直接 diff**；
+  3. 故改用 **独立 worktree 取 `origin/master` 真基线**（`git worktree add
+     ../balabala-baseline origin/master`，不动工作区）：debug
+     `124 passed / 22 failed` → 集成后 `132 / 22`（+8 = 本 change 新测试）；
+     release `109 / 22` → `115 / 22`（+6，另 2 个为 debug-only）；
+     两 profile 失败集均 **IDENTICAL**。
 - [macOS 侧编译在本机不可验（task 2.2 第三条验收）] →
   `cargo check --target x86_64-apple-darwin` 卡在**依赖**上，未走到本项目
   代码：`onig_sys`（`gpui-kit` 的 `syntect` feature 拉入的 C 依赖）的

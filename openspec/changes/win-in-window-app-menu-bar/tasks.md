@@ -140,13 +140,16 @@
 ## 6. 集成验收
 
 - [x] 6.1 全量回归：`cargo test`（debug）与 `cargo build --release`，验证：
-      两者均通过，且 `cargo test` 失败集合与基线 diff 为空（基线 19 个既有
-      失败见 design Risks）；release 二进制菜单无 `Debug` 项（既有字符串
-      验收不变）。**实测（2026-11-24）**：debug `154 passed / 19 failed`
-      与 debug 真基线 IDENTICAL；release `137 passed / 19 failed` 与 **stash
-      取得的 release 真基线** IDENTICAL（不拿 debug 基线冒充）；
-      `cargo build --release` 通过；release 字符串验收
-      `release_menu_has_no_debug_and_keeps_edit_copy` 通过；零 warning。
+      两者均通过，且 `cargo test` 失败集合与基线 diff 为空（基线数字见下
+      实测段与 design Risks —— 集成 `92cdc9e` 后为 22 个既有失败）；
+      release 二进制菜单无 `Debug` 项（既有字符串
+      验收不变）。**实测（2026-11-24）**：与并行 change `92cdc9e` merge 后
+      基线已变（19 → **22**，远程重构改测试名，旧基线不可 diff），改用
+      **独立 worktree 取 `origin/master` 真基线**对照：debug
+      `124 passed / 22 failed` → `132 / 22`（+8 = 本 change 新测试）、
+      release `109 / 22` → `115 / 22`（+6，另 2 个 debug-only），两 profile
+      失败集均 **IDENTICAL**；`cargo build --release` 通过；release 字符串
+      验收 `release_menu_has_no_debug_and_keeps_edit_copy` 通过；零 warning。
       📌 **踩到的坑（已解决）**：headed 应用若仍在运行，会占用
       `target/debug/balabala-agent-gui.exe` → cargo 报 `failed to remove file`
       (os error 5) 且 **`cargo test` 静默不跑测试**（exit=101、无
