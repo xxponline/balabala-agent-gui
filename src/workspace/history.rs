@@ -88,7 +88,12 @@ impl History {
         self.recent.truncate(MAX_RECENT);
     }
 
-    /// most-recent-first 的第一条 (启动直开目标)。
+    /// most-recent-first 的第一条 (最近打开的工作区)。
+    ///
+    /// 启动直开已随 `launcher-startup` 退场 — 读侧目前只有测试消费
+    /// (`confirmed_creation_then_open_lands_workspace` 断言 push 命中);
+    /// 保留为 MRU 语义的正式读口。
+    #[allow(dead_code)]
     pub fn most_recent(&self) -> Option<&Path> {
         self.recent.first().map(|p| p.as_path())
     }

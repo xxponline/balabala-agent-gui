@@ -1,5 +1,5 @@
 //! UI 层: vt100 颜色映射 (theme) + 共享小件 (widgets)。
-//! 终端面板已迁 agent-service::terminal (task 4.1), sidebar 收为 crate::sidebar 面板
+//! 终端面板已迁 agent-service::terminal (task 4.1), 左槽面板为 crate::solution_overview
 //! (change: split-ui-modules-dockarea)。
 //!
 //! **双主题颜色体系 (add-light-dark-theme)**:

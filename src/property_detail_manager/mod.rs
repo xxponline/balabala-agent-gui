@@ -1,6 +1,6 @@
 //! 默认打开系统（change: center-slot-multi-tab, design D1）。
 //!
-//! 统一后端接口：任意槽（当前=右槽文件树）把**中立封装对象**
+//! 统一后端接口：任意槽（当前=右槽 asset-overview）把**中立封装对象**
 //! [`OpenObject`] 交给 [`TerminalApp::open_object`]，由静态 handler
 //! 注册表 [`HANDLERS`] 按序认领，未命中 no-op；命中则查 dedup 表
 //! （key = 绝对路径字符串，与 `AssetNode.id` 同一身份体系）：
@@ -19,12 +19,12 @@ use gpui_kit::component::dock::DockPlacement;
 use gpui_kit::{Context, Window};
 
 use crate::app::TerminalApp;
-use crate::assets::AssetKind;
+use asset_service::contract::AssetKind;
 use editor_panel::RustViewerHandler;
 use md_panel::MarkdownViewerHandler;
 
 /// 待打开对象的中立封装——不含 gpui 类型，可跨插件边界
-/// （design D2; `kind` 由 asset_manager 查视图给出）。
+/// （design D2; `kind` 由镜像视图 `find_kind` 给出 —— change asset-service 4.4）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenObject {
     /// 对象的绝对路径（去重 key = 其字符串形式）。
@@ -83,7 +83,7 @@ mod tests {
 
     use super::*;
     use crate::app::TerminalApp;
-    use crate::sidebar::SidebarEvent;
+    use crate::solution_overview::SolutionOverviewEvent;
     use crate::workspace::Workspace;
     use gpui_kit::component::dock::BasePanel;
     use gpui_kit::component::dock::PanelHandle;
@@ -109,7 +109,7 @@ mod tests {
                     ..Default::default()
                 },
                 cx,
-                |window, cx| cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动")),
+                |window, cx| cx.new(|cx| TerminalApp::new(window, cx, None).expect("app 启动")),
             )
             .expect("open test window")
         });
@@ -1278,7 +1278,7 @@ mod tests {
     // ---------- 5.x 焦点/键盘跟随 active tab ----------
 
     #[gpui_kit::test]
-    fn sidebar_select_returns_to_console_tab(cx: &mut TestAppContext) {
+    fn solution_overview_select_returns_to_console_tab(cx: &mut TestAppContext) {
         let (handle, app) = open_app(cx);
         let path = write_temp_file("sidebar", "rs", "fn sidebar_probe() {}");
         open_object_in(
@@ -1303,11 +1303,11 @@ mod tests {
         let (agent_id, _shared) =
             crate::service_layer::test_sessions::create_session(cx, &app, &ws);
 
-        // 点 sidebar agent 行 → ask 经服务 → 成功回执经泵切 console + 焦点
+        // 点 agent 行 → ask 经服务 → 成功回执经泵切 console + 焦点
         let term_focus = cx.update(|cx| app.read(cx).terminal.read(cx).focus_handle(cx));
         cx.update_window(handle, |_, window, cx| {
             app.update(cx, |app, cx| {
-                app.on_sidebar_event(SidebarEvent::SelectAgent(agent_id), window, cx);
+                app.on_solution_overview_event(SolutionOverviewEvent::SelectAgent(agent_id), window, cx);
             });
         })
         .expect("update window");

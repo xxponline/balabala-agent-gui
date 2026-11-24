@@ -6,7 +6,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
-mod assets;
 // 门控在模块文件内 (#![cfg(debug_assertions)]): release 下模块为空壳,
 // 注册表/section 代码不进二进制 (design D5)
 mod debug;
@@ -17,12 +16,11 @@ mod service_layer;
 mod solution_config;
 mod property_detail_manager;
 mod shell;
-mod sidebar;
+mod solution_overview;
 mod ui;
 mod workspace;
-
-use app::TerminalApp;
-use gpui_kit::AppContext;
+// 启动关卡 (launcher-startup): 启动阶段唯一窗口, 先于主窗
+mod launcher;
 
 fn main() {
     // Windows GUI 子系统下 (release, 无控制台) crossterm 的 ANSI 支持探测修复:
@@ -54,36 +52,8 @@ fn main() {
         // gpui-component 默认 Light, TerminalApp::new 在窗口启动时
         // sync_system_appearance 同步到系统外观并订阅后续热切换。
 
-        let options = gpui_kit::WindowOptions {
-            window_bounds: Some(gpui_kit::WindowBounds::centered(
-                gpui_kit::size(gpui_kit::px(1000.), gpui_kit::px(600.)),
-                cx,
-            )),
-            titlebar: Some(gpui_kit::TitlebarOptions {
-                title: Some("pi agent shell".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        gpui_kit::open_window(options, cx, |window, cx| {
-            cx.new(|cx| {
-                let mut app = match TerminalApp::new(window, cx) {
-                    Ok(app) => app,
-                    Err(e) => {
-                        rfd::MessageDialog::new()
-                            .set_title("Failed to load workspaces")
-                            .set_description(&e)
-                            .set_level(rfd::MessageLevel::Error)
-                            .show();
-                        eprintln!("failed to load workspaces: {e}");
-                        std::process::exit(1);
-                    }
-                };
-                app.start_update_loop(cx);
-                app
-            })
-        })
-        .expect("failed to open window");
+        // 启动关卡 (launcher-startup, design D1): 只出 Launcher。主窗在
+        // 用户选定 workspace 后才由 Launcher 交棒打开 — 自动恢复已退场。
+        launcher::open(cx);
     });
 }

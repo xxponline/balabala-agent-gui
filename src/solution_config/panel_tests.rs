@@ -52,7 +52,7 @@ fn open_app(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<TerminalApp>) {
             cx,
             |window, cx| {
                 cx.new(|cx| {
-                    TerminalApp::new_inner(window, cx, history.clone()).expect("app 启动")
+                    TerminalApp::new_inner(window, cx, history.clone(), None).expect("app 启动")
                 })
             },
         )
@@ -134,6 +134,15 @@ fn wait_for(
         );
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+}
+
+/// 让服务落盘必败 (design D5): 把 solutions 文件换成同名目录 →
+/// `fs::write` 必 EISDIR。落盘目标由服务绑定, 不能再靠改 view 侧的
+/// `workspace.path` 来影响写入位置。
+fn break_persist(ws: &std::path::Path) {
+    let p = project_model::files::solutions_path(ws);
+    let _ = fs::remove_file(&p);
+    fs::create_dir_all(&p).unwrap();
 }
 
 /// 起一个空工作区并打开（hermetic）。
@@ -337,7 +346,7 @@ fn submit_success_closes_tab_and_appends(cx: &mut TestAppContext) {
     wait_for(
         cx,
         &app,
-        |a| a.service_layer.tree_view().is_some_and(|t| t.tree.projects.len() == 1),
+        |a| a.service_layer.tree_view().is_some_and(|t| t.tree().projects.len() == 1),
         "create 落定",
     );
     // 成功自关 (spec: Successful creation closes the tab)
@@ -372,7 +381,7 @@ fn duplicate_root_blocks_second_submit(cx: &mut TestAppContext) {
     wait_for(
         cx,
         &app,
-        |a| a.service_layer.tree_view().is_some_and(|t| t.tree.projects.len() == 1),
+        |a| a.service_layer.tree_view().is_some_and(|t| t.tree().projects.len() == 1),
         "首次 create 落定",
     );
 
@@ -397,7 +406,7 @@ fn duplicate_root_blocks_second_submit(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let a = app.read(cx);
         let t = a.service_layer.tree_view().expect("镜像在场");
-        assert_eq!(t.tree.projects.len(), 1, "重复提交零变化 (spec: Re-adding …)");
+        assert_eq!(t.tree().projects.len(), 1, "重复提交零变化 (spec: Re-adding …)");
     });
     let json = solutions_json(&ws);
     assert_eq!(
@@ -427,7 +436,7 @@ fn close_without_submit_writes_nothing(cx: &mut TestAppContext) {
         assert!(
             a.service_layer
                 .tree_view()
-                .is_none_or(|t| t.tree.projects.is_empty()),
+                .is_none_or(|t| t.tree().projects.is_empty()),
             "无项目行出现"
         );
     });
@@ -442,25 +451,21 @@ fn write_failure_shows_inline_and_tab_stays(cx: &mut TestAppContext) {
     let ws = seed_and_open(cx, &app, "fail-行内");
     let outside = temp_dir("fail-root");
 
-    // 服务落盘必败: workspace 路径换成普通文件 (add_solution_merges 同款)
-    let not_dir = ws.join("not-a-dir");
-    fs::write(&not_dir, "x").unwrap();
+    // 服务落盘必败: solutions 文件换成同名目录 (design D5 后落盘目标由
+    // 服务绑定, 改 view 侧 `workspace.path` 已不影响写入位置)
+    break_persist(&ws);
 
     open_entry_in(cx, handle, &app);
     set_path_in(cx, handle, &app, &outside);
-    app.update(cx, |app, _| {
-        app.workspace.as_mut().unwrap().path = not_dir.clone();
-    });
     let panel = cx.update(|cx| app.read(cx).sol_config_panel.clone().unwrap());
     panel.update(cx, |panel, cx| panel.submit(cx));
 
     wait_for(cx, &app, |a| a.notice.is_some(), "写失败 notice");
     cx.update(|cx| {
         let a = app.read(cx);
+        // 路由按 action_id (design D7) — 落签即证明, 不再匹配文案
         assert!(
-            a.sol_config_error
-                .as_deref()
-                .is_some_and(|e| e.contains("添加 solution")),
+            a.sol_config_error.is_some(),
             "行内错误落签 (spec: failure → error shown in the tab): {:?}",
             a.sol_config_error
         );
@@ -472,15 +477,17 @@ fn write_failure_shows_inline_and_tab_stays(cx: &mut TestAppContext) {
         assert!(
             a.service_layer
                 .tree_view()
-                .is_some_and(|t| t.tree.projects.len() == 1),
+                .is_some_and(|t| t.tree().projects.len() == 1),
             "内存变更保留 (spec: in-memory state keeps the change)"
         );
     });
-    let texts = render_texts(handle, cx);
-    assert!(
-        texts.iter().any(|t| t.contains("添加 solution")),
-        "错误行内可见: {texts:?}"
-    );
+    // 可见性按元素 id 断言 — label 只是显示, 文案匹配是 D7 要拆的坏味道
+    let visible = cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find("solution-config-error").is_some()
+    })
+    .expect("update window");
+    assert!(visible, "错误行内可见 (按 id 断言)");
 }
 
 // ---------- 3.2: 关签后才到的失败回执 → notice 不丢 ----------
@@ -492,15 +499,11 @@ fn failure_reply_after_close_still_surfaces_notice(cx: &mut TestAppContext) {
     let ws = seed_and_open(cx, &app, "fail-关签竞态");
     let outside = temp_dir("fail-late-root");
 
-    // 落盘必败: workspace 路径换成普通文件
-    let not_dir = ws.join("not-a-dir");
-    fs::write(&not_dir, "x").unwrap();
+    // 落盘必败: solutions 文件换成同名目录 (同 write_failure 同款)
+    break_persist(&ws);
 
     open_entry_in(cx, handle, &app);
     set_path_in(cx, handle, &app, &outside);
-    app.update(cx, |app, _| {
-        app.workspace.as_mut().unwrap().path = not_dir.clone();
-    });
     let panel = cx.update(|cx| app.read(cx).sol_config_panel.clone().unwrap());
     panel.update(cx, |panel, cx| panel.submit(cx));
     // 回执到达前关签 (kick 的 8ms 快泵尚未让时 — 关在先, 回执晚到)
@@ -510,9 +513,15 @@ fn failure_reply_after_close_still_surfaces_notice(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let a = app.read(cx);
         assert!(
-            a.notice.as_deref().is_some_and(|n| n.contains("添加 solution")),
-            "notice 点名操作: {:?}",
+            a.notice.is_some(),
+            "关签后 notice 不丢: {:?}",
             a.notice
+        );
+        // 路由按 action_id (design D7): 签虽已关, 行内错误仍按 id 落定
+        assert!(
+            a.sol_config_error.is_some(),
+            "失败按 action_id 路由到表单签: {:?}",
+            a.sol_config_error
         );
         assert!(
             !a.open_tabs.contains_key(SOLUTION_CONFIG_TAB_KEY),
@@ -522,7 +531,7 @@ fn failure_reply_after_close_still_surfaces_notice(cx: &mut TestAppContext) {
         assert!(
             a.service_layer
                 .tree_view()
-                .is_some_and(|t| t.tree.projects.len() == 1),
+                .is_some_and(|t| t.tree().projects.len() == 1),
             "内存变更保留 (spec)"
         );
     });

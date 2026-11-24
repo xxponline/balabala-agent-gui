@@ -24,7 +24,7 @@ use gpui_kit::{
 
 use crate::app::TerminalApp;
 use crate::property_detail_manager::{OpenHandler, OpenObject};
-use crate::assets::AssetKind;
+use asset_service::contract::AssetKind;
 
 /// 查看模式（design D1; 默认 Rendered — proposal 定案, 不记忆）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -2,21 +2,22 @@
 
 ## Purpose
 
-Provides a desktop GUI shell around `pi` agent sessions: a sidebar manages
-multiple sessions (create, select, close, observe lifecycle), and a main pane
-renders the active session's terminal output and forwards user input.
+Provides a desktop GUI shell around `pi` agent sessions: the
+solution-overview manages multiple sessions (create, select, close, observe
+lifecycle), and a main pane renders the active session's terminal output and
+forwards user input.
 
 ## Requirements
 
 
-### Requirement: Sidebar session item display
+### Requirement: Session item display
 
-Each agent item in the sidebar SHALL be indented under its parent project row
-and SHALL display the session's prefixed name (e.g. `foo/pi-1`), a status
-badge, and a close button that is visible on hover. The status badge SHALL
-reflect one of three states: `starting` (session created but no output yet),
-`running` (session has produced output and its agent connection is still
-open), or `exited` (the session's `pi` process has ended its agent
+Each agent item in the solution-overview SHALL be indented under its parent
+project row and SHALL display the session's prefixed name (e.g. `foo/pi-1`),
+a status badge, and a close button that is visible on hover. The status badge
+SHALL reflect one of three states: `starting` (session created but no output
+yet), `running` (session has produced output and its agent connection is
+still open), or `exited` (the session's `pi` process has ended its agent
 connection).
 
 #### Scenario: Newly created session shows starting
@@ -105,14 +106,14 @@ be delivered. Ctrl-combination keys SHALL NOT be delivered. When another tab
 is active, its panel receives the keystrokes and IME input instead of the
 session.
 
-Selecting an agent item in the sidebar SHALL switch to the console tab and
-make that session's pane the recipient of keyboard input AND IME input in the
-same step: the system SHALL claim IME ownership for the pane immediately upon
-selection, with no additional click required inside the pane area. While the
-session is selected, IME-committed strings SHALL be routed to that session.
-The macOS-level application losing focus SHALL remain the only condition
-under which keystrokes and IME commits are not delivered to the active tab's
-panel.
+Selecting an agent item in the solution-overview SHALL switch to the console
+tab and make that session's pane the recipient of keyboard input AND IME
+input in the same step: the system SHALL claim IME ownership for the pane
+immediately upon selection, with no additional click required inside the
+pane area. While the session is selected, IME-committed strings SHALL be
+routed to that session. The macOS-level application losing focus SHALL
+remain the only condition under which keystrokes and IME commits are not
+delivered to the active tab's panel.
 
 #### Scenario: Printable characters forwarded
 
@@ -159,17 +160,18 @@ panel.
 
 #### Scenario: Sidebar selection grants keyboard and IME focus in one step
 
-- **WHEN** the user clicks a different agent item in the sidebar and then
-  composes text with an IME without clicking inside the pane area
+- **WHEN** the user clicks a different agent item in the solution-overview
+  and then composes text with an IME without clicking inside the pane area
 - **THEN** the committed text is delivered to the newly selected session,
   and no input is delivered to the previously selected session
 ### Requirement: Manual session close
 
-The user SHALL be able to close a session by clicking its sidebar close
-button. Closing SHALL immediately shut down the embedded session
-(terminating its `pi` process), remove the item from the sidebar, and — if
-the closed session was active — switch the main pane to the next remaining
-session or display an empty placeholder if none remain.
+The user SHALL be able to close a session by clicking its close button in
+the solution-overview. Closing SHALL immediately shut down the embedded
+session (terminating its `pi` process), remove the item from the
+solution-overview, and — if the closed session was active — switch the main
+pane to the next remaining session or display an empty placeholder if none
+remain.
 
 #### Scenario: Closing a non-active session
 
@@ -187,7 +189,7 @@ session or display an empty placeholder if none remain.
 When a session's `pi` process ends its agent connection on its own (e.g. the
 user runs `/exit` inside `pi`), the system SHALL mark the session as
 `exited`, preserve the last rendered screen in the main pane, and keep the
-item in the sidebar until the user explicitly closes it.
+item in the solution-overview until the user explicitly closes it.
 
 #### Scenario: Subprocess exits on its own
 
@@ -204,11 +206,12 @@ item in the sidebar until the user explicitly closes it.
 
 Each center tab's panel SHALL own a focusable interactive surface. Clicking
 anywhere inside the active tab's panel area (including its border and
-rendered contents) SHALL claim keyboard focus for that panel. Clicking a
-sidebar agent item SHALL switch to the console tab, set the active selection,
-AND claim pane keyboard focus for that session in the same step (one-step
-focus, consistent with Keyboard input forwarding). While no pane has focus,
-the system SHALL NOT enable IME input routing to any session.
+rendered contents) SHALL claim keyboard focus for that panel. Clicking an
+agent row in the solution-overview SHALL switch to the console tab, set the
+active selection, AND claim pane keyboard focus for that session in the same
+step (one-step focus, consistent with Keyboard input forwarding). While no
+pane has focus, the system SHALL NOT enable IME input routing to any
+session.
 
 #### Scenario: Click pane claims focus
 
@@ -601,10 +604,10 @@ directory equal to the owning project's root path.
 
 The center slot SHALL render as a tab group whose content is the active tab;
 the console tab SHALL always render the currently selected agent session.
-Clicking an agent item in the sidebar SHALL switch to the console tab,
-display that session, and make it the recipient of keyboard input. Clicking
-a project row SHALL switch only that row's expanded state and SHALL NOT
-switch the active tab.
+Clicking an agent item in the solution-overview SHALL switch to the console
+tab, display that session, and make it the recipient of keyboard input.
+Clicking a project row SHALL switch only that row's expanded state and SHALL
+NOT switch the active tab.
 
 #### Scenario: Click sidebar item switches active session
 
@@ -664,12 +667,12 @@ the active tab, and SHALL NOT steal keyboard focus from the current pane.
 
 ### Requirement: Session control failure feedback
 
-Session control requests initiated from the sidebar — selecting, creating, or
-closing a session — SHALL give visible feedback when a request fails or times
-out before taking effect: session state, active selection, and displayed
-content SHALL remain as they were, and a notice SHALL name the failed action.
-Input injection (keystrokes, wheel, clicks) is fire-and-forget and SHALL NOT
-emit failure notices.
+Session control requests initiated from the solution-overview — selecting,
+creating, or closing a session — SHALL give visible feedback when a request
+fails or times out before taking effect: session state, active selection,
+and displayed content SHALL remain as they were, and a notice SHALL name the
+failed action. Input injection (keystrokes, wheel, clicks) is
+fire-and-forget and SHALL NOT emit failure notices.
 
 #### Scenario: Failed close keeps the session
 
@@ -680,8 +683,8 @@ emit failure notices.
 
 #### Scenario: Failed selection keeps the active session
 
-- **WHEN** the user clicks a different sidebar session item but the selection
-  request fails or times out before it takes effect
+- **WHEN** the user clicks a different sidebar session item but the
+  selection request fails or times out before it takes effect
 - **THEN** the previously active session remains active and keeps receiving
   keystrokes, and a notice names the failed selection
 
@@ -690,3 +693,83 @@ emit failure notices.
 - **WHEN** the user clicks `[+ agent]` but creating the session fails (for
   example the `pi` binary cannot be started)
 - **THEN** no new session row appears and a notice names the failed creation
+### Requirement: Solution rows group their projects
+
+Each solution SHALL render as a row above its projects in the
+solution-overview, and rows SHALL be ordered by their position in the
+solution configuration.
+
+#### Scenario: Solution row sits above its project
+
+- **WHEN** the workspace has one `simple` solution at `/Users/me/code/foo`
+  resolving to project `foo`
+- **THEN** a solution row renders directly above the project row `foo`
+
+#### Scenario: Multiple solutions order by configuration
+
+- **WHEN** the solutions file lists two solutions
+- **THEN** their rows appear in the same order as the file lists them
+### Requirement: Solution row identity and label
+
+A solution row SHALL be labelled with the solution's name and its type
+marker, so it is distinguishable from the project row beneath it — v1
+`simple` solutions resolve to a project rooted at the solution's own path,
+so the two rows otherwise carry the same directory name. Its identity SHALL
+use a namespace distinct from any path-based row identity, so a solution
+and its project never collide as tree entries.
+
+#### Scenario: Type marker distinguishes the twin rows
+
+- **WHEN** a `simple` solution at `/Users/me/code/foo` and its project `foo`
+  are both rendered
+- **THEN** the solution row's label carries a type marker the project row
+  does not
+
+#### Scenario: Solution and project rows are distinct entries
+
+- **WHEN** the solution and its project are both present
+- **THEN** they occupy separate rows with distinct identities, and neither
+  shadows the other's selection, expansion, or menu
+### Requirement: Solution row collapse toggle
+
+Each solution row SHALL toggle the visibility of its projects (and their
+agent rows) when clicked. Toggling SHALL NOT change the active session,
+SHALL NOT switch the active tab, and SHALL NOT steal keyboard focus from the
+current pane. Collapse state SHALL be held per solution in the view and SHALL
+NOT be persisted across restarts.
+
+#### Scenario: Collapsed solution hides its projects
+
+- **WHEN** the user collapses a solution row whose projects list agent items
+- **THEN** those project and agent rows are hidden while the solution row
+  remains visible
+
+#### Scenario: Toggle preserves active session
+
+- **WHEN** the user collapses the solution owning the active session
+- **THEN** the main pane still renders that session and keystrokes still
+  reach it
+
+#### Scenario: Collapse state does not survive restart
+
+- **WHEN** the user collapses a solution row and restarts the application
+- **THEN** the solution row is expanded again after the workspace opens
+### Requirement: Solution row context menu offers declared actions
+
+Right-clicking a solution row SHALL open a context menu whose entries are
+the actions the solution service declared for that node, built from the
+snapshot without contacting the service. Activating an entry SHALL send the
+invoke message for that action and node; the solution row SHALL have no
+default-open behavior on left click beyond the collapse toggle.
+
+#### Scenario: Menu comes from the service's declarations
+
+- **WHEN** the user right-clicks a solution row for which the service
+  declared configuration actions
+- **THEN** a menu lists exactly those actions with the service's labels
+
+#### Scenario: Left click toggles rather than opens
+
+- **WHEN** the user left-clicks a solution row
+- **THEN** its collapse state toggles and no tab, viewer, or external
+  program is opened

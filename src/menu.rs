@@ -12,6 +12,16 @@ use agent_service::terminal::TerminalCopy;
 use crate::app::TerminalApp;
 use gpui_kit::{Menu, MenuItem};
 
+/// Launcher 期的菜单 (launcher-startup 5.1, design D5)。
+///
+/// 只有 `Edit` — `Debug` 子菜单的 action 监听要 `cx.weak_entity::<
+/// TerminalApp>()` (`install` 内), 而 Launcher 阶段主窗尚未构造。
+/// 主窗装配完成时会整根 `set_menus` 重推带 Debug 的完整版
+/// (spec: Menu content rebuild on change)。
+pub fn build_launcher() -> Vec<Menu> {
+    vec![Menu::new("Edit").items([MenuItem::action("Copy", TerminalCopy)])]
+}
+
 /// 当前应用菜单 (task 6.1: Edit/Copy; 6.2 追加 cfg 门控的 Debug 子菜单)。
 pub fn build() -> Vec<Menu> {
     // `mut` 供下方 cfg 块 push; release 下块剥离 → 闲置

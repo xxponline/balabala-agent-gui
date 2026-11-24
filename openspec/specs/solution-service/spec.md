@@ -14,12 +14,18 @@ parallel state.
 
 The solution service SHALL own the workspace's solution and project state on
 the service side: loading `balabala.solutions.json` and resolving its items
-into projects. View layers SHALL read
-this state through the service contract and SHALL NOT keep a parallel copy of
-solutions or projects. The service's knowledge SHALL stop at projects: it
-hands off project descriptors and SHALL NOT discover modules or enumerate
-assets. When solutions or projects change the service SHALL publish a change
-notification so views refresh without restarting the application.
+into projects. View layers SHALL read this state through the service
+contract and SHALL NOT keep a parallel copy of solutions or projects. The
+published snapshot SHALL be hierarchical — each solution with the projects it
+resolved — and SHALL be the single expanded source the view renders; the flat
+project set and the asset-registration handoff SHALL be derived from it
+rather than published alongside it. The service's knowledge SHALL stop at
+projects: it hands off project descriptors and SHALL NOT discover modules or
+enumerate assets. Each node SHALL carry the actions the service declares for
+it. Binding a workspace through a load SHALL also record where its
+configuration lives, so later writes need not be told again. When solutions
+or projects change the service SHALL publish a change notification so views
+refresh without restarting the application.
 
 #### Scenario: Project rows come from the service
 
@@ -33,18 +39,37 @@ notification so views refresh without restarting the application.
 - **THEN** the tree carries project descriptors only — no module or file
   rows — and the asset side derives everything below from them
 
+#### Scenario: Snapshot nests projects under their solution
+
+- **WHEN** a workspace with two solutions opens
+- **THEN** the published snapshot lists each solution with its own resolved
+  projects beneath it, and the view derives its flat project list from that
+  structure
+
+#### Scenario: Nodes declare their actions
+
+- **WHEN** the view reads a snapshot in which the service declared
+  configuration actions on solution nodes
+- **THEN** those solution nodes carry the action descriptors, with labels,
+  alongside their identity
+
+#### Scenario: Writes reuse the bound workspace
+
+- **WHEN** a workspace has been loaded and a later create or configure
+  operation succeeds
+- **THEN** the operation applies to that workspace's configuration file
+  without the message re-supplying its directory
 ### Requirement: Solution load failures surface as structured errors
 
 When loading fails — the solutions file cannot be parsed, an item declares an
 unknown `SolutionType`, or a `simple` item's path does not exist on disk —
 the service SHALL reply with the failure reason and SHALL NOT return partial
-project state. Every load boundary (startup restore, workspace switch,
-explicit reload) SHALL present the error dialog and SHALL NOT open the
-workspace.
+project state. Every load boundary (workspace open chosen at startup, explicit
+reload) SHALL present the error dialog and SHALL NOT open the workspace.
 
 #### Scenario: Corrupt file at startup
 
-- **WHEN** the application restores the most-recent workspace and its
+- **WHEN** the user chooses a workspace at startup and its
   `balabala.solutions.json` contains invalid JSON
 - **THEN** the load reply carries the parse failure, an error dialog
   describes it, and the workspace is not opened
@@ -54,11 +79,10 @@ workspace.
 - **WHEN** one item's path is missing on disk and others are valid
 - **THEN** the reply is the failure only — no partial project tree is
   returned or cached
-
 ### Requirement: Asset registration flag gates project handoff
 
 Each solution SHALL carry a flag controlling whether its projects register
-into the asset manager. Projects of a solution with the flag disabled SHALL
+into the asset service. Projects of a solution with the flag disabled SHALL
 be absent from the handoff tree while remaining present in the solution's
 own project set; toggling the flag SHALL take effect on the next handoff
 without restarting, and the flag SHALL persist to the solutions file.
@@ -74,7 +98,6 @@ without restarting, and the flag SHALL persist to the solutions file.
 - **WHEN** the user enables asset registration for that solution
 - **THEN** the project appears in the handoff and its assets enumerate
   without restarting the application
-
 ### Requirement: Git-managed resolution combines root and solution
 
 Each enumerated project's git-managed flag SHALL be resolved as enabled only
@@ -107,6 +130,11 @@ the same create request for an existing solution SHALL NOT duplicate it, and
 re-applying the same configuration SHALL leave state unchanged and SHALL NOT
 re-trigger handoffs. The service SHALL expose these idempotent checks as
 shared utilities that view layers use for the same guarantees before sending.
+All user-initiated solution writes SHALL travel through a single invoke
+message carrying the action id, the target node, and any arguments; a
+configure operation's target SHALL be resolved from that node rather than
+supplied separately, and an unresolvable node or unknown action id SHALL be
+rejected without changing state.
 
 #### Scenario: Re-adding an existing solution changes nothing
 
@@ -119,3 +147,15 @@ shared utilities that view layers use for the same guarantees before sending.
 
 - **WHEN** a configure request repeats the solution's current flag values
 - **THEN** state, the persisted file, and the handoff tree are unchanged
+
+#### Scenario: Target comes from the invoke node
+
+- **WHEN** the view invokes a configuration action naming a solution node
+- **THEN** the configuration applies to that node's solution, with no
+  separate target field in the message
+
+#### Scenario: Unknown action id changes nothing
+
+- **WHEN** an invoke message carries an action id the service did not
+  declare
+- **THEN** no state or file changes and the failure is reported

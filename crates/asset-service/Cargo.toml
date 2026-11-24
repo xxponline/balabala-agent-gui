@@ -1,0 +1,26 @@
+[package]
+name = "asset-service"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+# design D1 依赖边: asset-service -> service-core (对齐 agent/solution-service,
+# 不含 service-manager —— 骨架侧职责不进服务 crate)。
+service-core = { path = "../service-core" }
+# `ActionDesc`/`ExecutedBy` 的中立来源 (change asset-service design D6) —
+# asset 与 solution 两侧共用同一描述符类型, 服务之间不互相依赖。
+contracts = { path = "../contracts" }
+# design D1: 本 crate 同时装总线服务与 GUI 面板, 形态对齐 `agent-service`
+# (它的 Cargo.toml 同样为 AgentTerminal 渲染层预置 gpui-kit)。仅 panel/
+# 用; 服务侧枚举一律走 service_core 的 spawn_task, 不碰 GPUI 执行器 (D4)。
+gpui-kit = { version = "0.9.0", features = ["syntect"] }
+# 同步 fs 必须走阻塞池 (design D4 修订) — runtime 是 worker_threads(1)，
+# 协作式 spawn_task 扛不住 std::fs::read_dir。
+# **features 与 agent-service / service-manager / service-plugin /
+# example-plugin 完全一致**（同一编译单元；否则 TypeId 分叉 — 那几处
+# Cargo.toml 注释已反复强调）。
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+
+[dev-dependencies]
+# 面板测试随迁 (task 5.5): 无头窗口 + ElementSnapshot (与 GUI dev-dep 同款)。
+gpui-kit = { version = "0.9.0", features = ["test-support"] }

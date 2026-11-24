@@ -341,6 +341,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "asset-service"
+version = "0.1.0"
+dependencies = [
+ "contracts",
+ "gpui-kit",
+ "service-core",
+ "tokio",
+]
+
+[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -620,6 +630,7 @@ name = "balabala-agent-gui"
 version = "0.1.0"
 dependencies = [
  "agent-service",
+ "asset-service",
  "contracts",
  "crossterm",
  "directories",
@@ -7486,6 +7497,7 @@ dependencies = [
 name = "solution-service"
 version = "0.1.0"
 dependencies = [
+ "contracts",
  "serde",
  "serde_json",
  "service-core",

@@ -9,13 +9,12 @@ projects and modules must satisfy.
 
 ## Requirements
 
-
 ### Requirement: Solution configuration file
 
 A workspace SHALL carry its solution configuration in `balabala.solutions.json`
 in the workspace directory: a JSON array of solution items, each declaring a
 `SolutionType`. Each item SHALL carry two configuration flags — whether its
-projects register into the asset manager, and whether git management is
+projects register into the asset service, and whether git management is
 enabled for it — and a missing flag SHALL default to enabled, so files
 written before the flags existed load with unchanged behavior. The file SHALL
 be created (empty array) together with the workspace marker; a workspace
@@ -36,7 +35,7 @@ without the file SHALL load as a valid workspace with zero projects.
 - **WHEN** a solutions file predates the flags and its items declare
   neither of them
 - **THEN** both flags behave as enabled: the item's projects register into
-  the asset manager and git management applies as before
+  the asset service and git management applies as before
 ### Requirement: Solution type registry resolves items to projects
 
 Each solution item's `SolutionType` SHALL resolve through a registry of
@@ -87,16 +86,16 @@ module references.
 If `balabala.solutions.json` cannot be parsed, declares an unknown
 `SolutionType`, or a `simple` item's `path` does not exist on disk, the system
 SHALL show an error dialog describing the failure and SHALL NOT open the
-workspace. The dialog SHALL appear at every load boundary (startup restore,
-manual workspace switch, explicit reload) — the system SHALL NOT fall back to
-an empty project list.
+workspace. The dialog SHALL appear at every load boundary (workspace open
+chosen at startup, explicit reload) — the system SHALL NOT fall back to an
+empty project list.
 
 #### Scenario: Corrupt solutions file at startup
 
-- **WHEN** the application restores the most-recent workspace at startup and
-  its `balabala.solutions.json` contains invalid JSON
+- **WHEN** the user chooses a workspace at startup whose
+  `balabala.solutions.json` contains invalid JSON
 - **THEN** an error dialog describes the parse failure and the application
-  exits without rendering the workspace
+  exits without opening the workspace
 
 #### Scenario: Solution path missing on disk
 
@@ -113,22 +112,23 @@ an empty project list.
   not opened
 ### Requirement: Solution creation via the SolutionConfig tab
 
-A workspace with zero projects SHALL offer an add-solution action in the left
-slot. Activating it SHALL open a SolutionConfig tab in the center slot with a
-path input instead of a system file picker. The tab SHALL show prechecks for
-the entered path — empty, duplicate, and valid (an existing directory) — and
-SHALL enable submission only while they all pass. Submitting SHALL append a
-`simple` solution item for that path to `balabala.solutions.json`; the
-resulting project SHALL appear in the left slot without restarting the
-application. Closing the tab without submitting SHALL leave the file and the
-view unchanged.
+A workspace with zero solutions SHALL offer an add-solution action in the
+left slot. Activating it SHALL open a SolutionConfig tab in the center slot
+with a path input instead of a system file picker. The tab SHALL show
+prechecks for the entered path — empty, duplicate, and valid (an existing
+directory) — and SHALL enable submission only while they all pass.
+Submitting SHALL append a `simple` solution item for that path to
+`balabala.solutions.json`; the resulting solution row and its project SHALL
+appear in the left slot without restarting the application. Closing the tab
+without submitting SHALL leave the file and the view unchanged.
 
 #### Scenario: Add solution from empty workspace
 
 - **WHEN** the user activates the add-solution action in an empty workspace,
   enters `/Users/me/code/foo`, and submits with all prechecks passing
-- **THEN** `balabala.solutions.json` gains one `simple` item for that path and
-  a project row `foo` appears in the left slot
+- **THEN** `balabala.solutions.json` gains one `simple` item for that path
+  and a solution row for `foo` with the project row `foo` beneath it appears
+  in the left slot
 
 #### Scenario: Failed precheck blocks submission
 

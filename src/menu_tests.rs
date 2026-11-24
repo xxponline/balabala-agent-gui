@@ -25,7 +25,7 @@ fn open_app(cx: &mut TestAppContext) -> (AnyWindowHandle, gpui_kit::Entity<Termi
                 ..Default::default()
             },
             cx,
-            |window, cx| cx.new(|cx| TerminalApp::new(window, cx).expect("app 启动")),
+            |window, cx| cx.new(|cx| TerminalApp::new(window, cx, None).expect("app 启动")),
         )
         .expect("open test window")
     });

@@ -2,9 +2,10 @@
 
 ## Purpose
 
-Owns the list of on-disk workspaces shown in the sidebar: each workspace wraps
-an absolute path that `pi` agents inside it inherit as their working directory,
-and the list is persisted to a JSON file across app restarts.
+Owns the lifecycle of the single workspace the application has open: the
+Launcher chooses which workspace to open at startup, workspace-scoped
+configuration lives inside that workspace's directory, and the MRU history
+persisted across restarts feeds the Launcher's list of previous choices.
 
 ## Requirements
 
@@ -25,40 +26,40 @@ in-memory change.
   is visible explaining the save failure
 ### Requirement: Startup workspace restore
 
-On startup the system SHALL open the most recently opened workspace directly
-into the main window when a stored history entry exists and its marker file
-is valid. With no history, or when the most recent entry's directory no longer
-exists or lacks a marker file, the system SHALL render the main window with an
-in-window empty state offering a directory picker. If the most recent entry's
-marker file exists but cannot be parsed, the system SHALL show an error dialog
-and exit.
+On startup the system SHALL open the Launcher window rather than opening any
+workspace directly, and SHALL NOT open a workspace until the user chooses one
+through it. The most recently opened workspace SHALL NOT be restored
+automatically. A chosen directory whose marker file exists but cannot be
+parsed SHALL be reported inside the Launcher, which stays open with no
+workspace opened.
 
 #### Scenario: Fresh start shows picker empty state
 
 - **WHEN** the application starts with no stored workspace history
-- **THEN** the main window opens showing an empty state with a directory
-  picker, and no workspace is loaded
+- **THEN** the Launcher window opens with an empty history list, and no
+  workspace is loaded
 
 #### Scenario: History restores last workspace
 
 - **WHEN** the application starts and the most recent history entry names a
   directory whose marker file is valid
-- **THEN** the main window opens directly with that workspace loaded and no
-  picker shown
+- **THEN** the Launcher window opens listing that workspace, and the workspace
+  is not opened until the user chooses it
 
 #### Scenario: Deleted history entry falls back to empty state
 
 - **WHEN** the most recent history entry names a directory that no longer
   exists
-- **THEN** the main window opens showing the empty-state picker and no error
-  dialog appears
+- **THEN** the Launcher window opens and no error dialog appears, because no
+  workspace was opened
 ### Requirement: Workspace opening via directory picker
 
-Choosing a directory (from the startup empty state or the switch entry) SHALL
-validate its marker file `.balabala.workspace.json`: if the file is missing,
-the system SHALL ask for confirmation before creating a new workspace; if it
-exists but cannot be parsed, the system SHALL show an error dialog and exit;
-if it is valid, the workspace SHALL open.
+Choosing a directory from the Launcher SHALL validate its marker file
+`.balabala.workspace.json`: if the file is missing, the system SHALL ask for
+confirmation before creating a new workspace; if it exists but cannot be
+parsed, the failure SHALL be reported inside the Launcher with no workspace
+opened and the application still running; if it is valid, the workspace
+SHALL open.
 
 #### Scenario: Valid workspace opens
 
@@ -70,13 +71,14 @@ if it is valid, the workspace SHALL open.
 
 - **WHEN** the user picks a directory without `.balabala.workspace.json`
 - **THEN** a confirmation prompt offers to create a new workspace there, and
-  declining leaves no workspace open
+  declining returns to the Launcher with no workspace open
 
 #### Scenario: Corrupt marker blocks startup
 
 - **WHEN** the user picks a directory whose `.balabala.workspace.json`
   contains invalid JSON
-- **THEN** an error dialog describes the failure and the application exits
+- **THEN** the failure is described inside the Launcher, the Launcher stays
+  open with no workspace open, and the application keeps running
 ### Requirement: Workspace creation writes identity and solutions files
 
 Confirming creation SHALL write `.balabala.workspace.json` (with a format
@@ -96,46 +98,6 @@ failure is surfaced per the write-failure contract.
 - **WHEN** creation is confirmed but writing the solutions file fails
 - **THEN** the failure is surfaced as an on-screen error and no workspace is
   opened
-### Requirement: Workspace switch entry
-
-The left slot SHALL provide a workspace switch control at its top (the entry
-point that replaces the former per-workspace sidebar rows). Activating it
-SHALL follow the same directory-picker and validation path as startup
-selection; switching SHALL first satisfy the gating rules for the currently
-open workspace's sessions.
-
-#### Scenario: Switch entry opens the picker
-
-- **WHEN** the user activates the switch control while a workspace is open
-- **THEN** a directory picker opens, and cancelling it keeps the current
-  workspace unchanged
-### Requirement: Gated workspace switching
-
-Switching away SHALL be blocked while any session of the current workspace is
-in the `starting` or `running` state, with an on-screen notice naming the
-count of active sessions and leaving the workspace untouched. When only
-`exited` sessions remain, switching SHALL require a confirmation that states
-their preserved terminal screens will be discarded; confirming discards them
-and proceeds. With no sessions, switching SHALL proceed directly.
-
-#### Scenario: Active sessions block the switch
-
-- **WHEN** the user activates workspace switching while two sessions are
-  `running`
-- **THEN** a notice reports 2 active sessions, no picker opens, and the
-  current workspace is unchanged
-
-#### Scenario: Exited sessions require confirmation
-
-- **WHEN** the user activates switching and the workspace has only `exited`
-  sessions
-- **THEN** a confirmation warns that those sessions' screens will be
-  discarded; confirming proceeds to the picker and cancelling stays
-
-#### Scenario: No sessions switch directly
-
-- **WHEN** the user activates switching with zero sessions open
-- **THEN** the directory picker opens immediately with no confirmation
 ### Requirement: Workspace data lives in the workspace directory
 
 All workspace-scoped state SHALL be stored inside the workspace directory
@@ -153,13 +115,14 @@ The legacy `.workspaces.json` SHALL be used as a one-time migration source:
 its list seeds workspace history (completion recorded in the history store),
 and its `file_tree` rules for a workspace SHALL be copied into that
 workspace's configuration when the workspace is opened and its configuration
-lacks the section. The application SHALL NOT rewrite the legacy file.
+lacks the section. The application SHALL NOT rewrite the legacy file. Seeding
+SHALL complete before the Launcher presents history.
 
 #### Scenario: Legacy file seeds history once
 
 - **WHEN** the application starts and an app-root `.workspaces.json` lists
   previously used workspaces
-- **THEN** those paths seed the workspace history used by startup restore,
+- **THEN** those paths seed the workspace history presented by the Launcher,
   and the legacy file is not rewritten
 
 #### Scenario: Legacy filter rules copied into workspace config
