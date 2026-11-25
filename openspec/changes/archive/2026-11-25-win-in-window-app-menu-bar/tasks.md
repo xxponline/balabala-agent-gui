@@ -176,26 +176,36 @@
       - 运行期日志无 panic/error。
       **记录口径说明**：观察者是用户（我无法目视 GUI），我方负责逐项对照
       spec 场景与整理；非我方独立复现。
-- [ ] 6.3 macOS 侧确认不回归：原生菜单栏仍出现、Cmd+C 复制不变、窗口内
+- [x] 6.3 macOS 侧确认不回归：原生菜单栏仍出现、Cmd+C 复制不变、窗口内
       菜单栏未被挂载（无双份菜单），验证：真机目视 + `cargo test` 失败集合
       与基线 diff 为空。
-      **状态：待 macOS 真机补做，change 暂不归档**（用户选择：稍后补）。
-      本机为 Windows，**无法执行**——与 task 2.2 的 macOS 交叉编译限制同源
-      （无 Apple SDK）。风险评估：本 change **未改动 macOS 路径的行为** —
-      `menu::install` 的 macOS 分支只多了 `feed_global`（GlobalState 在
-      macOS 无消费者，因 `menu_bar` 恒 `None` 不挂载）、返回值仍为 `None`；
-      `set_menus` 调用原样保留；`secondary-c` 在 macOS 解析为 `platform`
-      （⌘）与原 `cmd-c` **等价**。故回归风险低，但**无编译/运行证据**，
-      属结构性论证（同 2.2 处理）。
+      **验收记录（2026-11-25, macOS 27.2.1 arm64, debug 构建, 用户真机
+      目视 + 我方跑测试整理）**：
+      - 编译 ✓ —— `cargo check --all-targets` 通过（2.2 记录的
+        `onig_sys` 缺 `cc` 阻塞在本机不存在：有 Xcode + `/usr/bin/cc`）
+      - `cargo test` ✓ —— **149 passed / 0 failed**（exit 0、有
+        `test result` 行，非 Windows 侧静默跳跑形态）；macOS 基线即
+        **0 失败**（Windows 基线 22 个属 Windows 特有，与本机无关），
+        零新增失败成立
+      - 原生菜单栏仍出现 ✓、⌘C 复制不变 ✓、窗口内菜单栏未挂载
+        （无双份菜单）✓ —— 用户目视
+      - 运行期日志无 panic/error ✓（term-rate/grid 常态输出）
+      - 关联测试绿：`terminal_copy_binding_resolves_per_platform`
+        （macOS 断 `platform`=⌘）、`menu_bar_has_edit_copy`、
+        `copy_availability_follows_selection`、
+        `rebuild_menus_updates_content_then_keeps_order`
+      **已知小尾巴（不阻塞验收）**：macOS 侧 `cargo check` 有 3 个
+      dead-code warning（`menu_tests.rs` 的 `open_menu_at` /
+      `open_edit_menu` / `copy_disabled` 仅被 `cfg(not(target_os =
+      "macos"))` 测试调用，macOS 下无消费者）；Windows 侧仍零 warning。
+      **记录口径说明**：观察者是用户，我方负责跑编译/测试并整理对照；
+      非我方独立目视复现。
 
 ## Workflow follow-up
 
-- **归档前置条件：task 6.3 尚未完成**（待 macOS 真机补做）—— 本轮**不归档**。
-  6.3 完成后：`openspec archive`，确认归档后主 spec 含本次三处
-  `app-menu-bar` delta 与一处 `agent-shell` delta。
-- 6.3 执行时的检查点：macOS 原生菜单栏仍出现、Cmd+C 复制不变、
-  窗口内菜单栏**未**被挂载（无双份菜单）、`cargo test` 失败集合与
-  macOS 侧基线 diff 为空。
+- **归档前置条件：task 6.3 已完成（2026-11-25, macOS 真机）** ——
+  `openspec archive` 已执行，归档后主 spec 含本次三处 `app-menu-bar`
+  delta 与一处 `agent-shell` delta。
 - 附带可选观察（不阻塞归档）：Win+C 在 Win11 是否弹 Copilot/Widgets
   面板 —— design Risks 已记为外部行为、不影响正确性，与本 change
   无关。
