@@ -709,6 +709,18 @@ impl TerminalApp {
         checked: Option<bool>,
         cx: &mut Context<Self>,
     ) {
+        // delete-worktree 的会话前置门（change solution-git-worktree 5.1,
+        // design D3 路线 A）：invoke **前**查 sessions_view 官方投影 ——
+        // 属主 project 有 Starting|Running 会话 → notice 拦下, 不发消息。
+        // 服务端只跑 git 自己的干净门（D2）, 两门各司其职。
+        if action_id == solution_service::ACTION_DELETE_WORKTREE {
+            if let Some(reason) = self.worktree_delete_blocked(node) {
+                self.notice = Some(format!("{label}失败: {reason}"));
+                cx.notify();
+                self.notify_panels(cx);
+                return;
+            }
+        }
         let args = solution_service::configure_action_args(action_id, checked).map(Payload::new);
         let result =
             self.service_layer
@@ -721,6 +733,37 @@ impl TerminalApp {
         }
         cx.notify();
         self.notify_panels(cx);
+    }
+
+    /// 会话前置门判据（5.1, design D3 路线 A）：返回 `Some(原因)` = 应拦下。
+    ///
+    /// 属主 project = 树镜像里 worktree 层命中的那个 project；拦的条件 =
+    /// 该 project root **或 worktree 自身路径**下有 `Starting|Running` 会话
+    /// （后者为 worktree 会话进场预铺）。镜像缺位/worktree 未登记/投影未到
+    /// → `None` 放行 —— 未知不拦（服务端 git 门还会拒不存在的 worktree）。
+    fn worktree_delete_blocked(&self, worktree_node: &str) -> Option<String> {
+        let wt_path = std::path::PathBuf::from(worktree_node);
+        let canon = |p: &std::path::Path| {
+            std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+        };
+        let wt = canon(&wt_path);
+        let owner = self.service_layer.tree_view()?.hierarchy.iter()
+            .flat_map(|s| s.projects.iter())
+            .find(|p| p.worktrees.iter().any(|w| canon(&w.path) == wt))?;
+        let sessions = self.service_layer.sessions_view()?;
+        let busy = sessions.sessions.iter().find(|s| {
+            (canon(&s.project_root) == canon(&owner.desc.root)
+                || canon(&s.project_root) == wt)
+                && matches!(
+                    s.status,
+                    agent_service::contract::SessionStatus::Starting
+                        | agent_service::contract::SessionStatus::Running
+                )
+        })?;
+        Some(format!(
+            "{} 下有运行中的 agent ({})",
+            owner.desc.name, busy.name
+        ))
     }
 
     /// Create ask 发送点（表单签提交与测试共用缝; change solution-service
@@ -1282,6 +1325,7 @@ mod tests {
                 },
                 projects: std::sync::Arc::from(vec![solution_service::ProjectNode {
                     desc,
+                    worktrees: std::sync::Arc::from([]),
                     actions: std::sync::Arc::from([]),
                 }]),
                 actions: std::sync::Arc::from([]),
@@ -2847,6 +2891,7 @@ mod tests {
                         root: external.clone(),
                         is_git: false,
                     },
+                    worktrees: std::sync::Arc::from([]),
                     actions: std::sync::Arc::from([]),
                 }]),
                 actions: std::sync::Arc::from([]),
@@ -3966,5 +4011,210 @@ mod tests {
                 "旧项目行不得残留"
             );
         });
+    }
+
+    /// change solution-git-worktree 5.1: delete-worktree 会话前置门
+    /// （design D3 路线 A）—— Running 拦下且**零消息发出**、Exited 放行。
+    #[gpui_kit::test]
+    fn worktree_delete_gated_by_running_session(cx: &mut TestAppContext) {
+        use agent_service::contract::{SessionId, SessionInfo, SessionStatus, SessionView};
+        use solution_service::ACTION_DELETE_WORKTREE;
+
+        let history = fresh_history_path();
+        let (_handle, app_entity) = open_app(cx, history, None);
+        cx.run_until_parked();
+
+        // 假路径即可 —— 门只比对字符串 (canonicalize 失败回退原值), 不碰盘
+        let proj_root = std::env::temp_dir()
+            .join(format!("wt-gate-proj-{}", std::process::id()));
+        let wt_path = proj_root
+            .join(".balabala.worktrees")
+            .join("feat");
+        let mk_sessions = |status: SessionStatus| SessionView {
+            sessions: std::sync::Arc::from(vec![SessionInfo {
+                id: SessionId(42),
+                name: "pi-1".into(),
+                project_root: proj_root.clone(),
+                status,
+            }]),
+            active: None,
+        };
+
+        // 树镜像: project 带一个 worktree 层 (门的属主解析源)
+        app_entity.update(cx, |app, cx| {
+            inject_test_workspace(app, "wt-gate");
+            use solution_service::{ProjectDesc, ProjectNode, SolutionItem, SolutionNode,
+                TreeSnapshot, WorktreeNode};
+            app.service_layer.set_tree_view_for_test(TreeSnapshot {
+                solutions: std::sync::Arc::from(vec![SolutionItem::Simple {
+                    path: proj_root.clone(),
+                    register_to_asset_manager: true,
+                    git_enabled: true,
+                }]),
+                hierarchy: std::sync::Arc::from(vec![SolutionNode {
+                    item: SolutionItem::Simple {
+                        path: proj_root.clone(),
+                        register_to_asset_manager: true,
+                        git_enabled: true,
+                    },
+                    projects: std::sync::Arc::from(vec![ProjectNode {
+                        desc: ProjectDesc {
+                            name: "proj".into(),
+                            root: proj_root.clone(),
+                            is_git: true,
+                        },
+                        worktrees: std::sync::Arc::from(vec![WorktreeNode {
+                            path: wt_path.clone(),
+                            branch: Some("feat".into()),
+                            actions: solution_service::worktree_actions(),
+                        }]),
+                        actions: solution_service::project_actions(),
+                    }]),
+                    actions: std::sync::Arc::from([]),
+                }]),
+            });
+            app.workspace = Some(Workspace::new(proj_root.clone()));
+
+            // 态1: 属主 project 有 Running 会话 → 拦下
+            app.service_layer.sessions_view = Some(mk_sessions(SessionStatus::Running));
+            app.notice = None;
+            app.invoke_solution_action(
+                &wt_path.to_string_lossy(),
+                ACTION_DELETE_WORKTREE,
+                "删除 worktree",
+                None,
+                cx,
+            );
+        });
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            let notice = app.notice.clone().expect("Running 应拦下并出 notice");
+            assert!(notice.contains("删除 worktree"), "notice 点名动作: {notice}");
+            assert!(notice.contains("pi-1"), "notice 点名阻塞会话: {notice}");
+            assert_eq!(
+                app.service_layer.sol_action_sends, 0,
+                "拦下时必须零消息发出 (不碰服务)"
+            );
+        });
+
+        // 态2: 同 project 但会话已 Exited → 放行 (消息真的发出)
+        app_entity.update(cx, |app, cx| {
+            app.service_layer.sessions_view = Some(mk_sessions(SessionStatus::Exited));
+            app.notice = None;
+            app.invoke_solution_action(
+                &wt_path.to_string_lossy(),
+                ACTION_DELETE_WORKTREE,
+                "删除 worktree",
+                None,
+                cx,
+            );
+        });
+        cx.update(|cx| {
+            let app = app_entity.read(cx);
+            assert_eq!(
+                app.service_layer.sol_action_sends, 1,
+                "Exited 放行 → 消息发出"
+            );
+            assert!(app.notice.is_none(), "放行路径不在 view 层出 notice");
+        });
+    }
+
+    /// change solution-git-worktree 5.3: hierarchy 第三层渲染 ——
+    /// 有 worktree 的 project 展开见行、无 worktree 的 project 层为空。
+    #[gpui_kit::test]
+    fn solution_overview_renders_worktree_rows(cx: &mut TestAppContext) {
+        use solution_service::{ProjectDesc, ProjectNode, SolutionItem, SolutionNode,
+            TreeSnapshot, WorktreeNode};
+
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app(cx, history, None);
+        cx.run_until_parked();
+
+        let ws_path = std::env::temp_dir()
+            .join(format!("wt-rows-{}", std::process::id()));
+        let with_wt = ws_path.join("with-wt");
+        let without_wt = ws_path.join("without-wt");
+        let wt_path = ws_path.join(".balabala.worktrees").join("feat");
+
+        app_entity.update(cx, |app, cx| {
+            inject_test_workspace(app, "wt-rows");
+            let mk_project = |root: std::path::PathBuf, wts: Vec<WorktreeNode>| ProjectNode {
+                desc: ProjectDesc {
+                    name: root
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    root,
+                    is_git: true,
+                },
+                worktrees: wts.into(),
+                actions: solution_service::project_actions(),
+            };
+            app.service_layer.set_tree_view_for_test(TreeSnapshot {
+                solutions: std::sync::Arc::from(vec![SolutionItem::Simple {
+                    path: ws_path.clone(),
+                    register_to_asset_manager: true,
+                    git_enabled: true,
+                }]),
+                hierarchy: std::sync::Arc::from(vec![SolutionNode {
+                    item: SolutionItem::Simple {
+                        path: ws_path.clone(),
+                        register_to_asset_manager: true,
+                        git_enabled: true,
+                    },
+                    projects: std::sync::Arc::from(vec![
+                        mk_project(
+                            with_wt.clone(),
+                            vec![WorktreeNode {
+                                path: wt_path.clone(),
+                                branch: Some("feat".into()),
+                                actions: solution_service::worktree_actions(),
+                            }],
+                        ),
+                        mk_project(without_wt.clone(), vec![]),
+                    ]),
+                    actions: std::sync::Arc::from([]),
+                }]),
+            });
+            app.workspace = Some(Workspace::new(ws_path.clone()));
+            app.solution_overview.update(cx, |_, cx| cx.notify());
+        });
+        cx.run_until_parked();
+
+        // 有 worktree 的 project: 展开见行 (文本 + 元素 id 锚点)
+        let texts = render_texts(handle, cx);
+        assert!(
+            texts.iter().any(|t| t == "feat"),
+            "worktree 行应渲染分支名, 实际: {texts:?}"
+        );
+        let wt_ids = cx
+            .update_window(handle, |_, window, cx| {
+                use gpui_kit::test::TestQueryExt;
+                window.render_frame(cx);
+                window
+                    .elements()
+                    .iter()
+                    .filter_map(|e| e.path().last().map(|id| id.to_string()))
+                    .filter(|id| id.starts_with("worktree-name-"))
+                    .collect::<Vec<_>>()
+            })
+            .expect("update window");
+        assert_eq!(
+            wt_ids.len(),
+            1,
+            "快照只有一个 worktree → 恰好一行, 实际: {wt_ids:?}"
+        );
+        assert!(
+            wt_ids[0].contains(&wt_path.display().to_string()),
+            "行 id 锚 worktree 裸路径: {}",
+            wt_ids[0]
+        );
+
+        // 无 worktree 的 project: 层为空 —— 全部 worktree 行只属于有树的
+        // 那个 project (上面已断言总数 == 1), 且 without_wt 下无任何行
+        assert!(
+            !wt_ids.iter().any(|id| id.contains(&without_wt.display().to_string())),
+            "无 worktree 的 project 不得有 worktree 行: {wt_ids:?}"
+        );
     }
 }

@@ -21,7 +21,7 @@ use gpui_kit::{InteractiveElement, *};
 use std::path::PathBuf;
 
 use agent_service::contract::{SessionId, SessionView, SessionStatus};
-use solution_service::{ActionDesc, ProjectDesc, solution_node_id};
+use solution_service::{ActionDesc, solution_node_id};
 use crate::app::TerminalApp;
 use crate::ui::widgets::TextTooltip;
 
@@ -125,6 +125,19 @@ pub struct ProjectRow {
     pub collapsed: bool,
     /// 展开时渲染的 agent 行 (collapsed 时为空)
     pub agents: Vec<AgentRow>,
+    /// 展开时渲染的 worktree 行 (hierarchy 第三层; collapsed 时为空)。
+    pub worktrees: Vec<WorktreeRow>,
+}
+
+/// 一个 worktree 行的渲染数据 (拥有值, change solution-git-worktree 5.3)。
+pub struct WorktreeRow {
+    /// worktree 绝对路径 (身份 / 锚点 id; solution-overview D2:
+    /// worktree 行用裸路径)。
+    pub path: String,
+    /// 显示名: 分支名 (detached → 目录末段)。
+    pub name: String,
+    /// 服务为该节点声明的动作 (右键菜单源, 恒含 delete, design D5)。
+    pub actions: Vec<ActionDesc>,
 }
 
 /// 一个 agent 行的渲染数据 (拥有值)。
@@ -179,13 +192,14 @@ pub struct SidebarSnapshot {
     pub ws: Option<WsView>,
 }
 
-/// 组装一个 project 行 (含其 agent 行; project 折叠时 agent 为空)。
+/// 组装一个 project 行 (含其 agent/worktree 行; project 折叠时两者为空)。
 fn project_row(
-    p: &ProjectDesc,
+    p: &solution_service::ProjectNode,
     ws: &crate::workspace::Workspace,
     sessions: Option<&SessionView>,
 ) -> ProjectRow {
-    let collapsed = ws.collapsed_projects.contains(&p.root);
+    let desc = &p.desc;
+    let collapsed = ws.collapsed_projects.contains(&desc.root);
     let agents = if collapsed {
         Vec::new()
     } else {
@@ -193,7 +207,7 @@ fn project_row(
             .map(|v| {
                 v.sessions
                     .iter()
-                    .filter(|s| s.project_root == p.root)
+                    .filter(|s| s.project_root == desc.root)
                     .map(|s| AgentRow {
                         id: s.id,
                         name: s.name.clone(),
@@ -204,11 +218,32 @@ fn project_row(
             })
             .unwrap_or_default()
     };
+    let worktrees = if collapsed {
+        Vec::new()
+    } else {
+        p.worktrees
+            .iter()
+            .map(|w| WorktreeRow {
+                path: w.path.to_string_lossy().into_owned(),
+                name: w
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| {
+                        w.path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    }),
+                actions: w.actions.to_vec(),
+            })
+            .collect::<Vec<_>>()
+    };
     ProjectRow {
-        root: p.root.to_string_lossy().into_owned(),
-        name: p.name.clone(),
+        root: desc.root.to_string_lossy().into_owned(),
+        name: desc.name.clone(),
         collapsed,
         agents,
+        worktrees,
     }
 }
 
@@ -235,7 +270,7 @@ fn snapshot(app: &TerminalApp, _cx: &App) -> SidebarSnapshot {
                         } else {
                             node.projects
                                 .iter()
-                                .map(|p| project_row(&p.desc, ws, sessions))
+                                .map(|p| project_row(p, ws, sessions))
                                 .collect::<Vec<_>>()
                         };
                         SolutionRow {
@@ -298,6 +333,11 @@ impl Render for SolutionOverviewPanel {
                 for project in &sol.projects {
                     rows.push(build_project_row(project, cx).into_any_element());
                     if !project.collapsed {
+                        // hierarchy 第三层 (change solution-git-worktree 5.3):
+                        // worktree 行紧跟其 project, 位于 agent 行之前
+                        for wt in &project.worktrees {
+                            rows.push(build_worktree_row(wt, cx).into_any_element());
+                        }
                         for agent in &project.agents {
                             rows.push(build_agent_row(agent, cx).into_any_element());
                         }
@@ -517,6 +557,86 @@ fn build_project_row(p: &ProjectRow, cx: &mut Context<SolutionOverviewPanel>) ->
                 .child(name.clone())
                 .test_text(name),
         )
+}
+
+/// 构建一行 worktree (hierarchy 第三层, change solution-git-worktree 5.3)。
+///
+/// - 身份 = 裸路径 (solution-overview D2: worktree 行用裸路径)。
+/// - 右键菜单由服务声明的 `actions` 构建 (同 solution 行形态, D3) ——
+///   恒含 delete；无打开语义 (开终端归 agent-service, 本 change 边界外)。
+fn build_worktree_row(
+    w: &WorktreeRow,
+    cx: &mut Context<SolutionOverviewPanel>,
+) -> ContextMenu<Stateful<Div>> {
+    let element_id = format!("worktree-row-{}", w.path);
+    let group = format!("worktree-{}", w.path);
+    // 语义 token 快照 (Hsla: Copy) — 闭包捕获值 (design D3)
+    let theme_hover = cx.theme().list_hover;
+    let theme_muted = cx.theme().muted_foreground;
+    let tooltip = w.path.clone();
+    let name = w.name.clone();
+
+    div()
+        .id(element_id)
+        .group(group)
+        .ml(px(16.)) // 缩进 (project 行内, 与 agent 行同级)
+        .flex()
+        .items_center()
+        .gap_1()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .hover(|style| style.bg(theme_hover))
+        .tooltip(move |_window, cx: &mut App| {
+            let text = tooltip.clone();
+            cx.new(move |_| TextTooltip { text }).into()
+        })
+        .child(div().text_sm().text_color(theme_muted).child("⑂"))
+        .child(
+            div()
+                // 观测锚点 (no-op): 挂在内层子元素上
+                .id(format!("worktree-name-{}", w.path))
+                .test_support()
+                .flex_1()
+                .text_sm()
+                .child(name.clone())
+                .test_text(name),
+        )
+        // 右键菜单: 从节点携带的 actions 构建 (同 solution 行, D3)
+        .context_menu({
+            let weak = cx.entity().downgrade();
+            let actions = w.actions.clone();
+            let node = w.path.clone();
+            move |menu, _window, _cx| {
+                let mut menu = menu;
+                for desc in actions.iter() {
+                    let mut item = PopupMenuItem::new(desc.label.clone());
+                    if let Some(v) = desc.checked {
+                        item = item.checked(v);
+                    }
+                    let act_id = desc.id.clone();
+                    let act_label = desc.label.clone();
+                    let act_checked = desc.checked;
+                    let weak = weak.clone();
+                    let node = node.clone();
+                    item = item.on_click(move |_, _window, cx| {
+                        weak
+                            .update(cx, |panel, cx| {
+                                panel.invoke_action(
+                                    node.clone(),
+                                    act_id.clone(),
+                                    act_label.clone(),
+                                    act_checked,
+                                    cx,
+                                )
+                            })
+                            .ok();
+                    });
+                    menu = menu.item(item);
+                }
+                menu
+            }
+        })
 }
 
 /// 构建一个 agent 行: 状态点 + 名字 (active 高亮) + hover 显隐 ×。

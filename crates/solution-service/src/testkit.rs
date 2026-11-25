@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct TestMessaging {
     id: InstanceId,
     sent: Mutex<Vec<Envelope>>,
+    /// 捕获的后台任务 (3.2: 后台 git 任务由测试 drive)。
+    spawned: Mutex<Vec<TaskFuture>>,
 }
 
 impl TestMessaging {
@@ -21,6 +23,7 @@ impl TestMessaging {
         Self {
             id,
             sent: Mutex::new(Vec::new()),
+            spawned: Mutex::new(Vec::new()),
         }
     }
 
@@ -75,7 +78,32 @@ impl Messaging for TestMessaging {
     }
 
     fn spawn_task(&self, fut: TaskFuture) {
-        drop(fut); // SolutionService 无后台任务; 测试不驱动
+        // 捕获而非丢弃: change solution-git-worktree 3.2 的后台 git 任务
+        // 由测试自行 drive (断言回执先于完成事件 / 无 corr / stderr 摘要)。
+        self.spawned
+            .lock()
+            .expect("test spawned poisoned")
+            .push(fut);
+    }
+}
+
+impl TestMessaging {
+    /// 驱动所有已捕获的后台任务至完成（测试用）。
+    ///
+    /// 未来体内无 await 点（同步 git 子进程）→ 单次 poll 即 Ready；
+    /// 兼顾起见循环至 Ready, 上限防意外 Pending 死转。
+    pub fn drive_spawned(&self) {
+        let mut futs = std::mem::take(&mut *self.spawned.lock().expect("test spawned poisoned"));
+        for mut fut in futs.drain(..) {
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            for _ in 0..16 {
+                match fut.as_mut().poll(&mut cx) {
+                    std::task::Poll::Ready(()) => break,
+                    std::task::Poll::Pending => continue,
+                }
+            }
+        }
     }
 }
 

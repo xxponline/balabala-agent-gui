@@ -142,6 +142,12 @@ pub fn configure_action_args(action_id: &str, checked: Option<bool>) -> Option<C
 pub const ACTION_CREATE: &str = "create";
 pub const ACTION_CONFIGURE_REGISTER: &str = "configure.register_to_asset_manager";
 pub const ACTION_CONFIGURE_GIT: &str = "configure.git_enabled";
+/// git 操作四个动作 id（change solution-git-worktree, design D5）：
+/// 描述符声明与服务端 `match` 分派共用同一词汇。
+pub const ACTION_PULL: &str = "git.pull";
+pub const ACTION_PUSH: &str = "git.push";
+pub const ACTION_CREATE_WORKTREE: &str = "worktree.create";
+pub const ACTION_DELETE_WORKTREE: &str = "worktree.delete";
 
 /// solution 节点声明的可用操作（design D3: 描述符随快照下传）。
 ///
@@ -164,6 +170,37 @@ pub fn solution_actions(item: &SolutionItem) -> Arc<[ActionDesc]> {
     ])
 }
 
+/// project 节点声明的可用操作（恒声明, design D5 方案 b）：
+/// **不**按 is_git/干净态过滤 —— 快照现算拦不住 invoke 前的状态变化
+/// （陈旧），门控在服务端 invoke 时做, 不过 → `OpError` → 既有 notice。
+pub fn project_actions() -> Arc<[ActionDesc]> {
+    const OPS: [(&str, &str); 3] = [
+        (ACTION_PULL, "拉取"),
+        (ACTION_PUSH, "推送"),
+        (ACTION_CREATE_WORKTREE, "创建 worktree"),
+    ];
+    Arc::from(
+        OPS.into_iter()
+            .map(|(id, label)| ActionDesc {
+                id: id.to_string(),
+                label: label.to_string(),
+                checked: None, // 非开关
+                execution: ExecutedBy::Service,
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// worktree 节点声明的可用操作（恒声明, 同 `project_actions` 立场）。
+pub fn worktree_actions() -> Arc<[ActionDesc]> {
+    Arc::from(vec![ActionDesc {
+        id: ACTION_DELETE_WORKTREE.to_string(),
+        label: "删除 worktree".to_string(),
+        checked: None,
+        execution: ExecutedBy::Service,
+    }])
+}
+
 /// solution 节点 id 前缀 — 与 asset 树 `project_id()` 同构的命名空间方案
 /// （change solution-overview D2）：v1 的 solution path 与 project root
 /// **是同一目录**, 裸路径会让两行撞 id（展开集/右键查找/观测锚点全坏）。
@@ -183,11 +220,40 @@ pub fn parse_solution_node(node: Option<&str>) -> Option<PathBuf> {
     node?.strip_prefix(SOLUTION_NODE_PREFIX).map(PathBuf::from)
 }
 
+/// project 层节点 id 前缀 — 与 asset 树 `project_id()` 同构
+/// （change solution-overview D2: 复用 `project://<path>`）。
+pub const PROJECT_NODE_PREFIX: &str = "project://";
+
+/// 构造 project 节点 id（视图渲染与服务回指同一函数）。
+pub fn project_node_id(root: &Path) -> String {
+    format!("{PROJECT_NODE_PREFIX}{}", root.display())
+}
+
+/// 解析 project 节点 id → 目标 root；语义同 [`parse_solution_node`]
+/// （None = 契约 bug → reject；前缀对但无此 project → `OpError::NoSuch`）。
+pub fn parse_project_node(node: Option<&str>) -> Option<PathBuf> {
+    node?.strip_prefix(PROJECT_NODE_PREFIX).map(PathBuf::from)
+}
+
 /// project 层节点（hierarchy 第二层）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectNode {
     pub desc: ProjectDesc,
+    /// 该 project 注册的 worktree 层（hierarchy 第三层；无 → 空层，
+    /// change solution-git-worktree design D4：真源 = git 元数据）。
+    pub worktrees: Arc<[WorktreeNode]>,
     /// 服务为该节点声明的操作（design D3）。
+    pub actions: Arc<[ActionDesc]>,
+}
+
+/// worktree 层节点（hierarchy 第三层，change solution-git-worktree）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeNode {
+    /// working copy 绝对路径（身份锚点；视图右键回指它）。
+    pub path: PathBuf,
+    /// 当前分支（detached → `None`）。
+    pub branch: Option<String>,
+    /// 服务为该节点声明的操作（恒声明 delete，design D5）。
     pub actions: Arc<[ActionDesc]>,
 }
 
@@ -258,6 +324,17 @@ pub struct ConfigureReq {
     pub register_to_asset_manager: Option<bool>,
     pub git_enabled: Option<bool>,
 }
+
+/// 创建 worktree 的参数（change solution-git-worktree 4.1）：`name` =
+/// 期望的分支/目录名（同名 —— `git worktree add` 按 basename 自建分支），
+/// 经消毒后落盘；表单 UI 属后续（design OQ2）。
+pub struct CreateWorktreeReq {
+    pub name: String,
+}
+
+/// worktree 物理目录（workspace 下, design D4 —— 点前缀让资产枚举默认
+/// 隐藏；与 tracked-clean 门（D2）互为双解药, 缺一不可）。
+pub const WORKTREES_DIR: &str = ".balabala.worktrees";
 
 /// 通用动作调用 — **写入口单点**（change solution-overview design D6）。
 ///
@@ -347,6 +424,10 @@ pub enum OpError {
     /// `RouteError::Timeout`, notice 只写 "ask timeout" — 既慢又不点名。
     /// 与 node 格式坏的 `reject` 分流（那条是真的无法解释目标）。
     UnknownAction(String),
+    /// git 域拒绝/失败的结构化原因（change solution-git-worktree,
+    /// design D5）：非 git 项目、tracked 不净、git 子进程失败（stderr
+    /// 尾部）都归这里 → 既有 notice 链路（按 action_id 命名）。
+    Git(String),
 }
 
 impl std::fmt::Display for OpError {
@@ -356,6 +437,7 @@ impl std::fmt::Display for OpError {
             OpError::NoSuch(p) => write!(f, "no such solution: {}", p.display()),
             OpError::Persist(m) => write!(f, "{m}"),
             OpError::UnknownAction(a) => write!(f, "unknown action: {a}"),
+            OpError::Git(m) => write!(f, "{m}"),
         }
     }
 }
@@ -388,6 +470,24 @@ pub const KIND_WATCH: &str = "solution.watch";
 /// 控制 ask 的统一回执 kind（载荷 = `OpResult`；对齐 `KIND_CONTROL_REPLY`）。
 pub const KIND_OP_REPLY: &str = "solution.reply";
 pub const KIND_TREE_CHANGED: &str = "solution.tree_changed";
+/// git 操作完成事件（change solution-git-worktree, design D1）：**无 corr**
+/// 的 tell —— 原 corr 已在 accepted 回执时销账, 带 corr 迟到会进死信
+/// （"late or unknown reply"）。载荷 = 本结构。
+pub const KIND_GIT_OP_FINISHED: &str = "solution.git_op_finished";
+
+/// `KIND_GIT_OP_FINISHED` 载荷：完成结果按 `action_id` 回到 notice 链路
+/// （node-actions: 按 id 路由不按 label）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitOpFinished {
+    /// 发起时的动作 id（git.pull / git.push / …）—— notice 路由键。
+    pub action_id: String,
+    /// 操作目标（project root 或 worktree path, 展示用）。
+    pub target: String,
+    /// 成败。
+    pub ok: bool,
+    /// 失败原因（git stderr 尾部摘要）；成功 → 空串。
+    pub detail: String,
+}
 
 #[cfg(test)]
 mod tests {
@@ -556,15 +656,114 @@ mod tests {
         );
         let labels: Vec<&str> = root.actions.iter().map(|a| a.label.as_str()).collect();
         assert_eq!(labels, vec!["注册到资产树", "git 管理"], "描述符携带 label");
-        assert!(
-            root.projects[0].actions.is_empty(),
-            "project 节点暂无声明 (create worktree 属后续)"
+        // change solution-git-worktree 2.1: project 节点从空 → 恒声明三个 git 动作
+        let pids: Vec<&str> = root.projects[0]
+            .actions
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
+        assert_eq!(
+            pids,
+            vec![ACTION_PULL, ACTION_PUSH, ACTION_CREATE_WORKTREE],
+            "project 节点恒声明 pull/push/create-worktree (design D5 恒声明)"
         );
         assert_eq!(
             root.item.path(),
             std::path::Path::new("/a/foo"),
             "item 原样保留在节点上"
         );
+    }
+
+    /// 任务 2.1 验证: 两类节点携带的 descriptor 集合与 label（对齐
+    /// `solution_actions` 既有测试形态）。
+    #[test]
+    fn project_and_worktree_nodes_declare_git_actions() {
+        // project 节点: 三动作, label 中文归服务, 恒 Service 执行, 非开关
+        let p = project_actions();
+        let pids: Vec<&str> = p.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(pids, vec![ACTION_PULL, ACTION_PUSH, ACTION_CREATE_WORKTREE]);
+        let plabels: Vec<&str> = p.iter().map(|a| a.label.as_str()).collect();
+        assert_eq!(plabels, vec!["拉取", "推送", "创建 worktree"], "label 归服务所有");
+        for a in p.iter() {
+            assert_eq!(a.execution, ExecutedBy::Service, "{} 必须标 Service", a.id);
+            assert_eq!(a.checked, None, "{} 非开关", a.id);
+        }
+
+        // worktree 节点: 单动作 delete
+        let w = worktree_actions();
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].id, ACTION_DELETE_WORKTREE);
+        assert_eq!(w[0].label, "删除 worktree");
+        assert_eq!(w[0].execution, ExecutedBy::Service);
+        assert_eq!(w[0].checked, None);
+    }
+
+    /// 任务 2.2 验证: `WorktreeNode` 构造往返不丢字段（typed Payload
+    /// 下转型, 非 serde —— 往返 = 构造后逐字段读回）。
+    #[test]
+    fn worktree_node_round_trips_fields() {
+        let node = WorktreeNode {
+            path: std::path::PathBuf::from("/ws/.balabala.worktrees/feature-x"),
+            branch: Some("feature-x".into()),
+            actions: worktree_actions(),
+        };
+        // 读回
+        assert_eq!(node.path, std::path::PathBuf::from("/ws/.balabala.worktrees/feature-x"));
+        assert_eq!(node.branch.as_deref(), Some("feature-x"));
+        assert_eq!(node.actions[0].id, ACTION_DELETE_WORKTREE);
+
+        // detached 分支 → None 不丢语义
+        let detached = WorktreeNode {
+            path: std::path::PathBuf::from("/ws/.balabala.worktrees/detached"),
+            branch: None,
+            actions: worktree_actions(),
+        };
+        assert_eq!(detached.branch, None);
+
+        // 挂进 ProjectNode 层级后字段仍在 (第三层不掉)
+        let proj = ProjectNode {
+            desc: ProjectDesc {
+                name: "foo".into(),
+                root: std::path::PathBuf::from("/a/foo"),
+                is_git: true,
+            },
+            worktrees: Arc::from(vec![node.clone()]),
+            actions: project_actions(),
+        };
+        assert_eq!(proj.worktrees.len(), 1);
+        assert_eq!(proj.worktrees[0], node, "层级挂载后逐字相等");
+        assert_eq!(proj.worktrees[0].branch.as_deref(), Some("feature-x"));
+    }
+
+    /// 任务 2.3 验证: 完成事件载荷 typed-Payload 往返不丢字段, 且信封
+    /// 形态为**无 corr 的 tell**（design D1: 原 corr 已销账, 带 corr
+    /// 迟到 = 死信 "late or unknown reply"）。
+    #[test]
+    fn git_op_finished_payload_round_trips_and_envelope_has_no_corr() {
+        let done = GitOpFinished {
+            action_id: ACTION_PUSH.to_string(),
+            target: "/a/foo".into(),
+            ok: false,
+            detail: "remote rejected: non-fast-forward".into(),
+        };
+        // 载荷往返 (typed Payload, 同 TreeSnapshot 传输形态)
+        let payload = Payload::new(done.clone());
+        let back: &GitOpFinished = payload.downcast().expect("类型对上应取回");
+        assert_eq!(*back, done, "载荷往返逐字相等");
+
+        // 信封形态: Envelope::new 即 tell (corr = None), 不挂 with_corr
+        let env = service_core::Envelope::new(
+            service_core::Route::Instance(service_core::InstanceId(1)),
+            service_core::Address::instance(service_core::InstanceId(2)),
+            KIND_GIT_OP_FINISHED,
+            Payload::new(done.clone()),
+        );
+        assert_eq!(env.kind, KIND_GIT_OP_FINISHED);
+        assert_eq!(env.corr, None, "完成事件必须无 corr (design D1)");
+        let back = env.downcast::<GitOpFinished>().expect("downcast 应成功");
+        assert_eq!(back.action_id, ACTION_PUSH);
+        assert_eq!(back.ok, false);
+        assert!(back.detail.contains("non-fast-forward"), "失败原因随载荷");
     }
 
     /// 由 item 列表搭一份 hierarchy（与 `snapshot()` 同构）。
@@ -583,7 +782,8 @@ mod tests {
                         root: item.path().to_path_buf(),
                         is_git: false,
                     },
-                    actions: Arc::from([]),
+                    worktrees: Arc::from([]),
+                    actions: project_actions(),
                 }]),
                 actions: solution_actions(item),
             })

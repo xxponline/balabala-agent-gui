@@ -22,10 +22,11 @@ use service_manager::{
 };
 // change solution-service task 2.2: Solution/Project 域服务接入（design D1）。
 use solution_service::contract::{
-    ActionInvoke, OpError as SolOpError, OpResult as SolOpResult, SolutionContract,
-    TreeChanged as SolTreeChanged, TreeSnapshot, WatchReq as SolWatchReq, KIND_ACTION as KIND_SOL_ACTION,
-    KIND_LOAD, KIND_OP_REPLY as KIND_SOLUTION_REPLY,
-    KIND_TREE_CHANGED as KIND_SOLUTION_CHANGED, KIND_WATCH as KIND_SOLUTION_WATCH,
+    ActionInvoke, GitOpFinished, OpError as SolOpError, OpResult as SolOpResult, SolutionContract,
+    TreeChanged as SolTreeChanged, TreeSnapshot, WatchReq as SolWatchReq,
+    KIND_ACTION as KIND_SOL_ACTION, KIND_GIT_OP_FINISHED, KIND_LOAD,
+    KIND_OP_REPLY as KIND_SOLUTION_REPLY, KIND_TREE_CHANGED as KIND_SOLUTION_CHANGED,
+    KIND_WATCH as KIND_SOLUTION_WATCH,
 };
 use solution_service::service::solution_service_factory;
 // change asset-service task 3.4: 右槽资产域服务 (design D1)。
@@ -216,6 +217,12 @@ pub struct ServiceLayer {
     /// 于是那条断言会真的报警。
     #[cfg(test)]
     pub(crate) asset_action_sends: usize,
+    /// 测试观测面：`solution.action` 发送次数 —— task 5.1 会话前置门
+    /// （design D3 路线 A）的判据：Running 拦下 ⇒ 本计数不增；
+    /// Exited 放行 ⇒ 增 1。[`Self::submit_action`] 是 solution 动作的
+    /// 唯一写入口。
+    #[cfg(test)]
+    pub(crate) sol_action_sends: usize,
     /// 项目树镜像（`tree_changed` 快照 + 操作回执自带快照；视图/交树渲染源）。
     tree_view: Option<TreeSnapshot>,
     /// **资产视图镜像**（change asset-service task 4.2）：`asset.tree_changed`
@@ -359,6 +366,8 @@ impl ServiceLayer {
             asset_refresh_sends: 0,
             #[cfg(test)]
             asset_action_sends: 0,
+            #[cfg(test)]
+            sol_action_sends: 0,
             agent_ready: false,
             solution_id,
             asset_id,
@@ -544,6 +553,21 @@ impl ServiceLayer {
                         }
                     }
                 }
+                // ---- change solution-git-worktree 5.2: git 操作完成事件 ----
+                // 无 corr 的 tell (design D1) —— 按 kind 直取, 不进销账表,
+                // 迟到也无死信噪音; 按 action_id 入 notice (node-actions:
+                // 按 id 路由不按 label)。
+                KIND_GIT_OP_FINISHED => {
+                    self.events_seen += 1;
+                    if let Ok(done) = env.downcast::<GitOpFinished>() {
+                        let text = if done.ok {
+                            format!("{} 完成: {}", done.action_id, done.target)
+                        } else {
+                            format!("{} 失败: {}", done.action_id, done.detail)
+                        };
+                        push_notice(&mut self.notices, Some(done.action_id.as_str()), text);
+                    }
+                }
                 _ => {
                     self.events_seen += 1;
                 }
@@ -580,6 +604,10 @@ impl ServiceLayer {
         args: Option<Payload>,
         label: &str,
     ) -> Result<Corr, service_manager::RouteError> {
+        #[cfg(test)]
+        {
+            self.sol_action_sends += 1;
+        }
         let corr = self.listener.submit(
             Route::Service("solution".into()),
             KIND_SOL_ACTION,
@@ -1277,6 +1305,116 @@ mod tests {
             );
         }
         assert!(layer.events_seen > seen_before, "新事件被消费");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// change solution-git-worktree 5.2: `KIND_GIT_OP_FINISHED` 收包 →
+    /// 成功/失败两态各出一条以 action_id 命名的 notice；无 corr 事件
+    /// 不进销账表 → 迟到无死信噪音 (design D1)。
+    #[test]
+    fn git_op_finished_produces_notice_without_dead_letter() {
+        use solution_service::contract::{GitOpFinished, KIND_GIT_OP_FINISHED};
+
+        let dir = temp_scan("git-finished");
+        let mut layer = ServiceLayer::bootstrap(&dir).expect("bootstrap");
+        assert!(
+            wait_until(
+                || {
+                    layer.pump();
+                    layer.states.get(&layer.solution_id) == Some(&ServiceState::Available)
+                },
+                Duration::from_secs(3)
+            ),
+            "solution 服务应可用"
+        );
+
+        let inject = |layer: &mut ServiceLayer, done: GitOpFinished| {
+            layer
+                .manager
+                .tell(Envelope::new(
+                    Route::Instance(layer.listener.id()),
+                    Address::instance(layer.solution_id),
+                    KIND_GIT_OP_FINISHED,
+                    Payload::new(done),
+                ))
+                .expect("inject git op finished");
+        };
+
+        // 成功态 → notice 点名 action + 目标
+        inject(
+            &mut layer,
+            GitOpFinished {
+                action_id: "git.pull".into(),
+                target: "/ws/proj".into(),
+                ok: true,
+                detail: String::new(),
+            },
+        );
+        assert!(
+            wait_until(
+                || {
+                    layer.pump();
+                    !layer.notices.is_empty()
+                },
+                Duration::from_secs(3)
+            ),
+            "成功事件应出 notice"
+        );
+        let (action, text) = layer.take_notices().pop().expect("notice 在场");
+        assert_eq!(action.as_deref(), Some("git.pull"), "路由键 = action_id");
+        assert!(text.contains("完成") && text.contains("/ws/proj"), "{text}");
+
+        // 失败态 → notice 点名 action + stderr 摘要
+        inject(
+            &mut layer,
+            GitOpFinished {
+                action_id: "git.push".into(),
+                target: "/ws/proj".into(),
+                ok: false,
+                detail: "remote rejected: non-fast-forward".into(),
+            },
+        );
+        assert!(
+            wait_until(
+                || {
+                    layer.pump();
+                    !layer.notices.is_empty()
+                },
+                Duration::from_secs(3)
+            ),
+            "失败事件应出 notice"
+        );
+        let (action, text) = layer.take_notices().pop().expect("notice 在场");
+        assert_eq!(action.as_deref(), Some("git.push"));
+        assert!(text.contains("失败") && text.contains("non-fast-forward"), "{text}");
+
+        // 迟到/无 corr: 事件不进 pending 表 → 零死信 (design D1)
+        let dead_before = layer.manager.dead_letters().len();
+        inject(
+            &mut layer,
+            GitOpFinished {
+                action_id: "git.pull".into(),
+                target: "/ws/proj".into(),
+                ok: true,
+                detail: String::new(),
+            },
+        );
+        assert!(
+            wait_until(
+                || {
+                    layer.pump();
+                    !layer.notices.is_empty()
+                },
+                Duration::from_secs(3)
+            ),
+            "重复事件照常出 notice"
+        );
+        layer.take_notices();
+        assert_eq!(
+            layer.manager.dead_letters().len(),
+            dead_before,
+            "无 corr 事件不得产生死信噪音"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
