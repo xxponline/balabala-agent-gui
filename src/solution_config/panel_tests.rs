@@ -52,7 +52,14 @@ fn open_app(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<TerminalApp>) {
             cx,
             |window, cx| {
                 cx.new(|cx| {
-                    TerminalApp::new_inner(window, cx, history.clone(), None).expect("app 启动")
+                    TerminalApp::new_inner(
+                        window,
+                        cx,
+                        history.clone(),
+                        crate::theme_preference::default_path(),
+                        None,
+                    )
+                    .expect("app 启动")
                 })
             },
         )

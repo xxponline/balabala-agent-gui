@@ -17,6 +17,7 @@ mod solution_config;
 mod property_detail_manager;
 mod shell;
 mod solution_overview;
+mod theme_preference;
 mod ui;
 mod workspace;
 // 启动关卡 (launcher-startup): 启动阶段唯一窗口, 先于主窗
@@ -48,9 +49,14 @@ fn main() {
         // 进程残留); LastWindowClosed 与 eframe 原行为一致, 否则
         // drain 循环与 pty 子进程会随僵尸进程残留。
         cx.set_quit_mode(gpui_kit::QuitMode::LastWindowClosed);
-        // 主题跟随系统外观 (add-light-dark-theme D1): 不再强制 Light —
-        // gpui-component 默认 Light, TerminalApp::new 在窗口启动时
-        // sync_system_appearance 同步到系统外观并订阅后续热切换。
+        // 主题偏好 (add-theme-preference design D3): init 后立即读全局
+        // 偏好并 apply, 先于 Launcher 打开 —— 钉住态首帧即生效 (顺带修
+        // 旧缺口: gpui-component init 强制 Light, 此前要到主窗
+        // TerminalApp::new 才 sync, 深色系统先见浅色 Launcher)。
+        let theme_pref = crate::theme_preference::load_at(
+            &crate::theme_preference::default_path(),
+        );
+        crate::theme_preference::apply_theme_preference(theme_pref, None, cx);
 
         // 启动关卡 (launcher-startup, design D1): 只出 Launcher。主窗在
         // 用户选定 workspace 后才由 Launcher 交棒打开 — 自动恢复已退场。

@@ -35,6 +35,7 @@ use asset_service::panel::AssetOverview;
 use crate::project_model::{self, MarkerStatus};
 use crate::solution_overview::{SolutionOverviewEvent, SolutionOverviewPanel};
 use crate::workspace::history::History;
+use crate::theme_preference::ThemePreference;
 use crate::workspace::Workspace;
 
 // Tab 在 Terminal context 下的转发动作: gpui-base 的 Root 全局绑定
@@ -73,6 +74,11 @@ pub struct TerminalApp {
     pub save_error: Option<String>,
     /// 历史文件路径 (测试缝: `new_inner` 注入; 正式 = 全局应用数据目录)
     pub history_path: PathBuf,
+    /// 主题偏好文件路径 (测试缝: `new_inner` 注入; 正式 = 全局应用数据目录)
+    pub theme_preference_path: PathBuf,
+    /// 当前主题偏好 (add-theme-preference design D2: 实体字段是真源,
+    /// 文件是持久化镜像; 外观订阅门控与菜单勾选都读它)
+    theme_preference: ThemePreference,
     /// DockArea 布局引擎 (design D1): 左|中|右三槽由它编排,
     /// 是 R3 外壳容器 (`render` 的根 div) 的子节点
     pub dock_area: Entity<DockArea>,
@@ -189,6 +195,7 @@ impl TerminalApp {
             window,
             cx,
             crate::workspace::history::default_path(),
+            crate::theme_preference::default_path(),
             startup,
         )
     }
@@ -201,6 +208,7 @@ impl TerminalApp {
         window: &mut Window,
         cx: &mut Context<Self>,
         history_path: PathBuf,
+        theme_preference_path: PathBuf,
         startup: Option<PathBuf>,
     ) -> Result<Self, String> {
         // Terminal context 下的 tab 终端转发绑定 (Root 的焦点遍历
@@ -239,18 +247,20 @@ impl TerminalApp {
             terminal,
             asset_overview,
         } = shell::build(weak_app, window, cx);
-        // 主题跟随系统外观 (add-light-dark-theme D1): 启动同步一次,
-        // 并订阅外观变化 → 每次变化重新 sync (Theme::change 内部会
-        // refresh_windows, 全窗重渲即热切换生效), 并把新配色推给
-        // 所有活会话 (D4: 会话内容色随主题)。
-        gpui_kit::component::theme::Theme::sync_system_appearance(Some(window), cx);
+        // 主题偏好 (add-theme-preference design D3/D4): 按存储偏好 apply
+        // (System → 真窗口 sync 到外观; pinned → 钉住), 再订阅外观变化 →
+        // 统一走 `on_system_appearance_changed` 门控: System 才 sync +
+        // 推会话 (Theme::change 内部 refresh_windows, 全窗重渲热切换),
+        // 钉住态忽略系统翻转。
+        let theme_preference = crate::theme_preference::load_at(&theme_preference_path);
+        crate::theme_preference::apply_theme_preference(theme_preference, Some(window), cx);
         let weak_for_theme = cx.weak_entity();
         let appearance_subscription = window.observe_window_appearance(move |window, cx| {
-            gpui_kit::component::theme::Theme::sync_system_appearance(Some(window), cx);
-            // 主题已切 → 遍历活会话 set_theme (spec: Theme change updates
-            // live sessions — 不重启、不丢 scrollback)
+            // 门控在实体方法 (design D4); 实体不在 (窗口收尾) → 无事可做。
+            // 转发而非内联: 外部测试无法触发 gpui 的 appearance observer
+            // (`TestAppContext::test_window` 是 pub(crate)) — 直驱方法验证。
             if let Some(app) = weak_for_theme.upgrade() {
-                app.update(cx, |app, cx| app.push_tui_theme(cx));
+                app.update(cx, |app, cx| app.on_system_appearance_changed(window, cx));
             }
         });
         let mut app = Self {
@@ -261,6 +271,8 @@ impl TerminalApp {
             notice: None,
             save_error: None,
             history_path,
+            theme_preference_path,
+            theme_preference,
             _update_task: None,
             _input_drain_task: None,
             _dialog_task: None,
@@ -300,7 +312,7 @@ impl TerminalApp {
         // bind_keys 在前 — macOS 建菜单项时读 keymap 出快捷键提示 (⌘C)。
         // win-in-window-app-menu-bar design D1: install 内先 set_app_menus
         // 再建 AppMenuBar, 返回值存入字段 (macOS 恒 None)。
-        app.menu_bar = crate::menu::install(cx, app.copy_enabled);
+        app.menu_bar = crate::menu::install(cx, app.copy_enabled, app.theme_preference);
         Ok(app)
     }
 
@@ -360,6 +372,45 @@ impl TerminalApp {
             Ok(_) => self.kick_input_drain(cx),
             Err(e) => self.notice = Some(format!("关闭会话失败: {e}")),
         }
+    }
+
+    /// View > Theme 切换的五步链路 (add-theme-preference 3.2, design D5):
+    /// ① 字段真源 → ② apply (System → 窗口外观; pinned → 钉住) → ③ 落盘
+    /// (失败仅日志, 便利数据语义, history 同款) → ④ 推活会话 (theming
+    /// req5: theme change updates live sessions) → ⑤ 重建菜单 (in-window
+    /// 勾选走 reload; 原生额外 set_menus — checked 只在建 NSMenu 时落
+    /// setState, validateMenuItem 只回 enabled。菜单项点击后原菜单必已关,
+    /// 无 disturb 风险; 通用 rebuild 通路不加它 — 选区边沿重建会打断正
+    /// 开着的原生菜单, 违反 Copy req 的 "does not close or reopen")。
+    /// `pub(crate)`: 菜单 action 监听 (`crate::menu::install`) 转发到此。
+    pub(crate) fn set_theme_mode(
+        &mut self,
+        mode: ThemePreference,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.theme_preference = mode;
+        crate::theme_preference::apply_theme_preference(mode, Some(window), cx);
+        if let Err(e) = crate::theme_preference::save_at(mode, &self.theme_preference_path) {
+            eprintln!("theme preference save failed: {e}"); // 便利数据: 不红条
+        }
+        self.push_tui_theme(cx);
+        self.rebuild_menus(cx);
+        cx.set_menus(crate::menu::build(self.copy_enabled, mode));
+    }
+
+    /// 系统外观变化的实体侧处理 (add-theme-preference design D4 门控):
+    /// 偏好 System → sync 到当前窗口外观 + 推会话; 钉住 (light/dark) →
+    /// 忽略系统翻转 (spec: Pinned preference holds against system changes)。
+    /// 外观订阅闭包与测试都走这里 — 闭包只做实体转发。
+    fn on_system_appearance_changed(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.theme_preference != ThemePreference::System {
+            return; // 钉住态: 系统外观变化不生效
+        }
+        gpui_kit::component::theme::Theme::sync_system_appearance(Some(window), cx);
+        // 主题已切 → 遍历活会话 set_theme (spec: Theme change updates
+        // live sessions — 不重启、不丢 scrollback)
+        self.push_tui_theme(cx);
     }
 
     /// 把当前主题推给服务 (服务存快照并广播全部会话; create 注入同源
@@ -1009,7 +1060,8 @@ impl TerminalApp {
     pub(crate) fn rebuild_menus(&self, cx: &mut Context<Self>) {
         let bar = self.menu_bar.clone(); // `self` 借用到此为止
         let copy_enabled = self.copy_enabled;
-        crate::menu::feed_global(cx, copy_enabled);
+        let theme_preference = self.theme_preference;
+        crate::menu::feed_global(cx, copy_enabled, theme_preference);
         if let Some(bar) = bar {
             bar.update(cx, |bar, cx| bar.reload(cx));
         }
@@ -1279,6 +1331,7 @@ mod tests {
     //! `gpui_kit::*` 把 `#[test]` 宏遮蔽掉)。
 
     use super::TerminalApp;
+    use crate::theme_preference::ThemePreference;
     // 3.2 路由键测试: 直接发 action (绕过 request_create_solution 的固定文案)
     use super::{SOL_ACTION_CREATE, SolCreateReq};
     use service_manager::Payload;
@@ -1558,6 +1611,196 @@ mod tests {
                 "主题必须跟随系统外观 (启动 sync), 而非被强制固定"
             );
         });
+    }
+
+    /// 2.2 门控: 钉住态走外观变化回调 → mode 不变。
+    /// 直驱 `on_system_appearance_changed` (订阅闭包的实体侧本体) ——
+    /// 外部 crate 触发不了 gpui 的 appearance observer (`test_window()`
+    /// 是 pub(crate)), 闭包只做实体转发。
+    /// 自证: 门控缺失 → sync 拉到窗口外观 (测试平台 Light) →
+    /// "仍为 Dark" 断言必败。
+    #[gpui_kit::test]
+    fn pinned_preference_ignores_system_appearance_change(cx: &mut TestAppContext) {
+        use gpui_kit::component::theme::{Theme, ThemeMode};
+
+        let pref_path = fresh_theme_preference_path("pinned");
+        crate::theme_preference::save_at(ThemePreference::Dark, &pref_path).expect("存钉深");
+        let (handle, app_entity) =
+            open_app_with_prefs(cx, fresh_history_path(), pref_path.clone(), None);
+        cx.update(|cx| {
+            assert_eq!(
+                Theme::global(cx).mode,
+                ThemeMode::Dark,
+                "构造即钉深 (真窗口 apply 存储偏好)"
+            );
+        });
+        // 驱动外观变化回调本体 (等价于订阅闭包转发到的调用)
+        handle
+            .update(cx, |_, window, cx| {
+                app_entity.update(cx, |app, cx| app.on_system_appearance_changed(window, cx))
+            })
+            .expect("drive appearance handler");
+        cx.update(|cx| {
+            assert_eq!(
+                Theme::global(cx).mode,
+                ThemeMode::Dark,
+                "钉住态: 外观变化回调不改主题 (spec: pinned holds)"
+            );
+        });
+        let _ = std::fs::remove_file(&pref_path);
+    }
+
+    /// 2.2 门控: System 态走回调 → 主动 sync 回窗口外观。
+    /// 自证: 人为拧偏主题再驱动 → 必须被拉回 (若门控误拦 System,
+    /// 拧偏留存 → 断言败)。
+    #[gpui_kit::test]
+    fn system_preference_syncs_on_appearance_change(cx: &mut TestAppContext) {
+        use gpui_kit::component::theme::{Theme, ThemeMode};
+
+        let pref_path = fresh_theme_preference_path("system"); // 不存在 → 默认 System
+        let _ = std::fs::remove_file(&pref_path);
+        let (handle, app_entity) =
+            open_app_with_prefs(cx, fresh_history_path(), pref_path, None);
+        cx.update(|cx| {
+            assert_eq!(
+                Theme::global(cx).mode,
+                ThemeMode::from(cx.window_appearance()),
+                "构造时无文件 → System → 跟随外观"
+            );
+            // 人为拧偏 (模拟外观已翻、主题未跟的中间态)
+            let drifted = match Theme::global(cx).mode {
+                ThemeMode::Light => ThemeMode::Dark,
+                ThemeMode::Dark => ThemeMode::Light,
+            };
+            Theme::change(drifted, None, cx);
+        });
+        handle
+            .update(cx, |_, window, cx| {
+                app_entity.update(cx, |app, cx| app.on_system_appearance_changed(window, cx))
+            })
+            .expect("drive appearance handler");
+        cx.update(|cx| {
+            assert_eq!(
+                Theme::global(cx).mode,
+                ThemeMode::from(cx.window_appearance()),
+                "System 态: 回调把主题拉回窗口外观"
+            );
+        });
+    }
+
+    /// 3.2: View > Theme 切换五步链路 (design D5) — 经平台同款
+    /// `cx.dispatch_action` 驱动 (menu_tests 6.3 形态), 断四项:
+    /// ① 落盘 ② mode 生效 ③ 活会话收到重注入 (既有 push 断言形态)
+    /// ④ 下次 build 勾选位落新项 (GlobalState + 原生 set_menus 两路)。
+    #[gpui_kit::test]
+    fn theme_toggle_persists_applies_and_reinjects(cx: &mut TestAppContext) {
+        use crate::theme_preference::{SetThemeMode, ThemePreference};
+        use gpui_kit::component::theme::{Theme, ThemeMode};
+
+        /// 当前 View > Theme 里勾选的项名 (两路菜单共用断言)
+        fn theme_checked(menus: &[gpui_kit::OwnedMenu]) -> Vec<String> {
+            menus
+                .iter()
+                .find(|m| m.name.as_str() == "View")
+                .and_then(|view| {
+                    view.items.iter().find_map(|i| match i {
+                        gpui_kit::OwnedMenuItem::Submenu(sub)
+                            if sub.name.as_str() == "Theme" =>
+                        {
+                            Some(sub)
+                        }
+                        _ => None,
+                    })
+                })
+                .map(|theme| {
+                    theme
+                        .items
+                        .iter()
+                        .filter_map(|i| match i {
+                            gpui_kit::OwnedMenuItem::Action {
+                                name,
+                                checked: true,
+                                ..
+                            } => Some(name.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .expect("View > Theme 在场")
+        }
+
+        let pref_path = fresh_theme_preference_path("toggle");
+        let (handle, app_entity) =
+            open_app_with_prefs(cx, fresh_history_path(), pref_path.clone(), None);
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("首帧");
+        // 激活窗口 — 监听体读 active_window, 菜单派发走活动窗口路径
+        // (menu_tests dispatch_tests 同款前提)
+        cx.update_window(handle, |_, window, _| window.activate_window())
+            .expect("activate");
+
+        // 会话: push 断言形态 = 既有 theme_change_pushes_tui_theme_to_live_sessions
+        app_entity.update(cx, |app, _cx| {
+            inject_test_workspace(app, "theme-toggle");
+        });
+        let ws_path = cx.update(|cx| {
+            app_entity
+                .read(cx)
+                .workspace
+                .as_ref()
+                .expect("测试 workspace")
+                .path
+                .clone()
+        });
+        let (_id, shared) = test_sessions::create_session(cx, &app_entity, &ws_path);
+        let shared = shared.expect("测试会话 (非 real-pi 路径)");
+
+        // 模拟点击 View > Dark: 平台 on_app_menu_action 回调 → dispatch_action
+        cx.update(|cx| {
+            cx.dispatch_action(&SetThemeMode {
+                mode: ThemePreference::Dark,
+            })
+        });
+        cx.run_until_parked();
+
+        // ① 落盘
+        assert_eq!(
+            crate::theme_preference::load_at(&pref_path),
+            ThemePreference::Dark,
+            "① 偏好落盘 dark"
+        );
+        // ② apply 生效
+        cx.update(|cx| {
+            assert_eq!(Theme::global(cx).mode, ThemeMode::Dark, "② mode 切到 Dark");
+        });
+        // ③ 活会话重注入 (按值等待防 agent-ready 一次性补推插队)
+        test_sessions::wait_until(
+            cx,
+            || {
+                shared
+                    .lock()
+                    .unwrap()
+                    .themes
+                    .iter()
+                    .any(|t| *t == TuiTheme::default())
+            },
+            "③ 切换推广播 (Dark 配色)",
+        );
+        // ④a GlobalState (in-window 数据源) 勾选落新项
+        let global_checked = cx.update(|cx| {
+            let menus = gpui_kit::base::GlobalState::global(cx)
+                .app_menus()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            theme_checked(&menus)
+        });
+        assert_eq!(global_checked, vec!["Dark"], "④a GlobalState 勾选落 Dark");
+        // ④b 原生 set_menus 重推 (checked 只在建 NSMenu 时落 setState)
+        let native = cx.update(|cx| cx.get_menus()).expect("get_menus");
+        assert_eq!(theme_checked(&native), vec!["Dark"], "④b 原生菜单勾选落 Dark");
+
+        let _ = std::fs::remove_file(&pref_path);
     }
 
     /// 输入触发的快速 drain (task 5.4, design D7): 测试 app 不启主循环
@@ -2327,11 +2570,37 @@ mod tests {
         p
     }
 
+    /// 主题偏好注入缝的临时路径 (2.2 写纪律: 钉住态测试不碰进程共享的
+    /// `default_path`)。同 pid+纳秒去撞, 先删旧文件保证"不存在"前提。
+    fn fresh_theme_preference_path(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "sw-theme-pref-{tag}-{}-{}.json",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = fs::remove_file(&p);
+        p
+    }
+
     /// 起 app 并**显式指定启动 path** (3.1: 自动恢复退场后的入口)。
     /// `Some(path)` → `new_inner` 开窗即异步打开; `None` → 只装配不打开。
     fn open_app(
         cx: &mut TestAppContext,
         history: PathBuf,
+        startup: Option<PathBuf>,
+    ) -> (
+        gpui_kit::AnyWindowHandle,
+        gpui_kit::Entity<TerminalApp>,
+    ) {
+        open_app_with_prefs(cx, history, crate::theme_preference::default_path(), startup)
+    }
+
+    /// 主题偏好注入缝 (add-theme-preference 2.2): 钉住态测试用 —
+    /// 默认路径进程共享, 写纪律同 history (不碰默认路径做写入断言)。
+    fn open_app_with_prefs(
+        cx: &mut TestAppContext,
+        history: PathBuf,
+        theme_preference_path: PathBuf,
         startup: Option<PathBuf>,
     ) -> (
         gpui_kit::AnyWindowHandle,
@@ -2350,9 +2619,16 @@ mod tests {
                 cx,
                 |window, cx| {
                     let startup = startup.clone();
+                    let theme_preference_path = theme_preference_path.clone();
                     cx.new(move |cx| {
-                        TerminalApp::new_inner(window, cx, history.clone(), startup)
-                            .expect("new_inner 启动 (打开失败走 open_failure, 非 Err)")
+                        TerminalApp::new_inner(
+                            window,
+                            cx,
+                            history.clone(),
+                            theme_preference_path.clone(),
+                            startup,
+                        )
+                        .expect("new_inner 启动 (打开失败走 open_failure, 非 Err)")
                     })
                 },
             )

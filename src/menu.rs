@@ -10,6 +10,7 @@
 
 use agent_service::terminal::TerminalCopy;
 use crate::app::TerminalApp;
+use crate::theme_preference::{SetThemeMode, ThemePreference};
 use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::{Entity, Menu, MenuItem};
 
@@ -23,18 +24,51 @@ pub fn build_launcher() -> Vec<Menu> {
     vec![Menu::new("Edit").items([MenuItem::action("Copy", TerminalCopy)])]
 }
 
-/// 当前应用菜单 (task 6.1: Edit/Copy; 6.2 追加 cfg 门控的 Debug 子菜单)。
+/// 当前应用菜单 (task 6.1: Edit/Copy; 6.2 追加 cfg 门控的 Debug 子菜单;
+/// add-theme-preference 3.1: View > Theme 三选一)。
 ///
 /// `copy_enabled` 只驱动 Copy 项的**静态**灰显位 (design D2: 灰显只看选区,
 /// 焦点不参与) —— 窗口内 `AppMenuBar` → `PopupMenu` 直接拷 `disabled`,
 /// 它没有 macOS 那样的 `on_validate_app_menu_command` 动态判定。
-pub fn build(copy_enabled: bool) -> Vec<Menu> {
+///
+/// `theme_preference` 驱动 View > Theme 的勾选位 (spec: exactly one
+/// check-marked): 纯函数快照, 切换后由 [`TerminalApp::rebuild_menus`]
+/// 重算 (spec: rebuild preserves the check mark)。
+pub fn build(copy_enabled: bool, theme_preference: ThemePreference) -> Vec<Menu> {
     // `mut` 供下方 cfg 块 push; release 下块剥离 → 闲置
     // (app.rs legacy 播种的 `#[allow(unused_mut)]` 同款豁免)
     #[allow(unused_mut)]
     let mut menus = vec![Menu::new("Edit").items([
         MenuItem::action("Copy", TerminalCopy).disabled(!copy_enabled),
     ])];
+    // View > Theme 三选一 (add-theme-preference 3.1, specs/app-menu-bar:
+    // View menu carries theme selection)。子菜单路径 View > Theme,
+    // 项序固定 Follow System / Light / Dark, 恰一项勾选。
+    menus.push(
+        Menu::new("View").items([MenuItem::submenu(Menu::new("Theme").items([
+            MenuItem::action(
+                "Follow System",
+                SetThemeMode {
+                    mode: ThemePreference::System,
+                },
+            )
+            .checked(theme_preference == ThemePreference::System),
+            MenuItem::action(
+                "Light",
+                SetThemeMode {
+                    mode: ThemePreference::Light,
+                },
+            )
+            .checked(theme_preference == ThemePreference::Light),
+            MenuItem::action(
+                "Dark",
+                SetThemeMode {
+                    mode: ThemePreference::Dark,
+                },
+            )
+            .checked(theme_preference == ThemePreference::Dark),
+        ]))]),
+    );
     // Debug 子菜单整块仅 debug 构建产出 (task 6.2, design D5): 数据源
     // `sections()` 与项 action `OpenDebugSection` 都在 `crate::debug` 的
     // `#![cfg(debug_assertions)]` 门控内 — release 下本块不编译,
@@ -64,10 +98,20 @@ pub fn build(copy_enabled: bool) -> Vec<Menu> {
 ///
 /// `Menu` 非 Clone, 每次重新 `build()` (读 debug 注册表 + 分配, 廉价)。
 ///
-/// `copy_enabled` 透传给 [`build`] (design D3 的灰显来源, task 3.2)。
-pub fn feed_global(cx: &mut gpui_kit::App, copy_enabled: bool) {
+/// `copy_enabled` 透传给 [`build`] (design D3 的灰显来源, task 3.2);
+/// `theme_preference` 透传给 [`build`] (add-theme-preference 3.1 的勾选来源)。
+pub fn feed_global(
+    cx: &mut gpui_kit::App,
+    copy_enabled: bool,
+    theme_preference: ThemePreference,
+) {
     gpui_kit::base::GlobalState::global_mut(cx)
-        .set_app_menus(build(copy_enabled).into_iter().map(|m| m.owned()).collect());
+        .set_app_menus(
+            build(copy_enabled, theme_preference)
+                .into_iter()
+                .map(|m| m.owned())
+                .collect(),
+        );
 }
 
 /// 装配期安装: set_menus (task 6.1) + 窗口内菜单栏 (win-in-window-app-menu-bar
@@ -91,10 +135,11 @@ pub fn feed_global(cx: &mut gpui_kit::App, copy_enabled: bool) {
 pub fn install(
     cx: &mut gpui_kit::Context<TerminalApp>,
     copy_enabled: bool,
+    theme_preference: ThemePreference,
 ) -> Option<Entity<AppMenuBar>> {
-    cx.set_menus(build(copy_enabled));
+    cx.set_menus(build(copy_enabled, theme_preference));
     // design D1 前半: 先把菜单喂进 GlobalState (窗口内 AppMenuBar 的数据源)
-    feed_global(cx, copy_enabled);
+    feed_global(cx, copy_enabled, theme_preference);
     // design D1 后半 + D6: 实例只为挂载而建 → 只在非 mac 建 (macOS 挂原生,
     // 窗口内再挂一条会双份); macOS 恒 None, 字段与挂载两侧同 cfg 语义
     #[cfg(not(target_os = "macos"))]
@@ -122,6 +167,25 @@ pub fn install(
                 let _ = handle.update(cx, |_, window, cx| {
                     let _ = weak.update(cx, |app, cx| {
                         app.open_debug_section(&id, window, cx);
+                    });
+                });
+            });
+        });
+    }
+    // 主题切换 (add-theme-preference 3.2): View > Theme 点击 → defer
+    // (菜单 action 派发在窗口 update lease 内, 同步嵌套实体更新会
+    // 重入 — Debug 监听同款教训) → 实体五步链路。
+    {
+        let weak = cx.weak_entity();
+        let app: &mut gpui_kit::App = cx;
+        app.on_action::<SetThemeMode>(move |action, cx| {
+            let Some(handle) = cx.active_window() else { return };
+            let mode = action.mode;
+            let weak = weak.clone(); // 监听是 Fn, 每次调用 clone 句柄
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.set_theme_mode(mode, window, cx);
                     });
                 });
             });

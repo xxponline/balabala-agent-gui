@@ -8,8 +8,8 @@ use crate::workspace::Workspace;
 use agent_service::terminal::{CellPos, CellRange, TerminalCopy};
 use gpui_kit::test::{TestQueryExt, TestWindowExt};
 use gpui_kit::{
-    AnyWindowHandle, AppContext, Bounds, Focusable, OwnedMenuItem, Point, TestAppContext,
-    WindowBounds, WindowOptions, px, size,
+    AnyWindowHandle, AppContext, Bounds, Focusable, OwnedMenu, OwnedMenuItem, Point,
+    TestAppContext, WindowBounds, WindowOptions, px, size,
 };
 
 /// 起完整 app（隔离全局历史/外部配置, 模式同 pdm/tree tests）。
@@ -128,6 +128,111 @@ fn menu_bar_has_edit_copy(cx: &mut TestAppContext) {
         copy.partial_eq(&TerminalCopy),
         "Copy 项应接现有 TerminalCopy action (实际: {})",
         copy.name()
+    );
+}
+
+/// 3.1: View > Theme 三选一 (specs/app-menu-bar: View menu carries theme
+/// selection) — 纯函数 `build` × 三偏好: 子菜单在场、项序固定、恰一项
+/// 勾选且勾的正是当前偏好。
+#[test]
+fn theme_checkmark_tracks_preference() {
+    use crate::theme_preference::ThemePreference;
+
+    for (pref, expected) in [
+        (ThemePreference::System, "Follow System"),
+        (ThemePreference::Light, "Light"),
+        (ThemePreference::Dark, "Dark"),
+    ] {
+        let menus: Vec<OwnedMenu> = super::build(false, pref)
+            .into_iter()
+            .map(|m| m.owned())
+            .collect();
+        let view = menus
+            .iter()
+            .find(|m| m.name.as_str() == "View")
+            .unwrap_or_else(|| panic!("View 菜单在场 (pref={pref:?})"));
+        let theme = view
+            .items
+            .iter()
+            .find_map(|item| match item {
+                OwnedMenuItem::Submenu(sub) if sub.name.as_str() == "Theme" => Some(sub),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("Theme 子菜单在场 (pref={pref:?})"));
+        let checks: Vec<(&str, bool)> = theme
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                OwnedMenuItem::Action { name, checked, .. } => Some((name.as_str(), *checked)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            checks.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec!["Follow System", "Light", "Dark"],
+            "项序固定 (pref={pref:?})"
+        );
+        let checked: Vec<&str> = checks
+            .iter()
+            .filter(|(_, c)| *c)
+            .map(|(n, _)| *n)
+            .collect();
+        assert_eq!(
+            checked,
+            vec![expected],
+            "恰一项勾选且为当前偏好 (pref={pref:?})"
+        );
+    }
+}
+
+/// 3.1: 装配期贯通 — 默认偏好 (无文件 → System) 下**已装**菜单带
+/// View > Theme 且 Follow System 勾选 (spec: check mark reflects the
+/// active preference)。
+#[gpui_kit::test]
+fn installed_menu_carries_theme_checkmark(cx: &mut TestAppContext) {
+    let (_handle, _app) = open_app(cx);
+
+    let menus = cx.update(|cx| cx.get_menus()).expect("菜单已安装 (装配期 set_menus)");
+    let view = menus
+        .iter()
+        .find(|m| m.name.as_str() == "View")
+        .expect("View 菜单在场");
+    let theme = view
+        .items
+        .iter()
+        .find_map(|item| match item {
+            OwnedMenuItem::Submenu(sub) if sub.name.as_str() == "Theme" => Some(sub),
+            _ => None,
+        })
+        .expect("Theme 子菜单在场");
+    let checked: Vec<&str> = theme
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            OwnedMenuItem::Action { name, checked: true, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        checked,
+        vec!["Follow System"],
+        "默认偏好 System → 勾 Follow System"
+    );
+}
+
+/// 3.1: Launcher 期菜单无 View (specs/app-menu-bar: while only the
+/// Launcher is open the menu bar SHALL remain valid without it)。
+#[test]
+fn launcher_menus_have_no_view_menu() {
+    let menus: Vec<OwnedMenu> = super::build_launcher()
+        .into_iter()
+        .map(|m| m.owned())
+        .collect();
+    assert_eq!(menus.len(), 1, "Launcher 期只有 Edit 一个菜单");
+    assert_eq!(menus[0].name.as_str(), "Edit");
+    assert!(
+        !menus.iter().any(|m| m.name.as_str() == "View"),
+        "Launcher 菜单不得含 View"
     );
 }
 
@@ -439,8 +544,8 @@ fn rebuild_menus_updates_content_then_keeps_order(cx: &mut TestAppContext) {
     let first = global_menus(cx);
     assert_eq!(
         menu_names(&first),
-        vec!["Edit", "Debug"],
-        "菜单序列 = build() 产出 (design D6: Edit 常驻 + Debug debug-only)"
+        vec!["Edit", "View", "Debug"],
+        "菜单序列 = build() 产出 (design D6: Edit 常驻 + Debug debug-only; add-theme-preference 3.1: View 常驻)"
     );
     let debug1 = menu_items(&first, "Debug").to_vec();
     assert!(
@@ -553,14 +658,14 @@ fn copy_disabled_follows_selection(cx: &mut TestAppContext) {
     #[cfg(debug_assertions)]
     assert_eq!(
         baseline,
-        vec!["Edit", "Debug"],
-        "debug 构建菜单序列 = Edit 常驻 + Debug (design D5/D6)"
+        vec!["Edit", "View", "Debug"],
+        "debug 构建菜单序列 = Edit/View 常驻 + Debug (design D5/D6 + add-theme-preference 3.1)"
     );
     #[cfg(not(debug_assertions))]
     assert_eq!(
         baseline,
-        vec!["Edit"],
-        "release 构建不得含 Debug 菜单 (design D5)"
+        vec!["Edit", "View"],
+        "release 构建不得含 Debug 菜单 (design D5); View 恒常驻 (3.1)"
     );
 
     // ① 无选区 → 菜单可开 + Copy 灰显
@@ -813,8 +918,8 @@ fn register_then_rebuild_shows_section_in_debug_menu(cx: &mut TestAppContext) {
     let baseline = menu_names(&first).to_vec();
     assert_eq!(
         baseline,
-        vec!["Edit", "Debug"],
-        "菜单序列 = build() 产出 (design D5)"
+        vec!["Edit", "View", "Debug"],
+        "菜单序列 = build() 产出 (design D5 + add-theme-preference 3.1: View 常驻)"
     );
 
     // 启动后注册 — 尚未 rebuild
@@ -825,7 +930,8 @@ fn register_then_rebuild_shows_section_in_debug_menu(cx: &mut TestAppContext) {
     });
 
     // 负向: popup 快照是 reload 时刻的, 不含新 section
-    open_menu_at(cx, handle, 1);
+    // (menu 栏序: Edit=0, View=1, Debug=2 — add-theme-preference 3.1)
+    open_menu_at(cx, handle, 2);
     assert!(
         cx.update_window(handle, |_, window, _| window.try_find_by_label(TITLE).is_none())
             .expect("query"),
@@ -841,8 +947,8 @@ fn register_then_rebuild_shows_section_in_debug_menu(cx: &mut TestAppContext) {
         "rebuild 应经 reload() 关掉开着的 popup (design D3)"
     );
 
-    // 正向: 重开 Debug 菜单 → 新 section 帧级可见
-    open_menu_at(cx, handle, 1);
+    // 正向: 重开 Debug 菜单 → 新 section 帧级可见 (Debug = index 2)
+    open_menu_at(cx, handle, 2);
     assert!(
         cx.update_window(handle, |_, window, _| window.try_find_by_label(TITLE).is_some())
             .expect("query"),
