@@ -20,7 +20,7 @@ use gpui_kit::{Context, Window};
 
 use crate::app::TerminalApp;
 use asset_service::contract::AssetKind;
-use editor_panel::RustViewerHandler;
+use editor_panel::{LuaViewerHandler, RustViewerHandler};
 use md_panel::MarkdownViewerHandler;
 
 /// 待打开对象的中立封装——不含 gpui 类型，可跨插件边界
@@ -49,8 +49,9 @@ pub trait OpenHandler: Send + Sync + 'static {
     ) -> Arc<dyn PanelView>;
 }
 
-/// 静态 handler 注册表（按序第一个认领者胜出; `.rs` 与 `.md` 只读查看器）。
-static HANDLERS: &[&dyn OpenHandler] = &[&RustViewerHandler, &MarkdownViewerHandler];
+/// 静态 handler 注册表（按序第一个认领者胜出; `.rs` / `.lua` / `.md` 只读查看器）。
+static HANDLERS: &[&dyn OpenHandler] =
+    &[&RustViewerHandler, &LuaViewerHandler, &MarkdownViewerHandler];
 
 /// 按注册顺序取第一个认领 `obj` 的 handler。
 pub(crate) fn handler_for(obj: &OpenObject) -> Option<&'static dyn OpenHandler> {
@@ -1022,6 +1023,131 @@ mod tests {
             ".toml / 目录不认领 → 无新签 (spec scenario: Non-viewer file has no viewer)"
         );
         let _ = render(handle, cx);
+    }
+
+    // ---------- change add-lua-language-service 4.1/4.2: .lua 只读 viewer ----------
+
+    /// 4.1: `.lua` 认领 → 只读签 (标题=文件名, 灌入内容, readonly 双保险,
+    /// `language("lua")` 生效 — syntect Lua 语法在场由 gpui-component
+    /// highlighter 自测 `find_syntax("lua")` 保证, 本层断言口径与 rust
+    /// viewer 测试一致)。
+    #[gpui_kit::test]
+    fn lua_viewer_shows_content_readonly(cx: &mut TestAppContext) {
+        let (handle, app) = open_app(cx);
+        let path = write_temp_file("lua-ro", "lua", "local function lua_probe()\n  return 1\nend\n");
+        open_object_in(
+            cx,
+            handle,
+            &app,
+            OpenObject {
+                path: PathBuf::from(&path),
+                kind: AssetKind::File,
+            },
+        );
+
+        assert_eq!(
+            center_tabs(cx, &app).0.len(),
+            2,
+            ".lua → 开 viewer 签 (spec: Read-only Lua viewer handler)"
+        );
+        let viewer = viewer_entity(cx, &app, &path);
+        let (value, readonly, lang) = cx.update(|cx| {
+            let state = viewer.read(cx).state.clone();
+            let state = state.read(cx);
+            (
+                state.value().to_string(),
+                !state.is_editable(),
+                state.language_name(),
+            )
+        });
+        assert!(
+            value.contains("local function lua_probe()"),
+            "viewer 灌入 lua 内容: {value:?}"
+        );
+        assert!(readonly, "状态侧 readonly (spec: SHALL NOT permit modifying)");
+        assert_eq!(lang, "lua", "language(\"lua\") 生效 — syntect Lua 高亮选中");
+
+        // tab 标题 = 文件名 (spec: titled with the file's name)
+        let title = cx.update(|cx| viewer.read(cx).title.clone());
+        let expected = std::path::Path::new(&path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(title.to_string(), expected, "tab 标题 = 文件名");
+
+        // 键入不得改 buffer (spec scenario: Lua tab is read-only)
+        let viewer_focus = cx.update(|cx| viewer.read(cx).focus_handle(cx));
+        cx.update_window(handle, |_, window, cx| {
+            viewer_focus.clone().focus(window, cx);
+        })
+        .expect("update window");
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            let mut scope = window.within("viewer-pane");
+            scope.input("HACKED", cx);
+        })
+        .expect("update window");
+        cx.run_until_parked();
+        let value_after = cx.update(|cx| viewer.read(cx).state.read(cx).value().to_string());
+        assert_eq!(value_after, value, "readonly lua viewer 键入后内容不变");
+        let _ = render(handle, cx);
+    }
+
+    /// 4.2: 同一 `.lua` 开两次 → 不重开, 聚焦既有签 (spec scenario:
+    /// Lua tab is read-only and deduplicated)。
+    #[gpui_kit::test]
+    fn lua_open_twice_yields_one_tab_and_focuses(cx: &mut TestAppContext) {
+        let (handle, app) = open_app(cx);
+        let path = write_temp_file("lua-dedup", "lua", "local x = 1\n");
+        let obj = || OpenObject {
+            path: PathBuf::from(&path),
+            kind: AssetKind::File,
+        };
+
+        open_object_in(cx, handle, &app, obj());
+        let (tabs1, active1) = center_tabs(cx, &app);
+        assert_eq!(tabs1.len(), 2, "console + lua viewer");
+        assert_eq!(active1, 1, "新签尾插即 activate");
+        let first = viewer_entity(cx, &app, &path);
+
+        // 切回 console, 再开同一 .lua → 不新建, 聚焦既有签
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                app.dock_area.update(cx, |area, cx| {
+                    area.select_panel(console_id_raw(app), window, cx)
+                });
+            });
+        })
+        .expect("update window");
+        cx.run_until_parked();
+        let (_, active_console) = center_tabs(cx, &app);
+        assert_eq!(active_console, 0, "已切回 console");
+
+        open_object_in(cx, handle, &app, obj());
+        let (tabs2, active2) = center_tabs(cx, &app);
+        assert_eq!(tabs2.len(), 2, "同 path 不重开 (spec: deduplicated)");
+        assert_eq!(active2, 1, "既有 lua 签被 select_panel 聚焦");
+        // dedup 表仍指向同一实体 (重开 = select, 非重建)
+        let again = viewer_entity(cx, &app, &path);
+        assert_eq!(again, first, "dedup → 同一实体");
+        let _ = render(handle, cx);
+    }
+
+    /// 4.2: 高亮器语法集含 Lua — `two_face::syntax::extra_newlines` 是
+    /// gpui-component `syntect_backend` 的 `SYNTAXES` 同源 (其自测
+    /// `common_fence_names_find_a_syntax` 亦断言 "lua" 在场)。编辑器侧
+    /// `language("lua")` 由上面 readonly 测试断言, 两头合起来 = 高亮链路成立。
+    #[test]
+    fn syntect_syntax_set_contains_lua() {
+        let set = two_face::syntax::extra_newlines();
+        assert!(
+            set.find_syntax_by_token("lua").is_some(),
+            "语法集须含 Lua (spec: displays with Lua syntax highlighting)"
+        );
+        // 顺带: 不能退化到纯文本 — token 命中的必须是 Lua 而非 Plain Text
+        let syntax = set.find_syntax_by_token("lua").expect("lua 在场");
+        assert_ne!(syntax.name, "Plain Text", "lua 不得退化为纯文本");
     }
 
     // ---------- md-viewer-toggle (1.3 / 2.x / 3.x / 4.x) ----------

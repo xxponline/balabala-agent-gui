@@ -1,0 +1,29 @@
+[package]
+name = "lua-language-service"
+version = "0.1.0"
+edition.workspace = true
+description = "Lua 索引薄壳 (change add-lua-language-service): emmylua 后端可换, 公开面只出本 crate 类型"
+
+[dependencies]
+# change add-lua-language-service design D3: 后端可换 — 本依赖只在
+# backend 实现模块露脸, 公开 API 不出现其任何类型 (spec: Public API
+# exposes backend-neutral types)。
+# design D3 依赖边: 后端中立的公开 API 不出这三个类型 — 它们只在
+# backend 模块内部流动 (三个均已随 emmylua_code_analysis 在 lock 中)。
+# - emmylua_parser: LuaSyntaxId/LuaSyntaxKind — 符号分类 (ClosureExpr 判函数)
+# - emmy_lsp_types: DiagnosticSeverity — 诊断严重度映射 (上游诊断返回类型)
+# - tokio-util: CancellationToken — diagnose_file 签名要求
+emmylua_code_analysis = "0.25.1"
+emmylua_parser = "0.29.1"
+emmy_lsp_types = "0.1.0"
+tokio-util = "0.7"
+# design D1: LuaIndexView 实体住本 crate (AgentTerminal 先例);
+# 仅 view 用 — 服务核心不碰 GPUI。view 只画 div/输入, 不做高亮
+# (着色走主 crate 的 syntect viewer, 与索引无关 — design D7)。
+gpui-kit = "0.9.0"
+# browse…: 系统默认目录选择框 (solution_config 同款 rfd, 已在 lock)。
+rfd = "0.15.0"
+
+[dev-dependencies]
+# view 渲染行测试 (task 3.1): 无头窗口 + ElementSnapshot (与 GUI 同款)。
+gpui-kit = { version = "0.9.0", features = ["test-support"] }

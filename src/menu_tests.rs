@@ -443,6 +443,47 @@ mod dispatch_tests {
     }
 }
 
+/// change add-lua-language-service 3.2 + spec *Debug menu lists a lua-index
+/// section*: debug 构建 Debug 菜单列出 `lua-index` 节 (注册表 → 菜单链路)。
+#[cfg(debug_assertions)]
+#[gpui_kit::test]
+fn debug_menu_lists_lua_index(cx: &mut TestAppContext) {
+    let (_handle, _app) = open_app(cx); // TerminalApp::new → register_builtin → 菜单构建
+    let menus = cx.update(|cx| cx.get_menus()).expect("菜单已安装");
+    let debug_menu = menus
+        .iter()
+        .find(|m| m.name.as_str() == "Debug")
+        .expect("Debug 菜单在场 (debug 构建)");
+    assert!(
+        debug_menu.items.iter().any(|item| matches!(
+            item,
+            OwnedMenuItem::Action { name, .. } if name == "lua-index"
+        )),
+        "Debug 菜单须列出 lua-index 节 (spec: Debug menu lists a lua-index section)"
+    );
+}
+
+/// change add-lua-language-service 3.2 + spec *Section appears only in debug
+/// builds*: release 下注册表随 `crate::debug` 整体消失 — 任何菜单不得出现
+/// `lua-index` 项 (Debug 菜单本身也不存在, 由下个测试覆盖)。
+/// 仅 `cargo test --release` 编译 (debug_assertions 关)。
+#[cfg(not(debug_assertions))]
+#[gpui_kit::test]
+fn release_menus_have_no_lua_index(cx: &mut TestAppContext) {
+    let (_handle, _app) = open_app(cx);
+    let menus = cx.update(|cx| cx.get_menus()).expect("菜单已安装");
+    for menu in &menus {
+        assert!(
+            !menu.items.iter().any(|item| matches!(
+                item,
+                OwnedMenuItem::Action { name, .. } if name == "lua-index"
+            )),
+            "release 菜单 {} 不得含 lua-index 项 (spec: Section appears only in debug builds)",
+            menu.name
+        );
+    }
+}
+
 /// task 8.2 + spec *No Debug menu in release*: release 构建菜单栏无 Debug
 /// 菜单, Edit/Copy 仍在 (design D6 常驻)。仅 `cargo test --release`
 /// 编译 (debug_assertions 关) — debug 测试构建里 Debug 菜单本就在场,

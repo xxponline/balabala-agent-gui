@@ -73,10 +73,19 @@ fn claims_rust(obj: &OpenObject) -> bool {
         && obj.path.extension().is_some_and(|ext| ext == "rs")
 }
 
-/// Editor 语言名（v1 只有 rust; 与认领表同步扩展）。
+/// change add-lua-language-service 4.1: `lua` 认领（spec: Read-only Lua
+/// viewer handler — 复用 `EditorPanel` 只读管线, 仅扩展名不同）。
+fn claims_lua(obj: &OpenObject) -> bool {
+    obj.kind == AssetKind::File
+        && obj.path.extension().is_some_and(|ext| ext == "lua")
+}
+
+/// Editor 语言名（与认领表同步扩展: rust + lua; syntect 默认语法集内置
+/// Lua — `gpui-component` highlighter 自测断言 `find_syntax("lua")` 在场）。
 fn language_for(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("rs") => "rust",
+        Some("lua") => "lua",
         _ => "plaintext",
     }
 }
@@ -95,6 +104,28 @@ pub struct RustViewerHandler;
 impl OpenHandler for RustViewerHandler {
     fn claims(&self, obj: &OpenObject) -> bool {
         claims_rust(obj)
+    }
+
+    fn create_panel(
+        &self,
+        obj: &OpenObject,
+        window: &mut Window,
+        cx: &mut Context<TerminalApp>,
+    ) -> std::sync::Arc<dyn PanelView> {
+        let app = cx.weak_entity();
+        let panel = cx.new(|cx| EditorPanel::new(obj, app, window, cx));
+        panel_handle(panel)
+    }
+}
+
+/// change add-lua-language-service 4.1: `.lua` → [`EditorPanel`]
+/// （spec: Read-only Lua viewer handler — 与 Rust handler 同管线同断言,
+/// 只读 / 标题=文件名 / syntect Lua 高亮 / dedup 由 EditorPanel on_removed 摘）。
+pub struct LuaViewerHandler;
+
+impl OpenHandler for LuaViewerHandler {
+    fn claims(&self, obj: &OpenObject) -> bool {
+        claims_lua(obj)
     }
 
     fn create_panel(

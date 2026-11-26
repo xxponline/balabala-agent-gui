@@ -33,6 +33,9 @@ solution-service = { path = "crates/solution-service" }
 # change asset-service task 2.2: GUI -> asset-service —— 资产枚举/过滤域
 # 已迁入, GUI 侧 Project 构建 filter 集并注入 Module (design D1/D3)
 asset-service = { path = "crates/asset-service" }
+# change add-lua-language-service: lua 索引薄壳 (design D1 — crate 持 view,
+# 主 crate 只在 register_builtin 里 3 行接线)。
+lua-language-service = { path = "crates/lua-language-service" }
 
 [dev-dependencies]
 # 仅测试构建启用 (resolver 不会把 dev 特性并入 cargo build)：
@@ -40,6 +43,10 @@ asset-service = { path = "crates/asset-service" }
 gpui-kit = { version = "0.9.0", features = ["test-support"] }
 # service_layer 测试: 非 tokio executor await ask future (task 6.1)
 futures = "0.3"
+# change add-lua-language-service 4.2: gpui-component 高亮器的语法集来源
+# (`two_face::syntax::extra_newlines`) — 断言 Lua 语法在场。已在 lock
+# (gpui-component 传递依赖), 提升为直接 dev-dep, 无新增下载面。
+two-face = "0.4"
 
 # debug-console change task 4.1: 进程线程数 OS 真值 (design D9)。
 # 两者均已在 Cargo.lock (传递依赖), 此处仅提升为直接依赖, 无新增下载面。
