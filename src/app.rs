@@ -772,7 +772,9 @@ impl TerminalApp {
                 return;
             }
         }
-        let args = solution_service::configure_action_args(action_id, checked).map(Payload::new);
+        // typed args 分派留契约 (D6): create-worktree → 默认名 (OQ2 表单
+        // 未就绪的过渡), configure → 开关反值, 其余动作无 args。
+        let args = solution_service::action_args(action_id, node, checked);
         let result =
             self.service_layer
                 .submit_action(action_id, Some(node.to_string()), args, label);
@@ -3466,12 +3468,13 @@ mod tests {
 
     /// 4.3: 右键 Solution 行 → 菜单**来自服务声明的 actions** (同步、零往返)
     /// → 点击发 `ActionInvoke` → 服务处理 (交树收缩)。
+    /// 扩展 (change solution-git-worktree): project 行右键 → 恒声明三项
+    /// 菜单, 点「拉取」→ `project://` 节点 id 派发 → 非 git 项目被服务端
+    /// 门拒 → notice 点名动作; 零声明 → 无菜单。
     /// (specs/node-actions: Menu is built from the snapshot;
     ///  spec: Solution row context menu offers declared actions)
     #[gpui_kit::test]
-    fn solution_row_context_menu_dispatches_declared_actions(
-        cx: &mut TestAppContext,
-    ) {
+    fn solution_row_context_menu_dispatches_declared_actions(cx: &mut TestAppContext) {
         use gpui_kit::Role;
         use gpui_kit::test::{TestQueryExt, TestWindowExt};
 
@@ -3484,11 +3487,10 @@ mod tests {
         project_model::create_workspace_files(&ws).unwrap();
         let proj = ws.join("proj");
         fs::create_dir_all(&proj).unwrap();
-        fs::write(
-            project_model::files::solutions_path(&ws),
-            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, proj.display()),
-        )
-        .unwrap();
+        // serde_json 构造而非手拼: Windows 路径含 `\` 是非法 JSON 转义,
+        // 手拼会让 load 在 Parse 就炸 (本机实测)。
+        let items = serde_json::json!([{"type": "simple", "path": proj.display().to_string()}]);
+        fs::write(project_model::files::solutions_path(&ws), items.to_string()).unwrap();
         app_entity.update(cx, |app, cx| app.begin_open(ws.clone(), cx));
         wait_sol_settled(cx, &app_entity, |a| a.workspace.is_some(), "工作区打开");
         cx.run_until_parked();
@@ -3532,28 +3534,30 @@ mod tests {
         cx.update_window(handle, |_, window, cx| window.render_frame(cx))
             .expect("render");
 
-        let labels = cx.update_window(handle, |_, window, _| {
-            window
-                .find_all_by_role(Role::MenuItem)
-                .iter()
-                .filter_map(|i| i.label().map(str::to_string))
-                .collect::<Vec<_>>()
-        })
-        .expect("menu items");
+        let labels = cx
+            .update_window(handle, |_, window, _| {
+                window
+                    .find_all_by_role(Role::MenuItem)
+                    .iter()
+                    .filter_map(|i| i.label().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .expect("menu items");
         assert_eq!(
             labels, expected,
             "菜单项与服务声明的 label 一致 (label 归服务, design D3)"
         );
 
         // 点第一项 (注册到资产树, 当前 true → 翻 false) → 交树收缩
-        let item_id = cx.update_window(handle, |_, window, _| {
-            window.find_all_by_role(Role::MenuItem)[0]
-                .path()
-                .last()
-                .expect("菜单项路径")
-                .clone()
-        })
-        .expect("menu item id");
+        let item_id = cx
+            .update_window(handle, |_, window, _| {
+                window.find_all_by_role(Role::MenuItem)[0]
+                    .path()
+                    .last()
+                    .expect("菜单项路径")
+                    .clone()
+            })
+            .expect("menu item id");
         cx.update_window(handle, |_, window, cx| {
             let mut menu = window.within("popup-menu");
             menu.click(item_id, cx);
@@ -3566,22 +3570,230 @@ mod tests {
                 a.service_layer
                     .tree_view()
                     .is_some_and(|t| t.handoff().projects.is_empty())
-                },
+            },
             "点击后交树收缩 (ActionInvoke 已被服务处理)",
         );
-        // 零声明 → 无菜单 (specs/node-actions: A node with no declared
-        // actions has no menu): project 行不挂 context_menu
+        // project 行右键 → 菜单来自服务声明 (node-actions: Menu is built
+        // from the snapshot; 恒声明 拉取/推送/创建 worktree, design D5)。
+        // label 从镜像取 (label 归服务), 只钉声明项数不钉文案。
+        let proj_expected: Vec<String> = cx.update(|cx| {
+            app_entity
+                .read(cx)
+                .service_layer
+                .tree_view()
+                .expect("镜像在场")
+                .hierarchy[0]
+                .projects[0]
+                .actions
+                .iter()
+                .map(|a| a.label.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(proj_expected.len(), 3, "project 节点恒声明三项 (design D5)");
+        let proj_row = format!("project-name-{}", proj.display());
+        cx.update_window(handle, |_, window, cx| {
+            window.right_click(proj_row.clone(), cx)
+        })
+        .expect("right click project row");
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        let on_project = cx
+            .update_window(handle, |_, window, _| {
+                window
+                    .find_all_by_role(Role::MenuItem)
+                    .iter()
+                    .filter_map(|i| i.label().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .expect("menu items on project row");
+        assert_eq!(
+            on_project, proj_expected,
+            "project 行菜单项与服务声明一致 (label 归服务, design D3)"
+        );
+
+        // 点首项 (拉取) → invoke 带 `project://` 节点 id → 非 git 项目被
+        // 服务端门拒 → reply 配对出**点名动作**的 notice (node-actions:
+        // Failed action names itself)。若节点 id 少前缀 → 服务端 reject →
+        // 路由错误只出笼统文案, 正好被本断言抦下。
+        app_entity.update(cx, |app, _cx| app.notice = None);
+        let pull_item = cx
+            .update_window(handle, |_, window, _| {
+                window.find_all_by_role(Role::MenuItem)[0]
+                    .path()
+                    .last()
+                    .expect("菜单项路径")
+                    .clone()
+            })
+            .expect("pull menu item id");
+        cx.update_window(handle, |_, window, cx| {
+            let mut menu = window.within("popup-menu");
+            menu.click(pull_item, cx);
+        })
+        .expect("click pull menu item");
+        wait_sol_settled(
+            cx,
+            &app_entity,
+            |a| a.notice.is_some(),
+            "拉取被服务端拒 → notice",
+        );
+        let notice = cx.update(|cx| app_entity.read(cx).notice.clone()).unwrap();
+        assert!(
+            notice.contains(&format!("{}失败", proj_expected[0])),
+            "notice 点名首项动作 (label 取自声明): {notice}"
+        );
+
+        // 零声明 → 无菜单 (node-actions: A node with no declared actions
+        // has no menu) —— 注入 actions 为空的 project 快照; **必须重渲染**
+        // (菜单构建器在 render 期捕获 actions, 旧构建器还带着三项)。
+        app_entity.update(cx, |app, cx| {
+            let mut snap = app.service_layer.tree_view().expect("镜像在场").clone();
+            let mut hierarchy = snap.hierarchy.to_vec();
+            let mut projects = hierarchy[0].projects.to_vec();
+            projects[0].actions = std::sync::Arc::from([]);
+            hierarchy[0].projects = projects.into();
+            snap.hierarchy = hierarchy.into();
+            app.service_layer.set_tree_view_for_test(snap);
+            app.solution_overview.update(cx, |_, cx| cx.notify());
+        });
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render after inject");
+        cx.update_window(handle, |_, window, cx| window.right_click(proj_row, cx))
+            .expect("right click project row (zero actions)");
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        let on_empty = cx
+            .update_window(handle, |_, window, _| {
+                window.find_all_by_role(Role::MenuItem).len()
+            })
+            .expect("menu items on zero-action project row");
+        assert_eq!(on_empty, 0, "零声明动作的 project 行右键无菜单");
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    /// 6.2 冒烟的自动化半场（(b) 方案, OQ2 表单未就绪）：右键 git
+    /// project →「创建 worktree」→ 视图经契约构造**默认名**
+    /// `<project>-<毫秒>` → 服务端真建出目录。project 名带空格 →
+    /// 默认名必须折成 `my-proj-<毫秒>` 才能过 git（按 basename 自建
+    /// 分支, 名字非法 git 直接 fatal）。顺带覆盖 Windows 真机 git.exe
+    /// PATH 解析（git setup 与 worktree add 都经 `crate::git` 出口）。
+    #[gpui_kit::test]
+    fn create_worktree_menu_builds_default_name(cx: &mut TestAppContext) {
+        use gpui_kit::Role;
+        use gpui_kit::test::{TestQueryExt, TestWindowExt};
+
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app(cx, history, None);
+
+        // 真 git 项目（worktree add 需要 HEAD 可解析 → 至少一个 commit）；
+        // project 名带空格, 专门钉默认名的分支名消毒。
+        let ws = temp_dir("wt-create");
+        project_model::create_workspace_files(&ws).unwrap();
+        let proj = ws.join("my proj");
+        fs::create_dir_all(&proj).unwrap();
+        let git = |args: &[&str]| {
+            solution_service::git::run_ok(args, &proj)
+                .unwrap_or_else(|e| panic!("git {args:?}: {e}"))
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        fs::write(proj.join("f.txt"), "v1").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let items = serde_json::json!([{"type": "simple", "path": proj.display().to_string()}]);
+        fs::write(project_model::files::solutions_path(&ws), items.to_string()).unwrap();
+
+        app_entity.update(cx, |app, cx| app.begin_open(ws.clone(), cx));
+        wait_sol_settled(cx, &app_entity, |a| a.workspace.is_some(), "工作区打开");
+        cx.run_until_parked();
+
+        // 菜单项 label 从**镜像的服务声明**取 (label 归服务)
+        let create_label = cx.update(|cx| {
+            app_entity
+                .read(cx)
+                .service_layer
+                .tree_view()
+                .expect("镜像在场")
+                .hierarchy[0]
+                .projects[0]
+                .actions
+                .iter()
+                .find(|a| a.id == solution_service::ACTION_CREATE_WORKTREE)
+                .expect("create 动作已声明")
+                .label
+                .clone()
+        });
+
         let proj_row = format!("project-name-{}", proj.display());
         cx.update_window(handle, |_, window, cx| window.right_click(proj_row, cx))
             .expect("right click project row");
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| window.render_frame(cx))
             .expect("render");
-        let on_project = cx.update_window(handle, |_, window, _| {
-            window.find_all_by_role(Role::MenuItem).len()
+        let item_id = cx
+            .update_window(handle, |_, window, _| {
+                let items = window.find_all_by_role(Role::MenuItem);
+                let idx = items
+                    .iter()
+                    .position(|i| i.label() == Some(create_label.as_str()))
+                    .expect("创建 worktree 菜单项在场");
+                items[idx].path().last().expect("菜单项路径").clone()
+            })
+            .expect("create menu item id");
+        cx.update_window(handle, |_, window, cx| {
+            let mut menu = window.within("popup-menu");
+            menu.click(item_id, cx);
         })
-        .expect("menu items on project row");
-        assert_eq!(on_project, 0, "未声明动作的 project 行右键无菜单");
+        .expect("click create worktree menu item");
+
+        // 服务端真建目录 → 等落盘; 名字 = <消毒后 project>-<毫秒>
+        let wt_parent = ws.join(".balabala.worktrees");
+        wait_sol_settled(
+            cx,
+            &app_entity,
+            |_| {
+                wt_parent
+                    .read_dir()
+                    .map(|mut d| d.next().is_some())
+                    .unwrap_or(false)
+            },
+            "worktree 目录出现",
+        );
+        let entries: Vec<_> = wt_parent
+            .read_dir()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1, "恰一个 worktree 目录");
+        let dir_name = entries[0].file_name().to_string_lossy().into_owned();
+        assert!(
+            dir_name.starts_with("my-proj-"),
+            "空格 project 段已消毒: {dir_name}"
+        );
+        let ts = dir_name.trim_start_matches("my-proj-");
+        assert!(
+            !ts.is_empty() && ts.chars().all(|c| c.is_ascii_digit()),
+            "毫秒时间戳段: {dir_name}"
+        );
+
+        // 快照第三层指向新建目录 (TreeChanged/回执已消费)
+        wait_sol_settled(
+            cx,
+            &app_entity,
+            |a| {
+                a.service_layer.tree_view().is_some_and(|t| {
+                    t.hierarchy[0].projects[0]
+                        .worktrees
+                        .iter()
+                        .any(|w| w.path.ends_with(&dir_name))
+                })
+            },
+            "快照列出新建 worktree",
+        );
 
         let _ = fs::remove_dir_all(&ws);
     }

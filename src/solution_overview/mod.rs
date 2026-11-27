@@ -20,10 +20,10 @@ use gpui_kit::component::menu::{ContextMenu, ContextMenuExt, PopupMenuItem};
 use gpui_kit::{InteractiveElement, *};
 use std::path::PathBuf;
 
-use agent_service::contract::{SessionId, SessionView, SessionStatus};
-use solution_service::{ActionDesc, solution_node_id};
 use crate::app::TerminalApp;
 use crate::ui::widgets::TextTooltip;
+use agent_service::contract::{SessionId, SessionStatus, SessionView};
+use solution_service::{ActionDesc, project_node_id, solution_node_id};
 
 /// 点击回调的统一类型 (拥有; 可存进元素树)。
 type ClickListener = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
@@ -127,6 +127,9 @@ pub struct ProjectRow {
     pub agents: Vec<AgentRow>,
     /// 展开时渲染的 worktree 行 (hierarchy 第三层; collapsed 时为空)。
     pub worktrees: Vec<WorktreeRow>,
+    /// 服务为该节点声明的动作 (右键菜单源, 恒含 拉取/推送/创建 worktree,
+    /// change solution-git-worktree design D5)。
+    pub actions: Vec<ActionDesc>,
 }
 
 /// 一个 worktree 行的渲染数据 (拥有值, change solution-git-worktree 5.3)。
@@ -244,6 +247,7 @@ fn project_row(
         collapsed,
         agents,
         worktrees,
+        actions: p.actions.to_vec(),
     }
 }
 
@@ -321,8 +325,8 @@ impl Render for SolutionOverviewPanel {
         let theme_warning = cx.theme().warning;
         let theme_muted = cx.theme().muted_foreground;
 
-        // 统一装进 AnyElement: `.context_menu()` 会把 solution 行的返回类型
-        // 从 `Stateful<Div>` 变成 `ContextMenu<..>`, 同一 Vec 必须同型。
+        // 统一装进 AnyElement: `.context_menu()` 会把 solution/project 行的
+        // 返回类型从 `Stateful<Div>` 变成 `ContextMenu<..>`, 同一 Vec 必须同型。
         let mut rows: Vec<AnyElement> = Vec::new();
         if let Some(ws) = &snap.ws {
             for sol in &ws.solutions {
@@ -499,9 +503,12 @@ fn build_solution_row(
 }
 
 /// 构建一行 project。listener 在这里用 cx 预构建 (值捕获 root),
-/// 返回**具体类型** `Stateful<Div>` 而非 opaque: Rust 2024 的 RPIT
-/// 会捕获 cx 的借用生命周期, 导致循环里无法多次调用。
-fn build_project_row(p: &ProjectRow, cx: &mut Context<SolutionOverviewPanel>) -> Stateful<Div> {
+/// 返回**具体类型** `ContextMenu<Stateful<Div>>` 而非 opaque: Rust 2024 的
+/// RPIT 会捕获 cx 的借用生命周期, 导致循环里无法多次调用。
+fn build_project_row(
+    p: &ProjectRow,
+    cx: &mut Context<SolutionOverviewPanel>,
+) -> ContextMenu<Stateful<Div>> {
     // 载荷用 root PathBuf 稳定身份 (D3): 闭包捕获不随删除错位
     let root = PathBuf::from(&p.root);
     let group = format!("project-{}", p.root);
@@ -557,6 +564,42 @@ fn build_project_row(p: &ProjectRow, cx: &mut Context<SolutionOverviewPanel>) ->
                 .child(name.clone())
                 .test_text(name),
         )
+        // 右键菜单: 从节点携带的 actions 构建 (同 solution 行形态, D3) ——
+        // 恒含 拉取/推送/创建 worktree (design D5), 门控在服务端; 节点 id
+        // 必须带 `project://` 前缀 (服务端 parse_project_node)。
+        .context_menu({
+            let weak = cx.entity().downgrade();
+            let actions = p.actions.clone();
+            let node = project_node_id(&root);
+            move |menu, _window, _cx| {
+                let mut menu = menu;
+                for desc in actions.iter() {
+                    let mut item = PopupMenuItem::new(desc.label.clone());
+                    if let Some(v) = desc.checked {
+                        item = item.checked(v);
+                    }
+                    let act_id = desc.id.clone();
+                    let act_label = desc.label.clone();
+                    let act_checked = desc.checked;
+                    let weak = weak.clone();
+                    let node = node.clone();
+                    item = item.on_click(move |_, _window, cx| {
+                        weak.update(cx, |panel, cx| {
+                            panel.invoke_action(
+                                node.clone(),
+                                act_id.clone(),
+                                act_label.clone(),
+                                act_checked,
+                                cx,
+                            )
+                        })
+                        .ok();
+                    });
+                    menu = menu.item(item);
+                }
+                menu
+            }
+        })
 }
 
 /// 构建一行 worktree (hierarchy 第三层, change solution-git-worktree 5.3)。

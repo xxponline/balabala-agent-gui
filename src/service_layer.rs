@@ -459,7 +459,20 @@ impl ServiceLayer {
                             push_notice(&mut self.notices, None, format!("{label}失败: {msg}"));
                         }
                         None => {
-                            if let Some(c) = env.corr.filter(|c| self.pending_loads.remove(c)) {
+                            // solution 动作台账 (design D7): route_error 与回执
+                            // 同款配对 —— 按 action_id 点名 (不落笼统文案),
+                            // 台账同步销账 (不悬挂泄漏)。
+                            if let Some((action_id, label)) =
+                                env.corr.and_then(|c| self.pending_sol_ops.remove(&c))
+                            {
+                                push_notice(
+                                    &mut self.notices,
+                                    Some(action_id.as_str()),
+                                    format!("{label}失败: {msg}"),
+                                );
+                            } else if let Some(c) =
+                                env.corr.filter(|c| self.pending_loads.remove(c))
+                            {
                                 // load 链路: 路由失败也进回执队列 (打开流程统一收口)
                                 self.load_results.push((
                                     c,
@@ -1415,6 +1428,129 @@ mod tests {
             dead_before,
             "无 corr 事件不得产生死信噪音"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// change solution-git-worktree (route_error 配对补全): solution 动作在途
+    /// 收到 `KIND_ROUTE_ERROR`（超时/路由失败/reject）→ 与回执同款按
+    /// action_id 点名出 notice（不落笼统文案）且 `pending_sol_ops` 台账
+    /// 同步销账（design D7: id 路由, label 只进文案）；load 台账与无 corr
+    /// 两支不受影响。
+    ///
+    /// 投递保真：带 corr 的 `tell` 走 router `complete()` 销账 → 按 pending
+    /// 表投进提交者邮箱 —— 与真实超时路径（5s 定时器 `tx.try_send`）同一条
+    /// 链。故先发**真 ask** 造出 pending（载荷类型对不上 → 服务第一支
+    /// `reject` 静默丢弃, 不抢先回执），再合成 route_error 完成它；不等 5s。
+    #[test]
+    fn route_error_pairs_solution_action_ledger() {
+        let dir = temp_scan("route-error-sol");
+        let mut layer = ServiceLayer::bootstrap(&dir).expect("bootstrap");
+        assert!(
+            wait_until(
+                || {
+                    layer.pump();
+                    layer.states.get(&layer.solution_id) == Some(&ServiceState::Available)
+                },
+                Duration::from_secs(3)
+            ),
+            "solution 服务应可用"
+        );
+        layer.take_notices();
+
+        let ask = |layer: &mut ServiceLayer, kind: &'static str| -> Corr {
+            layer
+                .listener
+                .submit(
+                    Route::Service("solution".into()),
+                    kind,
+                    Payload::new(CorePing(1)), // 类型对不上 → 服务 reject, pending 留存
+                )
+                .expect("ask 应急切成功 (服务 Available)")
+        };
+        let inject_error = |layer: &mut ServiceLayer, corr: Option<Corr>| {
+            let env = Envelope::new(
+                Route::Instance(layer.listener.id()),
+                Address::instance(layer.solution_id),
+                KIND_ROUTE_ERROR,
+                Payload::new(service_manager::RouteError::Timeout),
+            );
+            let env = match corr {
+                Some(c) => env.with_corr(c),
+                None => env,
+            };
+            layer.manager.tell(env).expect("route_error 投递");
+        };
+
+        // 支 1: solution 动作台账 → 点名 notice + 台账销账
+        let corr = ask(&mut layer, KIND_SOL_ACTION);
+        layer
+            .pending_sol_ops
+            .insert(corr, ("git.pull".into(), "拉取".into()));
+        inject_error(&mut layer, Some(corr));
+        assert!(
+            wait_until(
+                || {
+                    layer.pump();
+                    !layer.notices.is_empty()
+                },
+                Duration::from_secs(3)
+            ),
+            "route_error 应出点名 notice"
+        );
+        let (action, text) = layer.take_notices().pop().expect("notice 在场");
+        assert_eq!(
+            action.as_deref(),
+            Some("git.pull"),
+            "路由键 = action_id (D7)"
+        );
+        assert!(
+            text.contains("拉取失败") && text.contains("timed out"),
+            "{text}"
+        );
+        assert!(
+            layer.pending_sol_ops.is_empty(),
+            "route_error 配对后台账不悬挂 (防泄漏)"
+        );
+
+        // 支 2: load 台账 → 回执队列收 Err, 不出 notice (打开链路统一收口)
+        let load_corr = layer
+            .submit_solution_load(Payload::new(CorePing(1)))
+            .expect("load ask 应急切成功");
+        inject_error(&mut layer, Some(load_corr));
+        assert!(
+            wait_until(
+                || {
+                    layer.pump();
+                    layer.load_results.iter().any(|(c, _)| *c == load_corr)
+                },
+                Duration::from_secs(3)
+            ),
+            "load 链路 route_error 应进回执队列"
+        );
+        assert!(layer.take_notices().is_empty(), "load 支不出 notice");
+        match layer.take_load_result(load_corr) {
+            Some(Err(SolOpError::Persist(t))) => {
+                assert!(t.contains("solution 服务请求失败"), "{t}")
+            }
+            other => panic!("load 回执应是 Persist 错, 实际: {:?}", other.map(|_| "ok")),
+        }
+
+        // 支 3: 无 corr → 兜底文案 (action = None), 不误配台账
+        inject_error(&mut layer, None);
+        assert!(
+            wait_until(
+                || {
+                    layer.pump();
+                    !layer.notices.is_empty()
+                },
+                Duration::from_secs(3)
+            ),
+            "无 corr route_error 应出兜底 notice"
+        );
+        let (action, text) = layer.take_notices().pop().expect("notice 在场");
+        assert_eq!(action, None, "无 corr 无路由键");
+        assert!(text.starts_with("服务请求失败"), "{text}");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

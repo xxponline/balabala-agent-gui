@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use service_core::Payload;
 
@@ -134,6 +135,89 @@ pub fn configure_action_args(action_id: &str, checked: Option<bool>) -> Option<C
             git_enabled: Some(!current),
         }),
         _ => None,
+    }
+}
+
+/// 视图点击时按 `action_id` 构造 invoke 的 typed args（change
+/// solution-git-worktree design D6: 形状知识留在契约, 视图只管一行调用）：
+/// - 创建 worktree → 默认名 `<project>-<epoch毫秒>`（change
+///   solution-git-worktree OQ2: 表单未就绪的过渡, 见
+///   [`default_create_worktree_args`]）；
+/// - configure 两开关 → 目标态反值（[`configure_action_args`]）；
+/// - 其余（拉取/推送/删除 worktree）无 args。
+pub fn action_args(action_id: &str, node: &str, checked: Option<bool>) -> Option<Payload> {
+    match action_id {
+        ACTION_CREATE_WORKTREE => default_create_worktree_args(node).map(Payload::new),
+        _ => configure_action_args(action_id, checked).map(Payload::new),
+    }
+}
+
+/// 创建 worktree 的默认 args（change solution-git-worktree OQ2 过渡）：
+/// `<project目录名>-<epoch毫秒>`，project 段过滤成**分支名安全**字符集。
+///
+/// `git worktree add <path>` 按目录 basename 自建分支 —— 空格、`..`、
+/// 前导 `-`/`.` 等「目录名合法但分支名非法」的字符会让 git 直接 fatal
+/// （6.2 冒烟前置实测；服务端 `sanitize_name` 只管目录安全, 这里补分支
+/// 名面）。project 段取 `project://` 节点的 `file_name()`（路径可能无
+/// file_name → 兜底 `worktree`）。节点非 `project://` → `None`
+/// （服务端 parse 同样会拒, 名字用不上）。
+pub fn default_create_worktree_args(node: &str) -> Option<CreateWorktreeReq> {
+    let root = parse_project_node(Some(node))?;
+    let project = root
+        .file_name()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_default();
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    Some(CreateWorktreeReq {
+        name: format!("{}-{ts}", branch_safe_segment(&project)),
+    })
+}
+
+/// project 段 → 分支名安全片段：保留字母数字（含中文等 Unicode 项目名）
+/// 与 `_`、`-`、`.`；其余（空格、`:*?"<>|`、控制符…）折 `-`；折叠连续
+/// `-` 与 `..`；不以 `-`/`.` 开头；修剪尾部 `-`/`.`；全被滤掉 → `worktree`。
+/// 合法性以真 `git check-ref-format` 为准（契约测试裁决, 不自写规则）。
+fn branch_safe_segment(raw: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    let mut last_dot = false;
+    for c in raw.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            out.push(c);
+            last_dash = false;
+            last_dot = false;
+        } else if c == '-' {
+            if last_dash || out.is_empty() {
+                continue;
+            }
+            out.push('-');
+            last_dash = true;
+            last_dot = false;
+        } else if c == '.' {
+            if last_dot || out.is_empty() {
+                continue;
+            }
+            out.push('.');
+            last_dot = true;
+            last_dash = false;
+        } else {
+            // 非法字符 → 折 `-`（首字符非法时直接丢, 不产出前导 `-`）
+            if last_dash || out.is_empty() {
+                continue;
+            }
+            out.push('-');
+            last_dash = true;
+            last_dot = false;
+        }
+    }
+    let trimmed = out.trim_end_matches(|c| c == '-' || c == '.');
+    if trimmed.is_empty() {
+        "worktree".into()
+    } else {
+        trimmed.into()
     }
 }
 
@@ -764,6 +848,73 @@ mod tests {
         assert_eq!(back.action_id, ACTION_PUSH);
         assert_eq!(back.ok, false);
         assert!(back.detail.contains("non-fast-forward"), "失败原因随载荷");
+    }
+
+    /// 默认名（6.2 冒烟前置, OQ2 表单未就绪的过渡）：`<project>-<毫秒>`，
+    /// project 段过滤成分支名安全字符集 —— 用真 git `check-ref-format`
+    /// 裁决合法性, 不自写规则。
+    #[test]
+    fn default_create_worktree_args_are_valid_branch_names() {
+        for node in [
+            "project:///ws/my proj",  // 空格 → 折 `-`
+            "project:///ws/a..b",     // `..` → 折单点
+            "project:///ws/.hidden",  // 前导 `.` 丢弃
+            "project:///ws/-lead",    // 前导 `-` 丢弃
+            "project:///ws/我的项目", // 中文保留 (Unicode 项目名)
+            "project:///ws/+++",      // 全非法 → 兜底 `worktree`
+            "project:///,",           // 逗号名 → 全非法 → 兜底 `worktree`
+            "project:///",            // 无 file_name → 兜底 `worktree`
+        ] {
+            let req = default_create_worktree_args(node).expect("project 节点");
+            // 形状: <段>-<纯数字毫秒>
+            let (seg, ts) = req.name.rsplit_once('-').expect("段-时间戳两段");
+            assert!(!seg.is_empty() && !ts.is_empty(), "{node} → {}", req.name);
+            assert!(
+                ts.chars().all(|c| c.is_ascii_digit()),
+                "{node} → {}",
+                req.name
+            );
+            // 真 git 裁决: 合法分支名 (git worktree add 按 basename 自建分支)
+            let out = crate::git::run(&["check-ref-format", "--branch", &req.name], Path::new("."))
+                .unwrap_or_else(|e| panic!("git 不可用: {e}"));
+            assert_eq!(
+                out.code, 0,
+                "{node} → {:?} 不是合法分支名: {}",
+                req.name, out.stderr
+            );
+        }
+        // 非 project 节点 → None (契约 bug 信号: 服务端 parse 同样会拒)
+        assert!(default_create_worktree_args("solution:///x").is_none());
+    }
+
+    /// typed args 分派表 (design D6)：create → 默认名；configure → 开关
+    /// 反值；其余动作（pull/push/delete）无 args。
+    #[test]
+    fn action_args_dispatches_per_action() {
+        let node = "project:///ws/proj";
+        let a = action_args(ACTION_CREATE_WORKTREE, node, None).expect("create 有 args");
+        let req = a
+            .downcast::<CreateWorktreeReq>()
+            .expect("CreateWorktreeReq");
+        assert!(req.name.starts_with("proj-"), "{}", req.name);
+
+        let a =
+            action_args(ACTION_CONFIGURE_REGISTER, node, Some(false)).expect("configure 有 args");
+        let cfg = a.downcast::<ConfigureReq>().expect("ConfigureReq");
+        assert_eq!(cfg.register_to_asset_manager, Some(true), "checked 取反");
+
+        assert!(
+            action_args(ACTION_PULL, node, None).is_none(),
+            "pull 无 args"
+        );
+        assert!(
+            action_args(ACTION_PUSH, node, None).is_none(),
+            "push 无 args"
+        );
+        assert!(
+            action_args(ACTION_DELETE_WORKTREE, node, None).is_none(),
+            "delete 无 args"
+        );
     }
 
     /// 由 item 列表搭一份 hierarchy（与 `snapshot()` 同构）。
