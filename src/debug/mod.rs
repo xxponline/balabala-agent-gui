@@ -89,6 +89,13 @@ pub fn register_builtin() {
         title: "threads/pipeline",
         factory: threads_pipeline::factory,
     });
+    // change add-lua-language-service (design D1): view 住 crate, 这里 3 行
+    // 接线 — 无 TerminalApp 依赖, 工厂参数忽略即为 `_`。
+    register(DebugSection {
+        id: "lua-index",
+        title: "lua-index",
+        factory: |_, cx| cx.new(|cx| lua_language_service::LuaIndexView::new(cx)).into(),
+    });
 }
 
 /// 菜单项 action (task 6.2 产出 section 项 / 6.3 分发接线): 点击 Debug
@@ -221,4 +228,25 @@ mod tests {
         assert_eq!(section_by_id("test::lookup").map(|s| s.title), Some("test::lookup"));
         assert!(section_by_id("test::definitely-missing").is_none(), "未登记 → None");
     }
+
+    /// change add-lua-language-service 3.2: 装配期注册含 `lua-index`
+    /// (spec: Debug menu SHALL list a lua-index debug section — 注册表是
+    /// 菜单唯一数据源, 注册在场 ⇔ 菜单列出)。register 幂等, 直调无碍。
+    #[test]
+    fn register_builtin_includes_lua_index() {
+        register_builtin();
+        let sec = sections()
+            .into_iter()
+            .find(|s| s.id == "lua-index")
+            .expect("register_builtin 须登记 lua-index (3.2)");
+        assert_eq!(sec.title, "lua-index", "标题与 spec 的节名一致");
+        assert!(
+            section_by_id("lua-index").is_some(),
+            "section_by_id 可查 (开签入口消费)"
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "lua_index_tests.rs"]
+mod lua_index_tests;
