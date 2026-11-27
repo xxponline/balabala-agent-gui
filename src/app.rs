@@ -781,7 +781,11 @@ impl TerminalApp {
         match result {
             Ok(_) => self.kick_input_drain(cx), // 快泵: 回执尽快达
             Err(e) => {
-                self.notice = Some(format!("{label}失败: {e}"));
+                let msg = format!("{label}失败: {e}");
+                // 冒烟可复制: 失败文案同步落控制台 (仅 debug; release 无控制台)
+                #[cfg(debug_assertions)]
+                println!("[notice] {msg}");
+                self.notice = Some(msg);
             }
         }
         cx.notify();
@@ -1149,6 +1153,10 @@ impl TerminalApp {
         // shown in the tab, 签保留)。
         // **路由按 action_id, 不按文案** (design D7) — 改 label 不改行为。
         if let Some((action, text)) = self.service_layer.take_notices().pop() {
+            // 冒烟可复制: 通知 (失败点名 / git 完成事件) 同步落控制台
+            // (仅 debug; release 无控制台)。
+            #[cfg(debug_assertions)]
+            println!("[notice] {text}");
             if self.sol_config_inflight && action.as_deref() == Some(SOL_ACTION_CREATE) {
                 self.sol_config_inflight = false;
                 self.sol_config_error = Some(text.clone());
