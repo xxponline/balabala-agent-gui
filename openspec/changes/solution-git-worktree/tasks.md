@@ -74,9 +74,41 @@
 - [x] 6.1 全量 `cargo test` 失败集合与基线 diff 为空（本机 macOS：
       基线 0 失败，e8cb9ff 处已录）；验证：命令输出 `test result` 行
       无 failed。
-- [ ] 6.2 Windows 侧冒烟（真机）：`git.exe` PATH 解析（pi 前例坑）、
+- [x] 6.2 Windows 侧冒烟（真机）：`git.exe` PATH 解析（pi 前例坑）、
       目录名非法字符消毒生效、pull/push/delete 各走一回；验证：用户
       目视 + 记录于 tasks（口径同 win-in-window 6.2）。
+      **验收记录（2026-11-28, Windows, debug 构建 `cargo run`, 观察者 =
+      用户真机目视 + 我方磁盘/git 取证整理）**：
+      - 冒烟环境：工作区 `D:\Balabala`（项目 = 仓库自身；另在
+        UnrealEngine 大仓上试过拉取）；通知经 `[notice]` 控制台落文案
+        （3dc99c8, 冒烟期间加）供直接复制
+      - **git.exe PATH** ✓：GUI 进程内 git 调用全通 —— `worktree
+        add/remove` 与 `git.pull` 均真 spawn 执行（pi 前例坑不复现）
+      - **目录名消毒 + 默认名 (b)** ✓：真机产出
+        `balabala-agent-gui-1795801689004`（`<project>-<epoch毫秒>`），
+        分支名合法被 git 接受；OQ2 表单未就绪的过渡方案实证
+      - **create/pull/push/delete 各一回** ✓：create 成功（成功无
+        banner —— 设计如此）；pull 有 `[notice] git.pull 完成: …`
+        完成事件按 action_id 点名；push/delete 用户目视通过，delete
+        后 `git worktree list` 仅剩主仓、`.git/worktrees` 元数据删净
+        （我方取证）
+      - **冒烟期间定位并修复（独立 commit，均带回归测试/探针）**：
+        - `3b3484e` 关窗残留：tokio Runtime Drop 无限期等在途
+          spawn_blocking，资产枚举 `D:\UnrealEngine`（百万文件）致
+          关窗后残留数分钟 → `shutdown_background`（钉子 Drop <500ms，
+          修复前实测干等 3s）；修复后多轮关窗取证无残留进程
+        - `1a97653` create 必炸：工作区路径 `\\?\` 扩展前缀经 MSYS
+          转 `//?/` → mkdir EINVAL（`[notice]` 原文 + 同仓探针 A/B 对照
+          双证）→ git 统一出口剥 argv 前缀（cwd 不动，pull 双证无碍）
+        - `3dc99c8` `[notice]` 控制台落文案（GUI 通知不可选中，冒烟
+          可复制）
+      - 遗留（不阻塞验收）：修复前 3 次失败尝试遗留
+        `balabala-agent-gui-*` 分支可 `git branch -d` 清理；大仓拉/推
+        门控 `git status` 同步阻塞服务驱动（其间 ask 排队超时）——
+        待独立 change；单次 `exit code: 0xffffffff`（疑手动结束，未再
+        复现）
+      **记录口径**：观察者是用户（我方无法目视 GUI），我方负责磁盘/
+      git 取证与整理；非我方独立复现。
 - [x] 6.3 macOS 侧冒烟（真机）：原生行为不回归，`.balabala.worktrees`
       不出现在资产树（点前缀过滤生效）、脏 worktree 删除被 git 拒；
       验证：用户目视 + 记录。
