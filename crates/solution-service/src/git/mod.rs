@@ -94,8 +94,14 @@ pub fn is_tracked_clean(root: &Path) -> Result<bool, GitError> {
 /// 防挂三件套全在这一处（design D6）：stdin null、`GIT_TERMINAL_PROMPT=0`、
 /// `GIT_ASKPASS=:`。
 fn run_program(program: &str, args: &[&str], cwd: &Path) -> Result<GitOutput, GitError> {
+    // `\\?\` 扩展长度前缀: Rust fs 认, git (MSYS) 不认 —— argv 里的
+    // `\\?\D:\x` 会被转成 `//?/D:/x` → mkdir "Invalid argument" (真机
+    // D:\Balabala 冒烟: worktree add 必炸于 "could not create leading
+    // directories …"; 探针同形复现)。cwd 不走 argv 转换 (CreateProcess
+    // 直收, pull 在带前缀仓上实测通过) —— 只剥 argv, cwd 不动。
+    let args: Vec<&str> = args.iter().map(|a| strip_extended_prefix(*a)).collect();
     let out = Command::new(program)
-        .args(args)
+        .args(&args)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", ":")
@@ -107,6 +113,23 @@ fn run_program(program: &str, args: &[&str], cwd: &Path) -> Result<GitOutput, Gi
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: tail_lossy(&out.stderr),
     })
+}
+
+/// 剥 `\\?\` 扩展长度前缀（仅 Windows 形态）。
+///
+/// git (MSYS 路径层) 不认该前缀：argv 里的 `\\?\D:\x` 会被转成
+/// `//?/D:/x` → mkdir "Invalid argument" —— 真机 D:\Balabala 冒烟
+/// `worktree add` 必炸于 "could not create leading directories …"。
+/// cwd 不走 argv 转换（CreateProcess 直收）, 实测无碍 → 不剥。
+#[cfg(windows)]
+fn strip_extended_prefix(arg: &str) -> &str {
+    arg.strip_prefix("\\\\?\\").unwrap_or(arg)
+}
+
+/// 非 Windows 无此形态 → 恒等。
+#[cfg(not(windows))]
+fn strip_extended_prefix(arg: &str) -> &str {
+    arg
 }
 
 /// 取字节尾部且不切断 UTF-8 字符（多字节序列的续字节 10xxxxxx 跳过）。
@@ -142,6 +165,20 @@ mod tests {
             .expect_err("注入的假程序必须 spawn 失败");
         assert!(matches!(err, GitError::Spawn(_)), "应为 Spawn: {err:?}");
         assert!(err.to_string().contains("no-such-git-binary"));
+    }
+
+    /// `\\?\` 前缀剥除 (真机 D:\Balabala 冒烟): argv 带前缀 → git 转
+    /// `//?/D:/` → mkdir EINVAL (worktree add 必炸); cwd 不剥 (实测无碍),
+    /// 普通参数不动。非 Windows 恒等 → 测试门控 Windows。
+    #[cfg(windows)]
+    #[test]
+    fn extended_prefix_stripped_from_args() {
+        assert_eq!(
+            strip_extended_prefix("\\\\?\\D:\\ws\\.balabala.worktrees\\x"),
+            "D:\\ws\\.balabala.worktrees\\x"
+        );
+        assert_eq!(strip_extended_prefix("D:\\plain"), "D:\\plain");
+        assert_eq!(strip_extended_prefix("--branch"), "--branch");
     }
 
     /// 任务 1.1 验证: 正常 `git --version` 走通出口。

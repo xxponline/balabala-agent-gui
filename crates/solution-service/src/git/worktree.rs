@@ -218,6 +218,32 @@ mod tests {
         );
     }
 
+    /// 真机 D:\Balabala 冒烟回归: parent 带 `\\?\` 扩展前缀也能建成 ——
+    /// 不剥前缀时 git (MSYS) 把它转成 `//?/` → mkdir "Invalid argument"
+    /// (线上原文: could not create leading directories … Invalid argument;
+    /// 探针 A 同形复现)。顺带覆盖 remove 的同款 dest 路径。
+    #[cfg(windows)]
+    #[test]
+    fn add_succeeds_with_extended_prefix_parent() {
+        let main = repo("extpfx");
+        let parent = main.join(".balabala.worktrees");
+        std::fs::create_dir_all(&parent).unwrap();
+        let parent_ext = std::path::PathBuf::from(format!("\\\\?\\{}", parent.display()));
+
+        let dest = add(&main, &parent_ext, "ext-x").expect("剥前缀后 add 应成功");
+        assert!(dest.is_dir(), "worktree 目录应存在: {dest:?}");
+
+        let entries = list(&main).expect("list 应成功");
+        let same = |e: &WorktreeEntry| {
+            std::fs::canonicalize(&e.path).unwrap_or_else(|_| e.path.clone()) == dest
+        };
+        assert!(entries.iter().any(same), "list 应见新条目");
+
+        remove(&main, &dest).expect("干净删应成功 (dest 同样带前缀)");
+        assert!(!dest.exists(), "目录应删净");
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
     /// 消毒: 斜杠折叠 / Windows 非法字符 / 拒 .. 与绝对路径。
     #[test]
     fn sanitize_name_rules() {
