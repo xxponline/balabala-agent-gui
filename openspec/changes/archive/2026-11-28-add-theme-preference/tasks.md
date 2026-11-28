@@ -56,9 +56,16 @@
       遗留问题：solution-overview hover 提示字体恒黑、dark 模式不可见
       → 根因 `TextTooltip` 缺 text_color（浮层不吃应用根默认色），
       记入组 5 本 change 内修复
-- [ ] 4.3 Windows 真机冒烟：窗口内菜单栏勾选位渲染（源码已证
+- [x] 4.3 Windows 真机冒烟：窗口内菜单栏勾选位渲染（源码已证
       check icon 映射）、切换/恢复/门控行为同 macOS；验证：用户目视 +
       记录于本 tasks
+      **验收记录（2026-11-28, Windows, 用户真机目视）**：清单 A–F
+      全过：View > Theme 随主窗出现且恰一勾（Launcher 无 View）、切
+      换即时生效含活会话配色且下次打开勾跳新项、重启恢复且启动即见存
+      储偏好（首帧 Launcher 色正确）、System 态翻转系统外观吸附、pin
+      态持守（设置 → 个性化 → 颜色）、无关重建后勾选保持、原生标题栏
+      跟系统外观（DWM 设计行为，观察项非回归）；日志仅常态 term-rate
+      无 panic
 
 ## 5. 冒烟发现的既有 theming 缺口
 
