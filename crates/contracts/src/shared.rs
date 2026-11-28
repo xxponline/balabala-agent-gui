@@ -41,7 +41,13 @@ pub enum ExecutedBy {
 ///
 /// ```compile_fail
 /// use contracts::shared::ActionDesc;
-/// let _ = ActionDesc { id: "x".into(), label: "y".into(), checked: None };
+/// use std::sync::Arc;
+/// let _ = ActionDesc {
+///     id: "x".into(),
+///     label: "y".into(),
+///     checked: None,
+///     children: Arc::from([]),
+/// };
 /// ```
 ///
 /// **为何在本 crate**：多个服务都会发布带动作的节点（solution 行、
@@ -57,4 +63,19 @@ pub struct ActionDesc {
     pub checked: Option<bool>,
     /// 由哪一层执行 — **无缺省值**，构造点必须显式给出（design D6）。
     pub execution: ExecutedBy,
+    /// 子菜单子项（change solution-git-sync design D3）：非空 ⇒ 视图把该
+    /// 动作渲染为子菜单，每项 `node` = 点击时回传的目标节点 id；空 ⇒
+    /// 既有平铺项。子项由服务随快照声明（同 label 归服务）。
+    pub children: std::sync::Arc<[ActionChild]>,
+}
+
+/// [`ActionDesc`] 的子菜单子项 — 点击发 `(node = child.node,
+/// action_id = 父动作 id)`，目标寻址与裸路径节点同款（change
+/// solution-git-sync design D3）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionChild {
+    /// 子项显示文案 — 服务拥有（同 ActionDesc::label）。
+    pub label: String,
+    /// 点击时作为 invoke 的 node 回传（如 worktree 裸路径）。
+    pub node: String,
 }

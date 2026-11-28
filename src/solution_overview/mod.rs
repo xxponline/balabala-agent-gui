@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use crate::app::TerminalApp;
 use crate::ui::widgets::TextTooltip;
 use agent_service::contract::{SessionId, SessionStatus, SessionView};
-use solution_service::{ActionDesc, project_node_id, solution_node_id};
+use solution_service::{ActionDesc, RepoState, project_node_id, solution_node_id};
 
 /// 点击回调的统一类型 (拥有; 可存进元素树)。
 type ClickListener = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
@@ -130,6 +130,8 @@ pub struct ProjectRow {
     /// 服务为该节点声明的动作 (右键菜单源, 恒含 拉取/推送/创建 worktree,
     /// change solution-git-worktree design D5)。
     pub actions: Vec<ActionDesc>,
+    /// 仓库状态徽标 (change solution-git-sync D4): None = 未观测 (灰)。
+    pub badge: Option<RepoState>,
 }
 
 /// 一个 worktree 行的渲染数据 (拥有值, change solution-git-worktree 5.3)。
@@ -141,6 +143,8 @@ pub struct WorktreeRow {
     pub name: String,
     /// 服务为该节点声明的动作 (右键菜单源, 恒含 delete, design D5)。
     pub actions: Vec<ActionDesc>,
+    /// 仓库状态徽标 (change solution-git-sync D4): None = 未观测 (灰)。
+    pub badge: Option<RepoState>,
 }
 
 /// 一个 agent 行的渲染数据 (拥有值)。
@@ -238,6 +242,7 @@ fn project_row(
                             .unwrap_or_default()
                     }),
                 actions: w.actions.to_vec(),
+                badge: None, // 由 snapshot() 按徽标表回填
             })
             .collect::<Vec<_>>()
     };
@@ -248,6 +253,7 @@ fn project_row(
         agents,
         worktrees,
         actions: p.actions.to_vec(),
+        badge: None, // 由 snapshot() 按徽标表回填
     }
 }
 
@@ -274,7 +280,16 @@ fn snapshot(app: &TerminalApp, _cx: &App) -> SidebarSnapshot {
                         } else {
                             node.projects
                                 .iter()
-                                .map(|p| project_row(p, ws, sessions))
+                                .map(|p| {
+                                    let mut row = project_row(p, ws, sessions);
+                                    // 行徽标回填 (solution-git-sync D4): 读
+                                    // service_layer 的观测表, 快照刷新不丢
+                                    row.badge = app.service_layer.repo_badge(&row.root);
+                                    for wt in &mut row.worktrees {
+                                        wt.badge = app.service_layer.repo_badge(&wt.path);
+                                    }
+                                    row
+                                })
                                 .collect::<Vec<_>>()
                         };
                         SolutionRow {
@@ -308,6 +323,31 @@ fn node_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/".to_string())
+}
+
+/// 行内仓库状态徽标 (change solution-git-sync D4): 灰未知 / 绿干净 /
+/// 黄脏 / 红冲突。id 带状态 → 测试按 (仓, 状态) 精确断言; 键经
+/// `badge_key` 归一 (反斜杠/正斜杠同键)。
+fn badge_dot(
+    badge: Option<RepoState>,
+    path: &str,
+    cx: &mut Context<SolutionOverviewPanel>,
+) -> impl IntoElement {
+    let (color, state) = match badge {
+        None => (cx.theme().muted_foreground, "unknown"),
+        Some(RepoState::Clean) => (cx.theme().success, "clean"),
+        Some(RepoState::Dirty) => (cx.theme().warning, "dirty"),
+        Some(RepoState::Conflict) => (cx.theme().danger, "conflict"),
+    };
+    div()
+        .id(format!(
+            "repo-badge-{}-{state}",
+            solution_service::contract::badge_key(path)
+        ))
+        .test_support()
+        .size(px(7.))
+        .rounded_full()
+        .bg(color)
 }
 
 impl Render for SolutionOverviewPanel {
@@ -564,38 +604,80 @@ fn build_project_row(
                 .child(name.clone())
                 .test_text(name),
         )
+        // 仓库状态徽标 (solution-git-sync D4): 未知灰/干净绿/脏黄/冲突红
+        .child(badge_dot(p.badge, &p.root, cx))
         // 右键菜单: 从节点携带的 actions 构建 (同 solution 行形态, D3) ——
         // 恒含 拉取/推送/创建 worktree (design D5), 门控在服务端; 节点 id
         // 必须带 `project://` 前缀 (服务端 parse_project_node)。
+        // children 非空 → 子菜单 (solution-git-sync D3): 子项点击
+        // invoke(node=child.node, action_id=父 id)。
         .context_menu({
             let weak = cx.entity().downgrade();
             let actions = p.actions.clone();
             let node = project_node_id(&root);
-            move |menu, _window, _cx| {
+            move |menu, window, cx| {
                 let mut menu = menu;
                 for desc in actions.iter() {
-                    let mut item = PopupMenuItem::new(desc.label.clone());
-                    if let Some(v) = desc.checked {
-                        item = item.checked(v);
+                    if desc.children.is_empty() {
+                        // 平铺项 (既有路径): 点击 → invoke(node=本行)
+                        let mut item = PopupMenuItem::new(desc.label.clone());
+                        if let Some(v) = desc.checked {
+                            item = item.checked(v);
+                        }
+                        let act_id = desc.id.clone();
+                        let act_label = desc.label.clone();
+                        let act_checked = desc.checked;
+                        let weak = weak.clone();
+                        let node = node.clone();
+                        item = item.on_click(move |_, _window, cx| {
+                            weak.update(cx, |panel, cx| {
+                                panel.invoke_action(
+                                    node.clone(),
+                                    act_id.clone(),
+                                    act_label.clone(),
+                                    act_checked,
+                                    cx,
+                                )
+                            })
+                            .ok();
+                        });
+                        menu = menu.item(item);
+                    } else {
+                        let act_id = desc.id.clone();
+                        let act_label = desc.label.clone();
+                        let children = desc.children.clone();
+                        let weak = weak.clone();
+                        menu = menu.submenu(
+                            desc.label.clone(),
+                            window,
+                            cx,
+                            move |sub, _window, _cx| {
+                                let mut sub = sub;
+                                for child in children.iter() {
+                                    let cnode = child.node.clone();
+                                    let cid = act_id.clone();
+                                    let clabel = act_label.clone();
+                                    let weak = weak.clone();
+                                    let citem = PopupMenuItem::new(child.label.clone()).on_click(
+                                        move |_, _window, cx| {
+                                            weak.update(cx, |panel, cx| {
+                                                panel.invoke_action(
+                                                    cnode.clone(),
+                                                    cid.clone(),
+                                                    clabel.clone(),
+                                                    None,
+                                                    cx,
+                                                )
+                                            })
+                                            .ok();
+                                        },
+                                    );
+                                    sub = sub.item(citem);
+                                }
+                                sub
+                            },
+                        );
                     }
-                    let act_id = desc.id.clone();
-                    let act_label = desc.label.clone();
-                    let act_checked = desc.checked;
-                    let weak = weak.clone();
-                    let node = node.clone();
-                    item = item.on_click(move |_, _window, cx| {
-                        weak.update(cx, |panel, cx| {
-                            panel.invoke_action(
-                                node.clone(),
-                                act_id.clone(),
-                                act_label.clone(),
-                                act_checked,
-                                cx,
-                            )
-                        })
-                        .ok();
-                    });
-                    menu = menu.item(item);
                 }
                 menu
             }
@@ -645,6 +727,8 @@ fn build_worktree_row(
                 .child(name.clone())
                 .test_text(name),
         )
+        // 仓库状态徽标 (solution-git-sync D4)
+        .child(badge_dot(w.badge, &w.path, cx))
         // 右键菜单: 从节点携带的 actions 构建 (同 solution 行, D3)
         .context_menu({
             let weak = cx.entity().downgrade();

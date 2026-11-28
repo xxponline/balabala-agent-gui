@@ -8,13 +8,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::contract::{
-    ActionInvoke, ConfigureReq, CreateReq, CreateWorktreeReq, GetTreeReq, GitOpFinished,
-    LoadReq, OpError, OpResult, ProjectNode, SolutionItem, SolutionNode, TreeChanged,
-    TreeSnapshot, WatchReq, ACTION_CONFIGURE_GIT, ACTION_CONFIGURE_REGISTER, ACTION_CREATE,
-    ACTION_CREATE_WORKTREE, ACTION_DELETE_WORKTREE, ACTION_PULL, ACTION_PUSH, KIND_ACTION,
-    KIND_GET_TREE, KIND_GIT_OP_FINISHED, KIND_LOAD, KIND_OP_REPLY, KIND_TREE_CHANGED,
-    KIND_WATCH, WORKTREES_DIR, WorktreeNode, parse_project_node, parse_solution_node,
-    project_actions, solution_actions, worktree_actions,
+    ACTION_CONFIGURE_GIT, ACTION_CONFIGURE_REGISTER, ACTION_CREATE, ACTION_CREATE_WORKTREE,
+    ACTION_DELETE_WORKTREE, ACTION_PULL, ACTION_PUSH, ACTION_SYNC_PROJECT_FROM_WORKTREE,
+    ACTION_SYNC_WORKTREE_FROM_PROJECT, ActionInvoke, ConfigureReq, CreateReq, CreateWorktreeReq,
+    GetTreeReq, GitOpFinished, KIND_ACTION, KIND_GET_TREE, KIND_GIT_OP_FINISHED, KIND_LOAD,
+    KIND_OP_REPLY, KIND_TREE_CHANGED, KIND_WATCH, LoadReq, OpError, OpResult, ProjectNode,
+    RepoState, RepoStatus, SolutionItem, SolutionNode, TreeChanged, TreeSnapshot, WORKTREES_DIR,
+    WatchReq, WorktreeNode, parse_project_node, parse_solution_node, project_actions,
+    solution_actions, worktree_actions,
 };
 use crate::loader;
 use crate::valid_checker;
@@ -27,6 +28,75 @@ use service_core::{
 /// 正常链路（Launcher → load → 用户操作）走不到; 真到了就是调用顺序 bug —
 /// 以红条暴露, 不 panic、不静默丢弃。
 const NO_BOUND_WORKSPACE: &str = "no workspace bound — load the workspace first";
+
+/// 属主查找（池内, change solution-git-sync D1/D2 与 delete 同款）：
+/// 遍历 git 项目的 worktree 层, canonicalize 匹配 → 属主 project root;
+/// 找不到 → `None`（无此 worktree, 或 solution 关了 git 管理）。
+async fn find_worktree_owner(items: &[SolutionItem], path: &std::path::Path) -> Option<PathBuf> {
+    for item in items {
+        let desc = loader::expand_item(item);
+        if !desc.is_git {
+            continue;
+        }
+        let Ok(entries) = crate::git::worktree::list_async(&desc.root).await else {
+            continue;
+        };
+        let canon =
+            |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        if entries.iter().any(|e| canon(&e.path) == canon(path)) {
+            return Some(desc.root.clone());
+        }
+    }
+    None
+}
+
+/// merge 成功摘要（进 notice detail）: 取带语义的摘要行 ——
+/// `Fast-forward`（ff 时首行是 `Updating a..b`, 摘要在次行）/
+/// `Merge made by ...` / `Already up to date.`；无匹配退首个非空行。
+fn merge_summary(out: &crate::git::GitOutput) -> String {
+    let lines: Vec<&str> = out
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines
+        .iter()
+        .find(|l| {
+            l.starts_with("Fast-forward")
+                || l.starts_with("Merge made")
+                || l.starts_with("Already up to date")
+        })
+        .or_else(|| lines.first())
+        .copied()
+        .unwrap_or("已合并")
+        .to_string()
+}
+
+/// 冲突详情（进 notice detail）: 提取 `Merge conflict in <file>` 文件
+/// 列表 + 未完成合并引导; 提取不到 → 退 git 原话尾部。
+fn conflict_detail(out: &crate::git::GitOutput) -> String {
+    let combined = format!("{}{}", out.stdout, out.stderr);
+    let files: Vec<&str> = combined
+        .lines()
+        .filter_map(|l| l.split("Merge conflict in ").nth(1))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if files.is_empty() {
+        let tail = crate::git::GitError::Failed {
+            code: out.code,
+            stderr: out.stderr.clone(),
+        }
+        .to_string();
+        format!("合并冲突, 仓库处于未完成合并状态, 请解决后提交: {tail}")
+    } else {
+        format!(
+            "合并冲突 — {}, 仓库处于未完成合并状态, 请解决后提交",
+            files.join(", ")
+        )
+    }
+}
 
 /// Solution/Project 域服务（driver 单线程顺序 dispatch，同步处理 + 同步回执，
 /// 对齐 `AgentService` 形态）。
@@ -68,15 +138,17 @@ impl SolutionService {
         for item in &self.items {
             // v1 `simple`: 1 item → 1 project (spec: Solution type
             // registry resolves items to projects)
+            // worktree 层 = git 元数据现算 (task 4.3 真源, design D4):
+            // `git worktree list --porcelain` 可见应用外注册的条目
+            // (异步出口 → 阻塞池, spec: Git work does not delay
+            // other services)
+            let worktrees = Self::worktree_layer(item).await;
+            // 描述符随层内容现算 (solution-git-sync D3: children 同源)
+            let actions = project_actions(&worktrees);
             let projects = Arc::from(vec![ProjectNode {
                 desc: loader::expand_item(item),
-                // worktree 层 = git 元数据现算 (task 4.3 真源, design D4):
-                // `git worktree list --porcelain` 可见应用外注册的条目
-                // (异步出口 → 阻塞池, spec: Git work does not delay
-                // other services)
-                worktrees: Self::worktree_layer(item).await,
-                // project 节点恒声明 pull/push/create-worktree (design D5)
-                actions: project_actions(),
+                worktrees,
+                actions,
             }]);
             nodes.push(SolutionNode {
                 item: item.clone(),
@@ -212,6 +284,12 @@ impl SolutionService {
             ACTION_PULL | ACTION_PUSH => self.on_git_pull_push(env, &req).await,
             ACTION_CREATE_WORKTREE => self.on_create_worktree(env, &req).await,
             ACTION_DELETE_WORKTREE => self.on_delete_worktree(env, &req).await,
+            ACTION_SYNC_WORKTREE_FROM_PROJECT => {
+                self.on_worktree_sync_from_project(env, &req).await
+            }
+            ACTION_SYNC_PROJECT_FROM_WORKTREE => {
+                self.on_project_sync_from_worktree(env, &req).await
+            }
             other => {
                 self.reply_to(env, Err(OpError::UnknownAction(other.to_string())));
             }
@@ -270,19 +348,41 @@ impl SolutionService {
             // 门控 + 执行 = 同一后台任务背靠背 (design D4), 子进程各自
             // 经异步出口落阻塞池 —— 大仓 status 与网络 pull/push 都不占
             // 单 worker (D1/D2)
-            // 门2: tracked-clean (脏 → 拒, 仓库零改动)
-            let (ok, detail) = match crate::git::is_tracked_clean_async(&root).await {
+            // 门2: tracked-clean (脏 → 拒, 仓库零改动); 状态随事件回传
+            // (solution-git-sync D4: 门判出/执行后的仓 → 行徽标)
+            let clean = || {
+                vec![RepoStatus {
+                    path: target.clone(),
+                    state: RepoState::Clean,
+                }]
+            };
+            let (ok, detail, statuses) = match crate::git::is_tracked_clean_async(&root).await {
                 Ok(false) => (
                     false,
                     format!("{target} 有未提交的 tracked 改动, 先提交再拉取/推送"),
+                    vec![RepoStatus {
+                        path: target.clone(),
+                        state: RepoState::Dirty,
+                    }],
                 ),
-                Err(e) => (false, e.to_string()),
+                Err(e) => (false, e.to_string(), Vec::new()),
                 Ok(true) => {
                     let args: &[&str] =
                         if action_id == ACTION_PULL { &["pull"] } else { &["push"] };
                     match crate::git::run_ok_async(args, &root).await {
-                        Ok(_) => (true, String::new()),
-                        Err(e) => (false, e.to_string()), // stderr 尾部摘要 (design D6)
+                        Ok(_) => (true, String::new(), clean()),
+                        Err(e) => {
+                            // pull 合并冲突 → Conflict（区别于门判的 Clean）
+                            let st = if e.to_string().contains("CONFLICT") {
+                                vec![RepoStatus {
+                                    path: target.clone(),
+                                    state: RepoState::Conflict,
+                                }]
+                            } else {
+                                clean()
+                            };
+                            (false, e.to_string(), st) // stderr 尾部摘要 (design D6)
+                        }
                     }
                 }
             };
@@ -298,6 +398,7 @@ impl SolutionService {
                     target,
                     ok,
                     detail,
+                    statuses,
                 }),
             ));
         });
@@ -365,9 +466,17 @@ impl SolutionService {
         let fut: TaskFuture = Box::pin(async move {
             // `worktree add` 经异步出口落阻塞池 (D1), 完成回投自己
             let outcome = crate::git::worktree::add_async(&root, &parent, &name).await;
-            let (ok, detail) = match outcome {
-                Ok(_) => (true, String::new()),
-                Err(e) => (false, e.to_string()),
+            // 成功 → 新 worktree 检出即净, 回传其状态（徽标新行）; 失败 → 未定
+            let (ok, detail, statuses) = match outcome {
+                Ok(_) => (
+                    true,
+                    String::new(),
+                    vec![RepoStatus {
+                        path: target.clone(),
+                        state: RepoState::Clean,
+                    }],
+                ),
+                Err(e) => (false, e.to_string(), Vec::new()),
             };
             let _ = messaging.tell(Envelope::new(
                 Route::Instance(instance),
@@ -378,6 +487,7 @@ impl SolutionService {
                     target,
                     ok,
                     detail,
+                    statuses,
                 }),
             ));
         });
@@ -432,9 +542,12 @@ impl SolutionService {
                     stderr: format!("no such worktree: {}", path.display()),
                 }),
             };
-            let (ok, detail) = match outcome {
-                Ok(()) => (true, String::new()),
-                Err(e) => (false, e.to_string()), // git 拒绝原话 (脏/locked) 直达 notice
+            let (ok, detail, statuses) = match outcome {
+                // 仓已删 → 无处徽标; 拒 → **不回传状态** —— git 删除门
+                // 计 untracked, 与 tracked-clean 口径不一致, 重推导会错判
+                // （拒绝原话已直达 notice, 徽标非 spec 要求）
+                Ok(()) => (true, String::new(), Vec::new()),
+                Err(e) => (false, e.to_string(), Vec::new()),
             };
             let _ = messaging.tell(Envelope::new(
                 Route::Instance(instance),
@@ -445,6 +558,259 @@ impl SolutionService {
                     target: path.display().to_string(),
                     ok,
                     detail,
+                    statuses,
+                }),
+            ));
+        });
+        self.ctx.messaging.spawn_task(fut);
+    }
+
+    /// `worktree.sync_from_project`（change solution-git-sync D1）：node =
+    /// worktree 裸路径。把 project 当前 HEAD 合入该 worktree —— **真合并**
+    /// （可冲突）。门只看 worktree 侧 tracked-clean（合并动的是 worktree
+    /// 的树, project 工作树不被改写 → 不门）。形态同 offload 后的 delete：
+    /// handle 仅节点格式检查 → 秒回 accepted → 池内属主查找/门/merge →
+    /// `KIND_GIT_OP_FINISHED` 直发订阅者（层级不变, 无 TreeChanged）。
+    async fn on_worktree_sync_from_project(&mut self, env: &Envelope, invoke: &ActionInvoke) {
+        let Some(path) = invoke.node.as_deref().map(PathBuf::from) else {
+            let _ = self.ctx.messaging.reject(env);
+            return;
+        };
+        let snap = self.snapshot().await;
+        self.reply_to(env, Ok(snap));
+        let items = self.items.clone();
+        let messaging = Arc::clone(&self.ctx.messaging);
+        let instance = self.ctx.instance;
+        let watcher = self.watcher;
+        let target = path.display().to_string();
+        let fut: TaskFuture = Box::pin(async move {
+            let (ok, detail, statuses): (bool, String, Vec<RepoStatus>) = async {
+                let Some(repo_root) = find_worktree_owner(&items, &path).await else {
+                    return (false, format!("no such worktree: {target}"), Vec::new());
+                };
+                // 门: worktree tracked-clean（拒绝 → 该行徽标 Dirty）
+                match crate::git::is_tracked_clean_async(&path).await {
+                    Ok(false) => {
+                        return (
+                            false,
+                            format!("{target} 有未提交的 tracked 改动, 先提交再同步"),
+                            vec![RepoStatus {
+                                path: target.clone(),
+                                state: RepoState::Dirty,
+                            }],
+                        );
+                    }
+                    Err(e) => return (false, e.to_string(), Vec::new()),
+                    Ok(true) => {}
+                }
+                // project HEAD → merge 入 worktree（真合并, 可冲突）
+                let sha = match crate::git::head_sha(&repo_root).await {
+                    Ok(sha) => sha,
+                    Err(e) => return (false, e.to_string(), Vec::new()),
+                };
+                let out = match crate::git::merge(&path, &sha, false).await {
+                    Ok(out) => out,
+                    Err(e) => return (false, e.to_string(), Vec::new()),
+                };
+                if out.code == 0 {
+                    (
+                        true,
+                        merge_summary(&out),
+                        vec![RepoStatus {
+                            path: target.clone(),
+                            state: RepoState::Clean,
+                        }],
+                    )
+                } else if format!("{}{}", out.stdout, out.stderr).contains("CONFLICT") {
+                    (
+                        false,
+                        conflict_detail(&out),
+                        vec![RepoStatus {
+                            path: target.clone(),
+                            state: RepoState::Conflict,
+                        }],
+                    )
+                } else {
+                    (
+                        false,
+                        crate::git::GitError::Failed {
+                            code: out.code,
+                            stderr: out.stderr,
+                        }
+                        .to_string(),
+                        Vec::new(),
+                    )
+                }
+            }
+            .await;
+            let Some(watcher) = watcher else {
+                return; // 无订阅者: 操作已完, 事件无人收
+            };
+            let _ = messaging.tell(Envelope::new(
+                Route::Instance(watcher),
+                Address::instance(instance),
+                KIND_GIT_OP_FINISHED,
+                Payload::new(GitOpFinished {
+                    action_id: ACTION_SYNC_WORKTREE_FROM_PROJECT.to_string(),
+                    target,
+                    ok,
+                    detail,
+                    statuses,
+                }),
+            ));
+        });
+        self.ctx.messaging.spawn_task(fut);
+    }
+
+    /// `project.sync_from_worktree`（change solution-git-sync D2）：node =
+    /// worktree 裸路径（子菜单 child 回传）。把 worktree HEAD **快进**回
+    /// project —— 四门定序（design D1）：project 脏 → wt 脏 → 不含 →
+    /// 领先=0，全过才 `merge --ff-only`（contains+ahead 已保证快进,
+    /// `--ff-only` 防 HEAD 竞动时静默造 merge commit）。两仓状态随完成
+    /// 事件回传（design D4）；层级不变 → 直发订阅者, 无 TreeChanged。
+    async fn on_project_sync_from_worktree(&mut self, env: &Envelope, invoke: &ActionInvoke) {
+        let Some(path) = invoke.node.as_deref().map(PathBuf::from) else {
+            let _ = self.ctx.messaging.reject(env);
+            return;
+        };
+        let snap = self.snapshot().await;
+        self.reply_to(env, Ok(snap));
+        let items = self.items.clone();
+        let messaging = Arc::clone(&self.ctx.messaging);
+        let instance = self.ctx.instance;
+        let watcher = self.watcher;
+        let action_id = ACTION_SYNC_PROJECT_FROM_WORKTREE.to_string();
+        let fut: TaskFuture = Box::pin(async move {
+            let owner = find_worktree_owner(&items, &path).await;
+            // notice 展示目标: 属主 project root; 无属主 → 退 worktree 路径
+            let target = owner
+                .as_ref()
+                .map(|r| r.display().to_string())
+                .unwrap_or_else(|| path.display().to_string());
+            let (ok, detail, statuses): (bool, String, Vec<RepoStatus>) = async {
+                let Some(repo_root) = owner else {
+                    return (
+                        false,
+                        format!("no such worktree: {}", path.display()),
+                        Vec::new(),
+                    );
+                };
+                // 门1: project tracked-clean（拒绝 → project 行徽标 Dirty）
+                match crate::git::is_tracked_clean_async(&repo_root).await {
+                    Ok(false) => {
+                        let msg = format!(
+                            "{} 有未提交的 tracked 改动, 先提交再同步",
+                            repo_root.display()
+                        );
+                        return (
+                            false,
+                            msg,
+                            vec![RepoStatus {
+                                path: repo_root.display().to_string(),
+                                state: RepoState::Dirty,
+                            }],
+                        );
+                    }
+                    Err(e) => return (false, e.to_string(), Vec::new()),
+                    Ok(true) => {}
+                }
+                // 门2: worktree tracked-clean（拒绝 → wt 行徽标 Dirty）
+                match crate::git::is_tracked_clean_async(&path).await {
+                    Ok(false) => {
+                        let msg =
+                            format!("{} 有未提交的 tracked 改动, 先提交再同步", path.display());
+                        return (
+                            false,
+                            msg,
+                            vec![
+                                RepoStatus {
+                                    path: repo_root.display().to_string(),
+                                    state: RepoState::Clean,
+                                },
+                                RepoStatus {
+                                    path: path.display().to_string(),
+                                    state: RepoState::Dirty,
+                                },
+                            ],
+                        );
+                    }
+                    Err(e) => return (false, e.to_string(), Vec::new()),
+                    Ok(true) => {}
+                }
+                // 双门已过: 后续逻辑类拒绝也回传这对 Clean 状态
+                let clean_both = vec![
+                    RepoStatus {
+                        path: repo_root.display().to_string(),
+                        state: RepoState::Clean,
+                    },
+                    RepoStatus {
+                        path: path.display().to_string(),
+                        state: RepoState::Clean,
+                    },
+                ];
+                // 两侧 HEAD
+                let p_head = match crate::git::head_sha(&repo_root).await {
+                    Ok(s) => s,
+                    Err(e) => return (false, e.to_string(), clean_both),
+                };
+                let w_head = match crate::git::head_sha(&path).await {
+                    Ok(s) => s,
+                    Err(e) => return (false, e.to_string(), clean_both),
+                };
+                // 门3: wt 包含 project HEAD（不分叉/未落后 → 指回 D1）
+                match crate::git::is_ancestor(&p_head, &w_head, &repo_root).await {
+                    Ok(false) => {
+                        return (
+                            false,
+                            "worktree 未包含 Project 最新提交, 先在 worktree 同步 Project 代码"
+                                .to_string(),
+                            clean_both,
+                        );
+                    }
+                    Err(e) => return (false, e.to_string(), clean_both),
+                    Ok(true) => {}
+                }
+                // 门4: 领先 >=1（相等 = 无操作）
+                match crate::git::ahead_count(&p_head, &w_head, &repo_root).await {
+                    Ok(0) => {
+                        return (
+                            false,
+                            "worktree 与 Project 同步点一致, 无可同步的新提交".to_string(),
+                            clean_both,
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => return (false, e.to_string(), clean_both),
+                }
+                // 执行: ff-only 快进
+                match crate::git::merge(&repo_root, &w_head, true).await {
+                    Err(e) => (false, e.to_string(), clean_both),
+                    Ok(out) if out.code == 0 => (true, merge_summary(&out), clean_both),
+                    Ok(out) => (
+                        false,
+                        crate::git::GitError::Failed {
+                            code: out.code,
+                            stderr: out.stderr,
+                        }
+                        .to_string(),
+                        clean_both,
+                    ),
+                }
+            }
+            .await;
+            let Some(watcher) = watcher else {
+                return; // 无订阅者: 操作已完, 事件无人收
+            };
+            let _ = messaging.tell(Envelope::new(
+                Route::Instance(watcher),
+                Address::instance(instance),
+                KIND_GIT_OP_FINISHED,
+                Payload::new(GitOpFinished {
+                    action_id,
+                    target,
+                    ok,
+                    detail,
+                    statuses,
                 }),
             ));
         });
@@ -1196,6 +1562,13 @@ mod tests {
             "拒绝文案点名 tracked 改动: {}",
             refusal.detail
         );
+        assert_eq!(refusal.statuses.len(), 1, "门判出的仓 → 单条状态");
+        assert_eq!(refusal.statuses[0].path, dirty.display().to_string());
+        assert_eq!(
+            refusal.statuses[0].state,
+            RepoState::Dirty,
+            "门禁判出的仓 → Dirty 徽标"
+        );
         let status_after = git_ok(&["status", "--porcelain"], &dirty).unwrap();
         assert_eq!(status_before, status_after, "拒时仓库必须零改动");
 
@@ -1289,6 +1662,12 @@ mod tests {
             "失败必须携带 git stderr 摘要: {:?}",
             done.detail
         );
+        assert_eq!(done.statuses.len(), 1, "门已判 Clean → 回传");
+        assert_eq!(
+            done.statuses[0].state,
+            RepoState::Clean,
+            "非冲突失败 → 保持门判的 Clean"
+        );
 
         // ③ 成功事件: pull 在干净无远端仓…同样失败; 用已配 remote 的仓验成功
         //    —— 本地 file:// remote 无网络 (3.3 集成题覆盖拉平, 这里验形状)
@@ -1328,6 +1707,8 @@ mod tests {
         let done2 = fin2.downcast::<GitOpFinished>().unwrap();
         assert!(done2.ok, "已同步仓 pull 成功: {}", done2.detail);
         assert_eq!(done2.detail, "", "成功态 detail 为空");
+        assert_eq!(done2.statuses.len(), 1, "执行后的仓 → 回传");
+        assert_eq!(done2.statuses[0].state, RepoState::Clean, "成功 → Clean");
     }
 
     /// change solution-git-worktree 3.3 验证：file:// 本地 remote 集成
@@ -1468,6 +1849,18 @@ mod tests {
         )
     }
 
+    /// 裸路径节点 + 任意动作 id（sync 双向共用）。
+    fn wt_node_env(path: &std::path::Path, action_id: &str) -> service_core::Envelope {
+        ask_env(
+            KIND_ACTION,
+            ActionInvoke {
+                node: Some(path.display().to_string()),
+                action_id: action_id.to_string(),
+                args: None,
+            },
+        )
+    }
+
     /// 从快照里取某 project 的 worktree 层。
     fn wt_layer(snap: &TreeSnapshot, root: &std::path::Path) -> Vec<WorktreeNode> {
         snap.hierarchy
@@ -1476,6 +1869,289 @@ mod tests {
             .find(|p| p.desc.root == root)
             .map(|p| p.worktrees.to_vec())
             .unwrap_or_else(|| panic!("快照里应有 project {}", root.display()))
+    }
+
+    /// change solution-git-sync (task 3.2): `worktree.sync_from_project`
+    /// 四例 —— 干净合并成功（statuses=Clean、detail 含 merge 摘要）/
+    /// 脏拒绝（statuses=Dirty、仓库零改动）/ 冲突（detail 列文件 +
+    /// Conflict）/ 幽灵·非 git 路径拒绝（statuses 空）。
+    #[test]
+    fn worktree_sync_from_project_four_cases() {
+        use crate::contract::{KIND_WATCH, WatchReq};
+
+        let ws = temp_ws("wt-sync-from");
+        let repo = make_git_project(&ws, "repo");
+        std::fs::write(
+            loader::solutions_path(&ws),
+            serde_json::json!([{"type": "simple", "path": repo}]).to_string(),
+        )
+        .unwrap();
+        let (ctx, msg) = test_ctx(12);
+        let mut svc = SolutionService::new(ctx);
+        drive(&mut svc, ask_env(KIND_WATCH, WatchReq));
+        drive(
+            &mut svc,
+            ask_env(
+                KIND_LOAD,
+                LoadReq {
+                    workspace_dir: ws.clone(),
+                },
+            ),
+        );
+        assert!(last_reply(&msg).is_ok(), "load 应成功");
+
+        // worktree 登记（走 create 动作 → TreeChanged 取层）
+        drive(&mut svc, create_wt_env(&repo, "feat"));
+        drive_bg(&mut svc, &msg, 12);
+        let snap = last_tree_changed(&msg);
+        let wt_path = wt_layer(&snap, &repo)[0].path.clone();
+        let sync = || wt_node_env(&wt_path, ACTION_SYNC_WORKTREE_FROM_PROJECT);
+
+        // 两侧分叉: wt 加 g.txt, project 加 h.txt（不同文件 → 合并无冲突）
+        std::fs::write(wt_path.join("g.txt"), "g").unwrap();
+        git_ok(&["add", "g.txt"], &wt_path).unwrap();
+        git_ok(&["commit", "-q", "-m", "wt-g"], &wt_path).unwrap();
+        std::fs::write(repo.join("h.txt"), "h").unwrap();
+        git_ok(&["add", "h.txt"], &repo).unwrap();
+        git_ok(&["commit", "-q", "-m", "proj-h"], &repo).unwrap();
+
+        // 场景A: 干净合并成功
+        drive(&mut svc, sync());
+        assert!(last_reply(&msg).is_ok(), "accepted 先回");
+        drive_bg(&mut svc, &msg, 12);
+        let done = find_fin(
+            &msg,
+            ACTION_SYNC_WORKTREE_FROM_PROJECT,
+            &wt_path.display().to_string(),
+        );
+        assert!(done.ok, "干净合并应成功: {}", done.detail);
+        assert!(
+            done.detail.contains("Merge made") || done.detail.contains("Fast-forward"),
+            "成功 detail 应带 merge 摘要: {}",
+            done.detail
+        );
+        assert_eq!(done.statuses.len(), 1, "D1 只检视 worktree");
+        assert_eq!(done.statuses[0].path, wt_path.display().to_string());
+        assert_eq!(
+            done.statuses[0].state,
+            RepoState::Clean,
+            "成功 → 徽标 Clean"
+        );
+
+        // 场景B: tracked 脏 → 拒, statuses=Dirty, 仓库零改动
+        std::fs::write(wt_path.join("f.txt"), "dirty-uncommitted").unwrap();
+        let before = git_ok(&["status", "--porcelain"], &wt_path).unwrap();
+        drive(&mut svc, sync());
+        assert!(last_reply(&msg).is_ok(), "门控后台化 → accepted 先回");
+        drive_bg(&mut svc, &msg, 12);
+        let refusal = find_fin(
+            &msg,
+            ACTION_SYNC_WORKTREE_FROM_PROJECT,
+            &wt_path.display().to_string(),
+        );
+        assert!(!refusal.ok, "脏树应被拒");
+        assert!(refusal.detail.contains("未提交"), "{}", refusal.detail);
+        assert_eq!(refusal.statuses.len(), 1);
+        assert_eq!(
+            refusal.statuses[0].state,
+            RepoState::Dirty,
+            "拒 → 徽标 Dirty"
+        );
+        let after = git_ok(&["status", "--porcelain"], &wt_path).unwrap();
+        assert_eq!(before, after, "拒时仓库必须零改动");
+        git_ok(&["checkout", "--", "f.txt"], &wt_path).unwrap(); // 复位
+
+        // 场景C: 双侧改 f.txt → 冲突, detail 列文件 + Conflict
+        std::fs::write(wt_path.join("f.txt"), "wt-side").unwrap();
+        git_ok(&["add", "f.txt"], &wt_path).unwrap();
+        git_ok(&["commit", "-q", "-m", "wt-f"], &wt_path).unwrap();
+        std::fs::write(repo.join("f.txt"), "proj-side").unwrap();
+        git_ok(&["add", "f.txt"], &repo).unwrap();
+        git_ok(&["commit", "-q", "-m", "proj-f"], &repo).unwrap();
+        drive(&mut svc, sync());
+        drive_bg(&mut svc, &msg, 12);
+        let conflict = find_fin(
+            &msg,
+            ACTION_SYNC_WORKTREE_FROM_PROJECT,
+            &wt_path.display().to_string(),
+        );
+        assert!(!conflict.ok, "冲突必须报失败");
+        assert!(conflict.detail.contains("合并冲突"), "{}", conflict.detail);
+        assert!(
+            conflict.detail.contains("f.txt"),
+            "冲突详情应列文件: {}",
+            conflict.detail
+        );
+        assert_eq!(conflict.statuses.len(), 1);
+        assert_eq!(
+            conflict.statuses[0].state,
+            RepoState::Conflict,
+            "冲突 → 徽标 Conflict（非 Dirty）"
+        );
+        let mid = git_ok(&["status", "--porcelain"], &wt_path).unwrap();
+        assert!(!mid.trim().is_empty(), "冲突后仓处未完成合并态");
+        git_ok(&["merge", "--abort"], &wt_path).unwrap();
+
+        // 场景D: 幽灵路径（含非 git/关了 git 管理 → 属主找不到）→ 拒
+        let ghost = ws.join("ghost-wt");
+        drive(
+            &mut svc,
+            wt_node_env(&ghost, ACTION_SYNC_WORKTREE_FROM_PROJECT),
+        );
+        assert!(last_reply(&msg).is_ok(), "幽灵也先 accepted");
+        drive_bg(&mut svc, &msg, 12);
+        let gone = find_fin(
+            &msg,
+            ACTION_SYNC_WORKTREE_FROM_PROJECT,
+            &ghost.display().to_string(),
+        );
+        assert!(!gone.ok, "幽灵路径应拒");
+        assert!(gone.detail.contains("no such worktree"), "{}", gone.detail);
+        assert!(gone.statuses.is_empty(), "未检视任何仓 → 状态空");
+    }
+
+    /// change solution-git-sync (task 3.3): `project.sync_from_worktree`
+    /// 五例 —— equal 无操作 / project 脏拒（单仓 Dirty）/ wt 脏拒
+    /// （project Clean + wt Dirty）/ 落后指回 D1 / ahead 快进成功
+    /// （ff + 两仓 Clean + project HEAD 跟上 wt HEAD）。
+    #[test]
+    fn project_sync_from_worktree_five_cases() {
+        use crate::contract::{KIND_WATCH, WatchReq};
+
+        let ws = temp_ws("proj-sync-from");
+        let repo = make_git_project(&ws, "repo");
+        std::fs::write(
+            loader::solutions_path(&ws),
+            serde_json::json!([{"type": "simple", "path": repo}]).to_string(),
+        )
+        .unwrap();
+        let (ctx, msg) = test_ctx(13);
+        let mut svc = SolutionService::new(ctx);
+        drive(&mut svc, ask_env(KIND_WATCH, WatchReq));
+        drive(
+            &mut svc,
+            ask_env(
+                KIND_LOAD,
+                LoadReq {
+                    workspace_dir: ws.clone(),
+                },
+            ),
+        );
+        assert!(last_reply(&msg).is_ok(), "load 应成功");
+        drive(&mut svc, create_wt_env(&repo, "feat"));
+        drive_bg(&mut svc, &msg, 13);
+        let snap = last_tree_changed(&msg);
+        let wt_path = wt_layer(&snap, &repo)[0].path.clone();
+        let sync = || wt_node_env(&wt_path, ACTION_SYNC_PROJECT_FROM_WORKTREE);
+        let find = || {
+            find_fin(
+                &msg,
+                ACTION_SYNC_PROJECT_FROM_WORKTREE,
+                &repo.display().to_string(),
+            )
+        };
+        let clean_both = |fin: &crate::contract::GitOpFinished, who: &str| {
+            assert_eq!(fin.statuses.len(), 2, "{who}: 两仓状态都应回传");
+            for want in [repo.display().to_string(), wt_path.display().to_string()] {
+                let st = fin
+                    .statuses
+                    .iter()
+                    .find(|s| s.path == want)
+                    .unwrap_or_else(|| panic!("{who}: 缺 {want} 的状态"));
+                assert_eq!(st.state, RepoState::Clean, "{who}: {want} 应 Clean");
+            }
+        };
+
+        // 场景1: equal（两侧同 HEAD）→ 无操作拒, 两仓 Clean
+        drive(&mut svc, sync());
+        assert!(last_reply(&msg).is_ok(), "accepted 先回");
+        drive_bg(&mut svc, &msg, 13);
+        let fin = find();
+        assert!(!fin.ok, "equal 应拒");
+        assert!(fin.detail.contains("无可同步"), "{}", fin.detail);
+        clean_both(&fin, "equal");
+
+        // 场景2: project 脏 → 单仓 Dirty, 零改动
+        std::fs::write(repo.join("f.txt"), "dirty-proj").unwrap();
+        let before = git_ok(&["status", "--porcelain"], &repo).unwrap();
+        drive(&mut svc, sync());
+        drive_bg(&mut svc, &msg, 13);
+        let fin = find();
+        assert!(!fin.ok, "project 脏应拒");
+        assert!(fin.detail.contains("未提交"), "{}", fin.detail);
+        assert_eq!(fin.statuses.len(), 1, "门1只检视了 project");
+        assert_eq!(fin.statuses[0].path, repo.display().to_string());
+        assert_eq!(fin.statuses[0].state, RepoState::Dirty);
+        assert_eq!(
+            before,
+            git_ok(&["status", "--porcelain"], &repo).unwrap(),
+            "拒时仓库零改动"
+        );
+        git_ok(&["checkout", "--", "f.txt"], &repo).unwrap();
+
+        // 场景3: wt 脏 → project Clean + wt Dirty
+        std::fs::write(wt_path.join("f.txt"), "dirty-wt").unwrap();
+        drive(&mut svc, sync());
+        drive_bg(&mut svc, &msg, 13);
+        let fin = find();
+        assert!(!fin.ok, "wt 脏应拒");
+        assert!(fin.detail.contains("未提交"), "{}", fin.detail);
+        assert_eq!(fin.statuses.len(), 2, "门1过 (project Clean), 门2拒");
+        let wt_st = fin
+            .statuses
+            .iter()
+            .find(|s| s.path == wt_path.display().to_string())
+            .expect("wt 状态在场");
+        assert_eq!(wt_st.state, RepoState::Dirty, "wt → Dirty");
+        let repo_st = fin
+            .statuses
+            .iter()
+            .find(|s| s.path == repo.display().to_string())
+            .expect("project 状态在场");
+        assert_eq!(repo_st.state, RepoState::Clean, "project 门已过 → Clean");
+        git_ok(&["checkout", "--", "f.txt"], &wt_path).unwrap();
+
+        // 场景4: 落后（project 前进）→ 不含 → 指回 worktree 侧同步
+        std::fs::write(repo.join("f.txt"), "proj-adv").unwrap();
+        git_ok(&["add", "f.txt"], &repo).unwrap();
+        git_ok(&["commit", "-q", "-m", "proj-adv"], &repo).unwrap();
+        drive(&mut svc, sync());
+        drive_bg(&mut svc, &msg, 13);
+        let fin = find();
+        assert!(!fin.ok, "落后应拒");
+        assert!(
+            fin.detail.contains("先在 worktree 同步 Project 代码"),
+            "拒绝文案指回 D1: {}",
+            fin.detail
+        );
+        clean_both(&fin, "behind");
+
+        // 用 D1 把 wt 补齐（ff 到 project HEAD）, 再给 wt 一个新提交 → ahead
+        drive(
+            &mut svc,
+            wt_node_env(&wt_path, ACTION_SYNC_WORKTREE_FROM_PROJECT),
+        );
+        drive_bg(&mut svc, &msg, 13);
+        let d1 = find_fin(
+            &msg,
+            ACTION_SYNC_WORKTREE_FROM_PROJECT,
+            &wt_path.display().to_string(),
+        );
+        assert!(d1.ok, "D1 应把落后补齐: {}", d1.detail);
+        std::fs::write(wt_path.join("extra.txt"), "x").unwrap();
+        git_ok(&["add", "extra.txt"], &wt_path).unwrap();
+        git_ok(&["commit", "-q", "-m", "wt-extra"], &wt_path).unwrap();
+        let w_head = crate::testkit::block_on(crate::git::head_sha(&wt_path)).unwrap();
+
+        // 场景5: ahead → ff 成功, project HEAD 跟上 wt HEAD
+        drive(&mut svc, sync());
+        drive_bg(&mut svc, &msg, 13);
+        let fin = find();
+        assert!(fin.ok, "ahead 应成功: {}", fin.detail);
+        assert!(fin.detail.contains("Fast-forward"), "{}", fin.detail);
+        clean_both(&fin, "ahead");
+        let r_head = crate::testkit::block_on(crate::git::head_sha(&repo)).unwrap();
+        assert_eq!(r_head, w_head, "project 应快进到 wt 的 HEAD");
     }
 
     /// 跑后台任务, 并把**回投自己**的完成事件驱动回 handle
@@ -1629,6 +2305,19 @@ mod tests {
         let snap = last_tree_changed(&msg);
         let wt_path = wt_layer(&snap, &repo)[0].path.clone();
         assert!(wt_path.is_dir());
+        // create 成功 → 新 worktree 状态回传（新建即净 → Clean 徽标）。
+        // 按 action_id 取: create 的 target 是 parent.join 拼的 (Windows
+        // 反斜杠), 快照行路径来自 git porcelain (正斜杠), 字符串不相等
+        let made = msg
+            .sent()
+            .into_iter()
+            .filter(|e| e.kind == crate::contract::KIND_GIT_OP_FINISHED)
+            .filter_map(|e| e.downcast::<crate::contract::GitOpFinished>().ok().cloned())
+            .find(|d| d.action_id == crate::contract::ACTION_CREATE_WORKTREE)
+            .expect("应有 create 完成事件");
+        assert!(made.ok, "create 应成功: {}", made.detail);
+        assert_eq!(made.statuses.len(), 1, "新 worktree → 单条状态");
+        assert_eq!(made.statuses[0].state, RepoState::Clean, "新建即净");
 
         // 脏树 → git 拒: 秒回 accepted, 后台 git 原话走完成事件 notice,
         // 目录原封, 不发 TreeChanged
@@ -1652,6 +2341,10 @@ mod tests {
             "git 判例原话应直达: {}",
             refusal.detail
         );
+        assert!(
+            refusal.statuses.is_empty(),
+            "git 删除门不重推导（untracked 口径不一致）→ 不回传状态"
+        );
         assert!(wt_path.is_dir(), "被拒后目录必须原封");
         let tells_mid = msg
             .sent()
@@ -1671,6 +2364,7 @@ mod tests {
             &wt_path.display().to_string(),
         );
         assert!(done.ok, "干净树应删净: {}", done.detail);
+        assert!(done.statuses.is_empty(), "仓已删 → 无状态回传");
         let snap = last_tree_changed(&msg);
         assert!(wt_layer(&snap, &repo).is_empty(), "快照不再列出");
         assert!(!wt_path.exists(), "目录删净");
@@ -1697,6 +2391,7 @@ mod tests {
             "结构化原因: {}",
             gone.detail
         );
+        assert!(gone.statuses.is_empty(), "未检视任何仓 → 状态空");
     }
 
     /// change solution-git-offload 4.1 验证：git 子进程**不在**驱动
@@ -1706,6 +2401,8 @@ mod tests {
     #[test]
     fn offload_git_subprocess_runs_off_the_driver_thread() {
         use std::time::Duration;
+        // 门闩全局单例 —— 与 solution-git-sync 5.2 的出口离载测试串行
+        let _probe_guard = crate::git::probe::exclusive();
 
         let ws = temp_ws("offload");
         let repo = make_git_project(&ws, "repo");

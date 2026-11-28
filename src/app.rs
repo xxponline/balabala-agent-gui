@@ -1466,6 +1466,7 @@ mod tests {
                 label: "git 管理".into(),
                 checked: Some(true),
                 execution: solution_service::ExecutedBy::Service,
+                children: std::sync::Arc::from([]),
             }]);
         });
         assert_eq!(generation(cx), base_generation, "仅描述符变化不得触发资产注册");
@@ -3819,6 +3820,324 @@ mod tests {
         let _ = fs::remove_dir_all(&ws);
     }
 
+    /// solution-git-sync 4.1: project 行子菜单 —— children 非空渲染
+    /// submenu, 子项点击 invoke(node=child.node, 父 action id)。用
+    /// equal-heads 拒绝（无副作用）反证: notice 含 "无可同步" ⇒ node =
+    /// worktree 裸路径（错路径会是 no such worktree）, 动作文案 ⇒
+    /// action_id = project.sync_from_worktree。
+    #[gpui_kit::test]
+    fn project_row_sync_submenu_invokes_child(cx: &mut TestAppContext) {
+        use gpui_kit::Role;
+        use gpui_kit::test::{TestQueryExt, TestWindowExt};
+
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app(cx, history, None);
+
+        let ws = temp_dir("wt-submenu");
+        project_model::create_workspace_files(&ws).unwrap();
+        let proj = ws.join("sub proj");
+        fs::create_dir_all(&proj).unwrap();
+        let git = |args: &[&str]| {
+            block_on_git(solution_service::git::run_ok_async(args, &proj))
+                .unwrap_or_else(|e| panic!("git {args:?}: {e}"))
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        fs::write(proj.join("f.txt"), "v1").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+        // 应用外注册 worktree（同 commit → equal heads, 子项点击必被门4
+        // 拒为 no-op, 全程零副作用）
+        let wt_parent = ws.join(".balabala.worktrees");
+        fs::create_dir_all(&wt_parent).unwrap();
+        block_on_git(solution_service::git::worktree::add_async(
+            &proj, &wt_parent, "feat",
+        ))
+        .expect("worktree 注册");
+
+        let items = serde_json::json!([{"type": "simple", "path": proj.display().to_string()}]);
+        fs::write(project_model::files::solutions_path(&ws), items.to_string()).unwrap();
+
+        app_entity.update(cx, |app, cx| app.begin_open(ws.clone(), cx));
+        wait_sol_settled(cx, &app_entity, |a| a.workspace.is_some(), "工作区打开");
+        cx.run_until_parked();
+
+        // 服务声明到达视图: sync 父描述符带 1 个 child（label = 行显示名）
+        let (sync_label, child_label, child_node) = cx.update(|cx| {
+            let snap = app_entity
+                .read(cx)
+                .service_layer
+                .tree_view()
+                .expect("镜像在场");
+            let desc = snap.hierarchy[0].projects[0]
+                .actions
+                .iter()
+                .find(|a| a.id == solution_service::ACTION_SYNC_PROJECT_FROM_WORKTREE)
+                .expect("sync 父描述符已声明");
+            assert_eq!(desc.children.len(), 1, "每 worktree 一条 child");
+            (
+                desc.label.clone(),
+                desc.children[0].label.clone(),
+                desc.children[0].node.clone(),
+            )
+        });
+        assert_eq!(child_label, "feat", "child label = 行显示名（分支）");
+        assert!(
+            child_node.ends_with("feat"),
+            "child node = worktree 裸路径: {child_node}"
+        );
+
+        // 右键 → 父项在场 → 点击展开 → 子项在场 → 点击子项
+        let proj_row = format!("project-name-{}", proj.display());
+        cx.update_window(handle, |_, window, cx| window.right_click(proj_row, cx))
+            .expect("right click project row");
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+        let parent_id = cx
+            .update_window(handle, |_, window, _| {
+                let items = window.find_all_by_role(Role::MenuItem);
+                let idx = items
+                    .iter()
+                    .position(|i| i.label() == Some(sync_label.as_str()))
+                    .expect("从 worktree 同步父项在场");
+                items[idx].path().last().expect("父项路径").clone()
+            })
+            .expect("parent item id");
+        cx.update_window(handle, |_, window, cx| {
+            window.within("popup-menu").click(parent_id, cx);
+        })
+        .expect("click submenu parent");
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("render");
+
+        let child_id = cx
+            .update_window(handle, |_, window, _| {
+                let items = window.find_all_by_role(Role::MenuItem);
+                let idx = items
+                    .iter()
+                    .position(|i| i.label() == Some(child_label.as_str()))
+                    .expect("子项应在展开的子菜单里");
+                items[idx].path().last().expect("子项路径").clone()
+            })
+            .expect("child item id");
+        cx.update_window(handle, |_, window, cx| {
+            window.within("submenu").click(child_id, cx);
+        })
+        .expect("click submenu child");
+        cx.run_until_parked();
+
+        // 子项点击 → invoke(node=wt 裸路径) → equal-heads 拒（零副作用）
+        wait_sol_settled(
+            cx,
+            &app_entity,
+            |a| {
+                a.notice.as_deref().is_some_and(|s| {
+                    s.contains("无可同步")
+                        && (s.contains("project.sync_from_worktree") || s.contains(&sync_label))
+                })
+            },
+            "子项 invoke 的 equal 拒绝 notice",
+        );
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    /// solution-git-sync 4.2: 行徽标 —— git 结果喂入后涉及行变色、未涉及
+    /// 行保持未知、TreeChanged 刷新不丢; create 成功 → 新行即绿。
+    #[gpui_kit::test]
+    fn repo_badge_follows_git_outcomes(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+
+        fn git_proj(ws: &std::path::Path, name: &str) -> std::path::PathBuf {
+            let root = ws.join(name);
+            fs::create_dir_all(&root).unwrap();
+            let g = |args: &[&str]| {
+                block_on_git(solution_service::git::run_ok_async(args, &root))
+                    .unwrap_or_else(|e| panic!("git {args:?}: {e}"))
+            };
+            g(&["init", "-q"]);
+            g(&["config", "user.email", "t@t"]);
+            g(&["config", "user.name", "t"]);
+            fs::write(root.join("f.txt"), "v1").unwrap();
+            g(&["add", "f.txt"]);
+            g(&["commit", "-q", "-m", "init"]);
+            root
+        }
+
+        let history = fresh_history_path();
+        let (handle, app_entity) = open_app(cx, history, None);
+
+        let ws = temp_dir("repo-badge");
+        project_model::create_workspace_files(&ws).unwrap();
+        let a = git_proj(&ws, "proj-a");
+        let b = git_proj(&ws, "proj-b");
+        let wt_parent = ws.join(".balabala.worktrees");
+        fs::create_dir_all(&wt_parent).unwrap();
+        block_on_git(solution_service::git::worktree::add_async(
+            &a, &wt_parent, "feat",
+        ))
+        .expect("wt 注册");
+        let wt = wt_parent.join("feat");
+        let items = serde_json::json!([
+            {"type": "simple", "path": a.display().to_string()},
+            {"type": "simple", "path": b.display().to_string()}
+        ]);
+        fs::write(project_model::files::solutions_path(&ws), items.to_string()).unwrap();
+
+        app_entity.update(cx, |app, cx| app.begin_open(ws.clone(), cx));
+        wait_sol_settled(cx, &app_entity, |a| a.workspace.is_some(), "工作区打开");
+        cx.run_until_parked();
+
+        let key =
+            |p: &std::path::Path| solution_service::contract::badge_key(&p.display().to_string());
+        let (a_key, b_key, wt_key) = (key(&a), key(&b), key(&wt));
+
+        // 初始: 三行皆 unknown, 无 clean
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .try_find(format!("repo-badge-{a_key}-unknown"))
+                    .is_some(),
+                "A 初始 unknown"
+            );
+            assert!(
+                window
+                    .try_find(format!("repo-badge-{b_key}-unknown"))
+                    .is_some(),
+                "B 初始 unknown"
+            );
+            assert!(
+                window
+                    .try_find(format!("repo-badge-{wt_key}-unknown"))
+                    .is_some(),
+                "wt 初始 unknown"
+            );
+        })
+        .expect("初始徽标");
+
+        // 喂事件: D2 sync equal 拒 → statuses [A Clean, wt Clean]（B 未涉及）
+        let wt_node = wt.display().to_string();
+        app_entity.update(cx, |app, cx| {
+            app.invoke_solution_action(
+                &wt_node,
+                solution_service::ACTION_SYNC_PROJECT_FROM_WORKTREE,
+                "从 worktree 同步",
+                None,
+                cx,
+            );
+        });
+        wait_sol_settled(
+            cx,
+            &app_entity,
+            |a| a.notice.as_deref().is_some_and(|s| s.contains("无可同步")),
+            "equal 拒 notice",
+        );
+        cx.run_until_parked();
+
+        // 涉及行 → clean; B 保持 unknown
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .try_find(format!("repo-badge-{a_key}-clean"))
+                    .is_some(),
+                "A → clean"
+            );
+            assert!(
+                window
+                    .try_find(format!("repo-badge-{a_key}-unknown"))
+                    .is_none(),
+                "A 不再 unknown"
+            );
+            assert!(
+                window
+                    .try_find(format!("repo-badge-{wt_key}-clean"))
+                    .is_some(),
+                "wt → clean"
+            );
+            assert!(
+                window
+                    .try_find(format!("repo-badge-{b_key}-unknown"))
+                    .is_some(),
+                "B 未涉及 → 保持 unknown"
+            );
+            assert!(
+                window
+                    .try_find(format!("repo-badge-{b_key}-clean"))
+                    .is_none(),
+                "B 不得凭空变色"
+            );
+        })
+        .expect("喂入后徽标");
+
+        // 刷新不丢 + create 成功 → 新行即绿: 在 B 上 create worktree
+        app_entity.update(cx, |app, cx| {
+            app.invoke_solution_action(
+                &solution_service::project_node_id(&b),
+                solution_service::ACTION_CREATE_WORKTREE,
+                "创建 worktree",
+                None,
+                cx,
+            );
+        });
+        wait_sol_settled(
+            cx,
+            &app_entity,
+            |a| {
+                a.service_layer.tree_view().is_some_and(|t| {
+                    t.hierarchy
+                        .iter()
+                        .flat_map(|s| s.projects.iter())
+                        .any(|p| p.desc.root == b && !p.worktrees.is_empty())
+                })
+            },
+            "B 的 worktree 入快照",
+        );
+        cx.run_until_parked();
+        let new_wt = cx.update(|cx| {
+            let t = app_entity
+                .read(cx)
+                .service_layer
+                .tree_view()
+                .expect("镜像在场");
+            t.hierarchy
+                .iter()
+                .flat_map(|s| s.projects.iter())
+                .find(|p| p.desc.root == b)
+                .expect("B 在场")
+                .worktrees[0]
+                .path
+                .clone()
+        });
+        let nw_key = key(&new_wt);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .try_find(format!("repo-badge-{a_key}-clean"))
+                    .is_some(),
+                "刷新后 A 徽标不丢"
+            );
+            assert!(
+                window
+                    .try_find(format!("repo-badge-{b_key}-unknown"))
+                    .is_some(),
+                "B 仍 unknown (create 只检视了新 wt)"
+            );
+            assert!(
+                window
+                    .try_find(format!("repo-badge-{nw_key}-clean"))
+                    .is_some(),
+                "新行即绿 (create 成功 statuses)"
+            );
+        })
+        .expect("刷新后徽标");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
     /// 4.2: Solution 行左键 = **纯折叠** (D2) — 隐藏子行, 不动 active
     /// session、不切 tab、不抢焦点; 折叠态易失 (类型上就无持久化)。
     #[gpui_kit::test]
@@ -4574,7 +4893,7 @@ mod tests {
                             branch: Some("feat".into()),
                             actions: solution_service::worktree_actions(),
                         }]),
-                        actions: solution_service::project_actions(),
+                        actions: solution_service::project_actions(&[]),
                     }]),
                     actions: std::sync::Arc::from([]),
                 }]),
@@ -4654,7 +4973,7 @@ mod tests {
                     is_git: true,
                 },
                 worktrees: wts.into(),
-                actions: solution_service::project_actions(),
+                actions: solution_service::project_actions(&[]),
             };
             app.service_layer.set_tree_view_for_test(TreeSnapshot {
                 solutions: std::sync::Arc::from(vec![SolutionItem::Simple {

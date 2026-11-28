@@ -132,6 +132,62 @@ pub async fn is_tracked_clean_async(root: &Path) -> Result<bool, GitError> {
         .map_err(|e| GitError::Spawn(format!("git task: {e}")))?
 }
 
+/// `rev-parse HEAD` → 当前 HEAD sha（change solution-git-sync design D6）。
+pub async fn head_sha(cwd: &Path) -> Result<String, GitError> {
+    let out = run_async(&["rev-parse", "HEAD"], cwd).await?;
+    if out.code != 0 {
+        return Err(GitError::Failed {
+            code: out.code,
+            stderr: out.stderr,
+        });
+    }
+    Ok(out.stdout.trim().to_string())
+}
+
+/// `merge-base --is-ancestor <base> <tip>`：true = base 已含于 tip。
+/// 退码 1 = 不是祖先（git 约定）, 其余退码 → 结构化 [`GitError::Failed`]。
+pub async fn is_ancestor(base: &str, tip: &str, cwd: &Path) -> Result<bool, GitError> {
+    let out = run_async(&["merge-base", "--is-ancestor", base, tip], cwd).await?;
+    match out.code {
+        0 => Ok(true),
+        1 => Ok(false),
+        code => Err(GitError::Failed {
+            code,
+            stderr: out.stderr,
+        }),
+    }
+}
+
+/// `rev-list --count <base>..<tip>`：tip 领先 base 的提交数。
+pub async fn ahead_count(base: &str, tip: &str, cwd: &Path) -> Result<usize, GitError> {
+    let range = format!("{base}..{tip}");
+    let out = run_async(&["rev-list", "--count", &range], cwd).await?;
+    if out.code != 0 {
+        return Err(GitError::Failed {
+            code: out.code,
+            stderr: out.stderr,
+        });
+    }
+    out.stdout.trim().parse().map_err(|e| GitError::Failed {
+        code: out.code,
+        stderr: format!("rev-list --count 输出未解析: {e}"),
+    })
+}
+
+/// `merge [--ff-only] --no-edit <sha>` 于 cwd：返回**原始产出** —— 不走
+/// `run_ok`, 因为冲突 = 非零退出 + `CONFLICT` 输出, 由调用方裁决
+/// （design D1）。`--no-edit` 恒带：非交互进程里缺它, 真合并会拉起
+/// 编辑器。
+pub async fn merge(cwd: &Path, sha: &str, ff_only: bool) -> Result<GitOutput, GitError> {
+    let mut args: Vec<&str> = vec!["merge"];
+    if ff_only {
+        args.push("--ff-only");
+    }
+    args.push("--no-edit");
+    args.push(sha);
+    run_async(&args, cwd).await
+}
+
 /// 实际执行（`program` 可注入, 供「二进制缺失」路径单测）。
 ///
 /// 防挂三件套全在这一处（design D6）：stdin null、`GIT_TERMINAL_PROMPT=0`、
@@ -228,6 +284,14 @@ pub(crate) mod probe {
 
     fn lock() -> std::sync::MutexGuard<'static, State> {
         STATE.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 测试互斥（并行防抖）: 门闩是全局单例 —— 两个测试同时跑会互相
+    /// `release` 放行对方的闩。用闩的测试全程持锁序列化。
+    static EXCLUSIVE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    pub(crate) fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+        EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// 上闩：此后 `cwd` 匹配的 git 调用会被卡住并记录线程。
@@ -403,5 +467,170 @@ mod tests {
             is_tracked_clean(&plain),
             Err(GitError::Failed { .. })
         ));
+    }
+
+    /// change solution-git-sync (task 2.1): 四个新异步出口在真仓上的行为 ——
+    /// head_sha / ancestor / count 数值, ff 合成功, 冲突 = 非零 + `CONFLICT`,
+    /// ff-only 对分叉拒绝。
+    #[test]
+    fn merge_helpers_on_real_repo() {
+        let repo = scratch("merge-helpers");
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).expect("scratch");
+        let git = |args: &[&str]| {
+            run_ok(args, &repo).unwrap_or_else(|e| panic!("git {args:?} 失败: {e}"))
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "base").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-q", "-m", "A"]);
+        let base_branch = git(&["symbolic-ref", "--short", "HEAD"]).trim().to_string();
+        let sha_a = crate::testkit::block_on(head_sha(&repo)).expect("head_sha");
+
+        // 分支 feat: 改 f → B（默认分支仍留 A）
+        git(&["checkout", "-q", "-b", "feat"]);
+        std::fs::write(repo.join("f.txt"), "feat").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-q", "-m", "B"]);
+        let sha_b = crate::testkit::block_on(head_sha(&repo)).expect("head on feat");
+        git(&["checkout", "-q", base_branch.as_str()]);
+        assert_eq!(
+            crate::testkit::block_on(head_sha(&repo)).unwrap(),
+            sha_a,
+            "默认分支应留在 A"
+        );
+
+        // ancestor / count
+        assert!(
+            crate::testkit::block_on(is_ancestor(&sha_a, &sha_b, &repo)).unwrap(),
+            "A 是 B 的祖先"
+        );
+        assert!(
+            !crate::testkit::block_on(is_ancestor(&sha_b, &sha_a, &repo)).unwrap(),
+            "B 不是 A 的祖先"
+        );
+        assert_eq!(
+            crate::testkit::block_on(ahead_count(&sha_a, &sha_b, &repo)).unwrap(),
+            1,
+            "B 领先 A 恰 1"
+        );
+
+        // ff 合并: A → B
+        let out = crate::testkit::block_on(merge(&repo, &sha_b, true)).expect("merge spawn");
+        assert_eq!(out.code, 0, "ff 应成功: {}", out.stderr);
+        assert_eq!(
+            crate::testkit::block_on(head_sha(&repo)).unwrap(),
+            sha_b,
+            "ff 后 HEAD = B"
+        );
+
+        // 分叉: left 从 A 改 f, 主线从 B 改 f → 真合并必冲突
+        git(&["checkout", "-q", "-b", "left", sha_a.as_str()]);
+        std::fs::write(repo.join("f.txt"), "left").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-q", "-m", "C"]);
+        let sha_c = crate::testkit::block_on(head_sha(&repo)).unwrap();
+        git(&["checkout", "-q", base_branch.as_str()]);
+        std::fs::write(repo.join("f.txt"), "right").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-q", "-m", "D"]);
+
+        let out = crate::testkit::block_on(merge(&repo, &sha_c, false)).expect("merge spawn");
+        assert_ne!(out.code, 0, "冲突必须非零退出");
+        let combined = format!("{}{}", out.stdout, out.stderr);
+        assert!(
+            combined.contains("CONFLICT"),
+            "输出应含 CONFLICT: {combined}"
+        );
+
+        // 收尾: abort 后 ff-only 对分叉拒绝
+        git(&["merge", "--abort"]);
+        let out = crate::testkit::block_on(merge(&repo, &sha_c, true)).expect("merge spawn");
+        assert_ne!(out.code, 0, "ff-only 对分叉必须拒绝");
+    }
+
+    /// change solution-git-sync (task 5.2): 四个新异步出口全部离载 ——
+    /// 逐个上闩, 实际执行 git 的线程 ≠ 调用线程（对齐 solution-git-offload
+    /// 的 latched 模式; 变异检查: 把任一出口改成同步直跑 → hit == drv →
+    /// 红）。门闩全局单例, 与既有离载测试经 `probe::exclusive()` 串行。
+    #[test]
+    fn merge_helpers_run_off_the_calling_thread() {
+        use std::time::Duration;
+
+        let _guard = probe::exclusive();
+        let repo = scratch("offload-merge");
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        let git =
+            |args: &[&str]| run_ok(args, &repo).unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "v1").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let sha = crate::testkit::block_on(head_sha(&repo)).expect("head_sha");
+
+        let cases: Vec<(&str, Box<dyn FnOnce() + Send>)> = vec![
+            (
+                "head_sha",
+                Box::new({
+                    let repo = repo.clone();
+                    move || {
+                        crate::testkit::block_on(head_sha(&repo)).expect("head_sha");
+                    }
+                }),
+            ),
+            (
+                "is_ancestor",
+                Box::new({
+                    let repo = repo.clone();
+                    let sha = sha.clone();
+                    move || {
+                        crate::testkit::block_on(is_ancestor(&sha, &sha, &repo))
+                            .expect("is_ancestor");
+                    }
+                }),
+            ),
+            (
+                "ahead_count",
+                Box::new({
+                    let repo = repo.clone();
+                    let sha = sha.clone();
+                    move || {
+                        crate::testkit::block_on(ahead_count(&sha, &sha, &repo))
+                            .expect("ahead_count");
+                    }
+                }),
+            ),
+            (
+                "merge",
+                Box::new({
+                    let repo = repo.clone();
+                    let sha = sha.clone();
+                    move || {
+                        let out = crate::testkit::block_on(merge(&repo, &sha, true))
+                            .expect("merge spawn");
+                        assert_eq!(out.code, 0, "同 sha 合并应 Already up to date");
+                    }
+                }),
+            ),
+        ];
+
+        for (name, call) in cases {
+            probe::arm(&repo);
+            let driver = std::thread::spawn(move || {
+                let tid = std::thread::current().id();
+                call();
+                tid
+            });
+            let hit = probe::wait_hit(Duration::from_secs(3))
+                .unwrap_or_else(|| panic!("{name} 的 git 子进程应在门闩处命中"));
+            probe::release();
+            let drv = driver.join().expect("调用线程应完成");
+            assert_ne!(hit, drv, "{name} 必须离载: git 不得在调用线程上执行");
+        }
     }
 }

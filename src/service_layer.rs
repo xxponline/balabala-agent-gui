@@ -22,8 +22,8 @@ use service_manager::{
 };
 // change solution-service task 2.2: Solution/Project 域服务接入（design D1）。
 use solution_service::contract::{
-    ActionInvoke, GitOpFinished, OpError as SolOpError, OpResult as SolOpResult, SolutionContract,
-    TreeChanged as SolTreeChanged, TreeSnapshot, WatchReq as SolWatchReq,
+    ActionInvoke, GitOpFinished, OpError as SolOpError, OpResult as SolOpResult, RepoState,
+    SolutionContract, TreeChanged as SolTreeChanged, TreeSnapshot, WatchReq as SolWatchReq,
     KIND_ACTION as KIND_SOL_ACTION, KIND_GIT_OP_FINISHED, KIND_LOAD,
     KIND_OP_REPLY as KIND_SOLUTION_REPLY, KIND_TREE_CHANGED as KIND_SOLUTION_CHANGED,
     KIND_WATCH as KIND_SOLUTION_WATCH,
@@ -170,6 +170,9 @@ pub struct ServiceLayer {
     pub states: HashMap<InstanceId, ServiceState>,
     /// `sessions_changed` 投影镜像（task 3.1；solution-overview/active 渲染源）。
     pub sessions_view: Option<SessionView>,
+    /// 行徽标数据（change solution-git-sync D4）：最近一次 git 结果检视
+    /// 过的每个仓 path → state；键经 `badge_key` 归一（反斜杠/正斜杠）。
+    pub repo_status: HashMap<String, RepoState>,
     /// 待消费帧（task 3.1；app 泵转发给 AgentTerminal.feed）。
     frames: Vec<FrameBytes>,
     /// 失败 notice 队列（spec delta: 点名失败操作）。
@@ -353,6 +356,7 @@ impl ServiceLayer {
             events_seen: 0,
             states: HashMap::new(),
             sessions_view: None,
+            repo_status: HashMap::new(),
             frames: Vec::new(),
             notices: Vec::new(),
             pending_ops: HashMap::new(),
@@ -573,10 +577,27 @@ impl ServiceLayer {
                 KIND_GIT_OP_FINISHED => {
                     self.events_seen += 1;
                     if let Ok(done) = env.downcast::<GitOpFinished>() {
+                        // 行徽标数据 (solution-git-sync D4): 本次运行检视过
+                        // 的每个仓 → path→state (键经 badge_key 归一)
+                        for st in &done.statuses {
+                            self.repo_status.insert(
+                                solution_service::contract::badge_key(&st.path),
+                                st.state,
+                            );
+                        }
+                        // 文案用 label (solution-git-sync D5, 未知 id 回退裸
+                        // id); 成功且带 detail（merge 摘要）→ 一并上屏
+                        // (spec: completion notice reports the merge result)
+                        let name = solution_service::contract::action_label(&done.action_id)
+                            .unwrap_or(done.action_id.as_str());
                         let text = if done.ok {
-                            format!("{} 完成: {}", done.action_id, done.target)
+                            if done.detail.is_empty() {
+                                format!("{name}完成: {}", done.target)
+                            } else {
+                                format!("{name}完成: {} — {}", done.target, done.detail)
+                            }
                         } else {
-                            format!("{} 失败: {}", done.action_id, done.detail)
+                            format!("{name}失败: {}", done.detail)
                         };
                         push_notice(&mut self.notices, Some(done.action_id.as_str()), text);
                     }
@@ -643,6 +664,13 @@ impl ServiceLayer {
             return Some(snap);
         }
         self.tree_view.as_ref()
+    }
+
+    /// 某仓的行徽标状态（None = 未观测 → 视图渲染未知灰）。
+    pub fn repo_badge(&self, path: &str) -> Option<RepoState> {
+        self.repo_status
+            .get(&solution_service::contract::badge_key(path))
+            .copied()
     }
 
     /// **资产视图镜像**（change asset-service task 4.2）——
@@ -1361,6 +1389,7 @@ mod tests {
                 target: "/ws/proj".into(),
                 ok: true,
                 detail: String::new(),
+                statuses: Vec::new(),
             },
         );
         assert!(
@@ -1375,7 +1404,61 @@ mod tests {
         );
         let (action, text) = layer.take_notices().pop().expect("notice 在场");
         assert_eq!(action.as_deref(), Some("git.pull"), "路由键 = action_id");
-        assert!(text.contains("完成") && text.contains("/ws/proj"), "{text}");
+        assert!(
+            text.starts_with("拉取完成") && text.contains("/ws/proj"),
+            "文案用 label (D5): {text}"
+        );
+
+        // 成功带 detail（merge 摘要）→ 一并上屏 (spec: reports the result)
+        inject(
+            &mut layer,
+            GitOpFinished {
+                action_id: "git.pull".into(),
+                target: "/ws/proj".into(),
+                ok: true,
+                detail: "Fast-forward".into(),
+                statuses: Vec::new(),
+            },
+        );
+        assert!(
+            wait_until(
+                || {
+                    layer.pump();
+                    !layer.notices.is_empty()
+                },
+                Duration::from_secs(3)
+            ),
+            "带 detail 的成功事件应出 notice"
+        );
+        let (_, text) = layer.take_notices().pop().expect("notice 在场");
+        assert!(text.contains("Fast-forward"), "成功 detail 上屏: {text}");
+
+        // 未知 id → 回退裸 id（未来新动作不崩文案）
+        inject(
+            &mut layer,
+            GitOpFinished {
+                action_id: "git.future_op".into(),
+                target: "/ws/proj".into(),
+                ok: false,
+                detail: "boom".into(),
+                statuses: Vec::new(),
+            },
+        );
+        assert!(
+            wait_until(
+                || {
+                    layer.pump();
+                    !layer.notices.is_empty()
+                },
+                Duration::from_secs(3)
+            ),
+            "未知 id 事件应出 notice"
+        );
+        let (_, text) = layer.take_notices().pop().expect("notice 在场");
+        assert!(
+            text.starts_with("git.future_op失败"),
+            "未知 id 回退裸 id: {text}"
+        );
 
         // 失败态 → notice 点名 action + stderr 摘要
         inject(
@@ -1385,6 +1468,7 @@ mod tests {
                 target: "/ws/proj".into(),
                 ok: false,
                 detail: "remote rejected: non-fast-forward".into(),
+                statuses: Vec::new(),
             },
         );
         assert!(
@@ -1399,7 +1483,10 @@ mod tests {
         );
         let (action, text) = layer.take_notices().pop().expect("notice 在场");
         assert_eq!(action.as_deref(), Some("git.push"));
-        assert!(text.contains("失败") && text.contains("non-fast-forward"), "{text}");
+        assert!(
+            text.starts_with("推送失败") && text.contains("non-fast-forward"),
+            "文案用 label (D5): {text}"
+        );
 
         // 迟到/无 corr: 事件不进 pending 表 → 零死信 (design D1)
         let dead_before = layer.manager.dead_letters().len();
@@ -1410,6 +1497,7 @@ mod tests {
                 target: "/ws/proj".into(),
                 ok: true,
                 detail: String::new(),
+                statuses: Vec::new(),
             },
         );
         assert!(

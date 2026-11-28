@@ -11,7 +11,7 @@ use service_core::Payload;
 
 // 节点动作描述符归中立命名空间 (change asset-service design D6) ——
 // solution 与 asset 两侧共用同一类型, 服务之间不互相依赖。
-pub use contracts::shared::{ActionDesc, ExecutedBy};
+pub use contracts::shared::{ActionChild, ActionDesc, ExecutedBy};
 
 // ---------- 契约类标记 ----------
 
@@ -232,6 +232,11 @@ pub const ACTION_PULL: &str = "git.pull";
 pub const ACTION_PUSH: &str = "git.push";
 pub const ACTION_CREATE_WORKTREE: &str = "worktree.create";
 pub const ACTION_DELETE_WORKTREE: &str = "worktree.delete";
+/// 双向同步两个动作 id（change solution-git-sync design D1）：前者挂
+/// worktree 行（project HEAD 合入 worktree）, 后者挂 project 行子菜单
+/// （worktree HEAD 快进 project）。
+pub const ACTION_SYNC_WORKTREE_FROM_PROJECT: &str = "worktree.sync_from_project";
+pub const ACTION_SYNC_PROJECT_FROM_WORKTREE: &str = "project.sync_from_worktree";
 
 /// solution 节点声明的可用操作（design D3: 描述符随快照下传）。
 ///
@@ -244,12 +249,14 @@ pub fn solution_actions(item: &SolutionItem) -> Arc<[ActionDesc]> {
             label: "注册到资产树".to_string(),
             checked: Some(item.register_to_asset_manager()),
             execution: ExecutedBy::Service,
+            children: Arc::from([]),
         },
         ActionDesc {
             id: ACTION_CONFIGURE_GIT.to_string(),
             label: "git 管理".to_string(),
             checked: Some(item.git_enabled()),
             execution: ExecutedBy::Service,
+            children: Arc::from([]),
         },
     ])
 }
@@ -257,32 +264,99 @@ pub fn solution_actions(item: &SolutionItem) -> Arc<[ActionDesc]> {
 /// project 节点声明的可用操作（恒声明, design D5 方案 b）：
 /// **不**按 is_git/干净态过滤 —— 快照现算拦不住 invoke 前的状态变化
 /// （陈旧），门控在服务端 invoke 时做, 不过 → `OpError` → 既有 notice。
-pub fn project_actions() -> Arc<[ActionDesc]> {
+///
+/// change solution-git-sync (design D3): worktree 层**非空**时追加
+/// "从 worktree 同步" 父描述符, children = 每 worktree 一条 —— 与
+/// 下方 worktree 行同源同涨落（层空 = 无目标, 不声明）。
+pub fn project_actions(worktrees: &[WorktreeNode]) -> Arc<[ActionDesc]> {
     const OPS: [(&str, &str); 3] = [
         (ACTION_PULL, "拉取"),
         (ACTION_PUSH, "推送"),
         (ACTION_CREATE_WORKTREE, "创建 worktree"),
     ];
-    Arc::from(
-        OPS.into_iter()
-            .map(|(id, label)| ActionDesc {
-                id: id.to_string(),
-                label: label.to_string(),
-                checked: None, // 非开关
-                execution: ExecutedBy::Service,
-            })
-            .collect::<Vec<_>>(),
-    )
+    let mut acts: Vec<ActionDesc> = OPS
+        .into_iter()
+        .map(|(id, label)| ActionDesc {
+            id: id.to_string(),
+            label: label.to_string(),
+            checked: None, // 非开关
+            execution: ExecutedBy::Service,
+            children: Arc::from([]),
+        })
+        .collect();
+    if !worktrees.is_empty() {
+        acts.push(ActionDesc {
+            id: ACTION_SYNC_PROJECT_FROM_WORKTREE.to_string(),
+            label: "从 worktree 同步".to_string(),
+            checked: None,
+            execution: ExecutedBy::Service,
+            children: worktrees
+                .iter()
+                .map(|w| ActionChild {
+                    label: worktree_display_name(w),
+                    node: w.path.to_string_lossy().into_owned(),
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        });
+    }
+    acts.into()
+}
+
+/// worktree 显示名：分支名, detached → 目录末段（与视图行推导同规则 ——
+/// 子项 label 必须与行一致, change solution-git-sync design D3）。
+pub fn worktree_display_name(w: &WorktreeNode) -> String {
+    w.branch.clone().unwrap_or_else(|| {
+        w.path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    })
 }
 
 /// worktree 节点声明的可用操作（恒声明, 同 `project_actions` 立场）。
 pub fn worktree_actions() -> Arc<[ActionDesc]> {
-    Arc::from(vec![ActionDesc {
-        id: ACTION_DELETE_WORKTREE.to_string(),
-        label: "删除 worktree".to_string(),
-        checked: None,
-        execution: ExecutedBy::Service,
-    }])
+    Arc::from(vec![
+        ActionDesc {
+            id: ACTION_DELETE_WORKTREE.to_string(),
+            label: "删除 worktree".to_string(),
+            checked: None,
+            execution: ExecutedBy::Service,
+            children: Arc::from([]),
+        },
+        ActionDesc {
+            id: ACTION_SYNC_WORKTREE_FROM_PROJECT.to_string(),
+            label: "同步 Project 代码".to_string(),
+            checked: None,
+            execution: ExecutedBy::Service,
+            children: Arc::from([]),
+        },
+    ])
+}
+
+/// 徽标键归一（change solution-git-sync design D4）：Windows 上 create
+/// 的 target 是 `parent.join` 拼的反斜杠, 快照行路径来自 git porcelain
+/// 的正斜杠 —— 同一仓两种写法必须落同一徽标键。
+pub fn badge_key(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+/// 动作 id → 显示文案的静态表（change solution-git-sync design D5）：
+/// `KIND_GIT_OP_FINISHED` 的 notice 用它把裸 id 换成人话, 未知 id
+/// 返回 `None` → 调用方回退裸 id。文案与各声明处同源, 测试钉住一致。
+pub fn action_label(action_id: &str) -> Option<&'static str> {
+    match action_id {
+        ACTION_CREATE => Some("添加 solution"), // 文案源头在视图提交处
+        ACTION_CONFIGURE_REGISTER => Some("注册到资产树"),
+        ACTION_CONFIGURE_GIT => Some("git 管理"),
+        ACTION_PULL => Some("拉取"),
+        ACTION_PUSH => Some("推送"),
+        ACTION_CREATE_WORKTREE => Some("创建 worktree"),
+        ACTION_DELETE_WORKTREE => Some("删除 worktree"),
+        ACTION_SYNC_WORKTREE_FROM_PROJECT => Some("同步 Project 代码"),
+        ACTION_SYNC_PROJECT_FROM_WORKTREE => Some("从 worktree 同步"),
+        _ => None,
+    }
 }
 
 /// solution 节点 id 前缀 — 与 asset 树 `project_id()` 同构的命名空间方案
@@ -559,6 +633,27 @@ pub const KIND_TREE_CHANGED: &str = "solution.tree_changed";
 /// （"late or unknown reply"）。载荷 = 本结构。
 pub const KIND_GIT_OP_FINISHED: &str = "solution.git_op_finished";
 
+/// 仓库状态（change solution-git-sync design D4）——行内徽标语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoState {
+    /// 干净（门禁通过或执行成功后的态）。
+    Clean,
+    /// 有未提交的 tracked 改动（tracked-clean 门禁判出）。
+    Dirty,
+    /// 存在未完成合并（merge 冲突后）——与 Dirty 刻意区分。
+    Conflict,
+}
+
+/// 单个仓库的状态观测（随完成事件回传，path = project root 或
+/// worktree 裸路径，与行身份锚点同键）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoStatus {
+    /// 仓库路径（绝对）。
+    pub path: String,
+    /// 观测到的状态。
+    pub state: RepoState,
+}
+
 /// `KIND_GIT_OP_FINISHED` 载荷：完成结果按 `action_id` 回到 notice 链路
 /// （node-actions: 按 id 路由不按 label）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -571,6 +666,9 @@ pub struct GitOpFinished {
     pub ok: bool,
     /// 失败原因（git stderr 尾部摘要）；成功 → 空串。
     pub detail: String,
+    /// 本次运行检视过的每个仓库的状态（门禁判出/执行后, design D4）；
+    /// 空 = 未检视任何仓库 → 视图保持原徽标。
+    pub statuses: Vec<RepoStatus>,
 }
 
 #[cfg(test)]
@@ -758,28 +856,129 @@ mod tests {
         );
     }
 
+    /// change solution-git-sync (D5): 完成事件 notice 的 id → label 静态表 ——
+    /// 7 个已声明 id 全命中、与声明处 label 逐字一致（防漂移）, 未知 id
+    /// 返回 None（调用方回退裸 id）。
+    #[test]
+    fn action_label_covers_declared_ids() {
+        let expected: [(&str, &str); 9] = [
+            (ACTION_CREATE, "添加 solution"), // 文案源头在视图提交处
+            (ACTION_CONFIGURE_REGISTER, "注册到资产树"),
+            (ACTION_CONFIGURE_GIT, "git 管理"),
+            (ACTION_PULL, "拉取"),
+            (ACTION_PUSH, "推送"),
+            (ACTION_CREATE_WORKTREE, "创建 worktree"),
+            (ACTION_DELETE_WORKTREE, "删除 worktree"),
+            (ACTION_SYNC_WORKTREE_FROM_PROJECT, "同步 Project 代码"),
+            (ACTION_SYNC_PROJECT_FROM_WORKTREE, "从 worktree 同步"),
+        ];
+        for (id, label) in expected {
+            assert_eq!(action_label(id), Some(label), "{id}");
+        }
+        // 与参数化的声明处逐字一致（防两处文案漂移）—— 带一个 worktree
+        // 让 project 侧也产出 sync 父描述符
+        let wt = WorktreeNode {
+            path: std::path::PathBuf::from("/ws/.balabala.worktrees/feat"),
+            branch: Some("feat".into()),
+            actions: worktree_actions(),
+        };
+        for desc in project_actions(&[wt.clone()])
+            .iter()
+            .chain(worktree_actions().iter())
+        {
+            assert_eq!(
+                action_label(&desc.id),
+                Some(desc.label.as_str()),
+                "{} 声明与表漂移",
+                desc.id
+            );
+        }
+        assert_eq!(action_label("git.nonexistent"), None, "未知 id 回退");
+    }
+
+    /// change solution-git-sync (D4): 徽标键归一 —— 反斜杠/正斜杠同键
+    /// （create 的 target 与快照行路径在 Windows 上写法不同）。
+    #[test]
+    fn badge_key_normalizes_separators() {
+        assert_eq!(badge_key(r"D:\ws\proj"), "D:/ws/proj");
+        assert_eq!(badge_key("D:/ws/proj"), "D:/ws/proj");
+        assert_eq!(badge_key(&badge_key(r"D:\ws")), badge_key("D:/ws"));
+    }
+
     /// 任务 2.1 验证: 两类节点携带的 descriptor 集合与 label（对齐
-    /// `solution_actions` 既有测试形态）。
+    /// `solution_actions` 既有测试形态）；solution-git-sync D3: 层非空
+    /// 追加 sync 父 + children, 层空不声明。
     #[test]
     fn project_and_worktree_nodes_declare_git_actions() {
-        // project 节点: 三动作, label 中文归服务, 恒 Service 执行, 非开关
-        let p = project_actions();
+        // worktree 层空 → project 三动作, 无 sync 父
+        let p0 = project_actions(&[]);
+        let p0ids: Vec<&str> = p0.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(
+            p0ids,
+            vec![ACTION_PULL, ACTION_PUSH, ACTION_CREATE_WORKTREE]
+        );
+
+        // 有 worktree → 第四个 sync 父描述符, children = 每 worktree 一条
+        let wt = WorktreeNode {
+            path: std::path::PathBuf::from("/ws/.balabala.worktrees/feat"),
+            branch: Some("feat".into()),
+            actions: worktree_actions(),
+        };
+        let p = project_actions(&[wt.clone()]);
         let pids: Vec<&str> = p.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(pids, vec![ACTION_PULL, ACTION_PUSH, ACTION_CREATE_WORKTREE]);
+        assert_eq!(
+            pids,
+            vec![
+                ACTION_PULL,
+                ACTION_PUSH,
+                ACTION_CREATE_WORKTREE,
+                ACTION_SYNC_PROJECT_FROM_WORKTREE
+            ],
+            "层非空 → 追加 sync 父描述符"
+        );
         let plabels: Vec<&str> = p.iter().map(|a| a.label.as_str()).collect();
-        assert_eq!(plabels, vec!["拉取", "推送", "创建 worktree"], "label 归服务所有");
+        assert_eq!(
+            plabels,
+            vec!["拉取", "推送", "创建 worktree", "从 worktree 同步"],
+            "label 归服务所有"
+        );
         for a in p.iter() {
             assert_eq!(a.execution, ExecutedBy::Service, "{} 必须标 Service", a.id);
             assert_eq!(a.checked, None, "{} 非开关", a.id);
         }
+        // children: label = 行同源显示名, node = 裸路径
+        let sync = p.last().expect("sync 父在场");
+        assert_eq!(sync.children.len(), 1, "每 worktree 一条 child");
+        assert_eq!(sync.children[0].label, "feat");
+        assert_eq!(
+            sync.children[0].node, "/ws/.balabala.worktrees/feat",
+            "child node = 裸路径"
+        );
 
-        // worktree 节点: 单动作 delete
+        // 显示名规则: 分支优先, detached → 目录末段（与视图行同规则）
+        assert_eq!(worktree_display_name(&wt), "feat", "分支名优先");
+        let detached = WorktreeNode {
+            path: std::path::PathBuf::from("/ws/.balabala.worktrees/det"),
+            branch: None,
+            actions: worktree_actions(),
+        };
+        assert_eq!(
+            worktree_display_name(&detached),
+            "det",
+            "detached → 目录末段"
+        );
+
+        // worktree 节点: delete + sync 两动作
         let w = worktree_actions();
-        assert_eq!(w.len(), 1);
+        assert_eq!(w.len(), 2);
         assert_eq!(w[0].id, ACTION_DELETE_WORKTREE);
         assert_eq!(w[0].label, "删除 worktree");
-        assert_eq!(w[0].execution, ExecutedBy::Service);
-        assert_eq!(w[0].checked, None);
+        assert_eq!(w[1].id, ACTION_SYNC_WORKTREE_FROM_PROJECT);
+        assert_eq!(w[1].label, "同步 Project 代码");
+        for a in w.iter() {
+            assert_eq!(a.execution, ExecutedBy::Service);
+            assert_eq!(a.checked, None);
+        }
     }
 
     /// 任务 2.2 验证: `WorktreeNode` 构造往返不丢字段（typed Payload
@@ -812,7 +1011,7 @@ mod tests {
                 is_git: true,
             },
             worktrees: Arc::from(vec![node.clone()]),
-            actions: project_actions(),
+            actions: project_actions(&[node.clone()]),
         };
         assert_eq!(proj.worktrees.len(), 1);
         assert_eq!(proj.worktrees[0], node, "层级挂载后逐字相等");
@@ -829,6 +1028,7 @@ mod tests {
             target: "/a/foo".into(),
             ok: false,
             detail: "remote rejected: non-fast-forward".into(),
+            statuses: Vec::new(),
         };
         // 载荷往返 (typed Payload, 同 TreeSnapshot 传输形态)
         let payload = Payload::new(done.clone());
@@ -937,7 +1137,7 @@ mod tests {
                         is_git: false,
                     },
                     worktrees: Arc::from([]),
-                    actions: project_actions(),
+                    actions: project_actions(&[]),
                 }]),
                 actions: solution_actions(item),
             })

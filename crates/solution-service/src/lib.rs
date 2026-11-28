@@ -18,11 +18,13 @@ mod testkit;
 
 pub use contract::{
     ACTION_CONFIGURE_GIT, ACTION_CONFIGURE_REGISTER, ACTION_CREATE, ACTION_CREATE_WORKTREE,
-    ACTION_DELETE_WORKTREE, ACTION_PULL, ACTION_PUSH, ActionDesc, ActionInvoke, ExecutedBy,
+    ACTION_DELETE_WORKTREE, ACTION_PULL, ACTION_PUSH, ACTION_SYNC_PROJECT_FROM_WORKTREE,
+    ACTION_SYNC_WORKTREE_FROM_PROJECT, ActionChild, ActionDesc, ActionInvoke, ExecutedBy,
     GitOpFinished, KIND_GIT_OP_FINISHED, LoadError, OpError, ProjectDesc, ProjectNode, ProjectTree,
-    SOLUTION_NODE_PREFIX, SolutionItem, SolutionNode, TreeSnapshot, WorktreeNode, action_args,
-    configure_action_args, parse_solution_node, project_actions, project_node_id, solution_actions,
-    solution_node_id, worktree_actions,
+    RepoState, RepoStatus, SOLUTION_NODE_PREFIX, SolutionItem, SolutionNode, TreeSnapshot,
+    WorktreeNode, action_args, action_label, badge_key, configure_action_args, parse_solution_node,
+    project_actions, project_node_id, solution_actions, solution_node_id, worktree_actions,
+    worktree_display_name,
 };
 /// 幂等工具 crate 根导出（design D6: View/Server 共用同一实现）。
 pub use valid_checker::{configure_is_noop, create_is_noop};

@@ -142,12 +142,14 @@ pub fn view_row_actions() -> Arc<[ActionDesc]> {
                     label: "复制路径".to_string(),
                     checked: None,
                     execution: ExecutedBy::View,
+                    children: std::sync::Arc::from([]),
                 },
                 ActionDesc {
                     id: ACTION_REVEAL.to_string(),
                     label: "在 Finder 显示".to_string(),
                     checked: None,
                     execution: ExecutedBy::View,
+                    children: std::sync::Arc::from([]),
                 },
             ])
         })
