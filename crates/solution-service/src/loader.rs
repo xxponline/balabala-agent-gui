@@ -173,7 +173,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let gone = dir.join("nope");
-        let text = format!(r#"[{{"type": "simple", "path": "{}"}}]"#, gone.display());
+        let text = serde_json::json!([{"type": "simple", "path": gone}]).to_string();
         std::fs::write(solutions_path(&dir), &text).unwrap();
         assert!(matches!(
             load_items(&dir),

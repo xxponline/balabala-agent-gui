@@ -41,6 +41,9 @@ lua-language-service = { path = "crates/lua-language-service" }
 # 仅测试构建启用 (resolver 不会把 dev 特性并入 cargo build)：
 # gpui_kit::test 无头窗口 + ElementSnapshot bounds 断言 (pane 网格宽度契约)
 gpui-kit = { version = "0.9.0", features = ["test-support"] }
+# 测试 setup 驱动 solution-service 的异步 git 出口 (spawn_blocking 需要
+# tokio 上下文) —— **features 与各服务 crate 完全一致** (TypeId 纪律)。
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
 # service_layer 测试: 非 tokio executor await ask future (task 6.1)
 futures = "0.3"
 # change add-lua-language-service 4.2: gpui-component 高亮器的语法集来源

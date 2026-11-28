@@ -1118,7 +1118,7 @@
         crate::project_model::create_workspace_files(&ws1).unwrap();
         std::fs::write(
             crate::project_model::files::solutions_path(&ws1),
-            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, ws1.display()),
+            serde_json::json!([{"type": "simple", "path": ws1}]).to_string(),
         )
         .unwrap();
         write_rules(&ws1, &["*.log"]);
@@ -1238,7 +1238,7 @@
         crate::project_model::create_workspace_files(&ws2).unwrap();
         std::fs::write(
             crate::project_model::files::solutions_path(&ws2),
-            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, ws2.display()),
+            serde_json::json!([{"type": "simple", "path": ws2}]).to_string(),
         )
         .unwrap();
         app.update(cx, |app, cx| app.begin_open(ws2.clone(), cx));

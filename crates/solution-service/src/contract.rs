@@ -875,8 +875,11 @@ mod tests {
                 req.name
             );
             // 真 git 裁决: 合法分支名 (git worktree add 按 basename 自建分支)
-            let out = crate::git::run(&["check-ref-format", "--branch", &req.name], Path::new("."))
-                .unwrap_or_else(|e| panic!("git 不可用: {e}"));
+            let out = crate::testkit::block_on(crate::git::run_async(
+                &["check-ref-format", "--branch", &req.name],
+                Path::new("."),
+            ))
+            .unwrap_or_else(|e| panic!("git 不可用: {e}"));
             assert_eq!(
                 out.code, 0,
                 "{node} → {:?} 不是合法分支名: {}",

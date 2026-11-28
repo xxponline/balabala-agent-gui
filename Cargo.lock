@@ -645,6 +645,7 @@ dependencies = [
  "serde_json",
  "service-manager",
  "solution-service",
+ "tokio",
  "two-face",
  "vt100",
  "windows-sys 0.61.2",
@@ -7988,6 +7989,7 @@ dependencies = [
  "serde",
  "serde_json",
  "service-core",
+ "tokio",
 ]
 
 [[package]]

@@ -2559,6 +2559,22 @@ mod tests {
             .unwrap_or(AssetState::Empty)
     }
 
+    /// 测试内同步驱动 solution-service 的异步 git 出口 —— `spawn_blocking`
+    /// 需要 tokio 上下文（change solution-git-offload：同步 git 已模块
+    /// 私有, 测试 setup 一律走异步出口 + 本 executor）。
+    fn block_on_git<F: std::future::Future>(fut: F) -> F::Output {
+        static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        RT.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .thread_name("gui-git-test")
+                .build()
+                .expect("test runtime")
+        })
+        .block_on(fut)
+    }
+
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "sw-{tag}-{}-{}",
@@ -2869,10 +2885,7 @@ mod tests {
         project_model::create_workspace_files(&ws).unwrap();
         fs::write(
             project_model::files::solutions_path(&ws),
-            format!(
-                r#"[{{"type": "simple", "path": "{}"}}]"#,
-                project_dir.display()
-            ),
+            serde_json::json!([{"type": "simple", "path": project_dir}]).to_string(),
         )
         .unwrap();
         let history = fresh_history_path();
@@ -3703,7 +3716,7 @@ mod tests {
         let proj = ws.join("my proj");
         fs::create_dir_all(&proj).unwrap();
         let git = |args: &[&str]| {
-            solution_service::git::run_ok(args, &proj)
+            block_on_git(solution_service::git::run_ok_async(args, &proj))
                 .unwrap_or_else(|e| panic!("git {args:?}: {e}"))
         };
         git(&["init", "-q"]);
@@ -4231,10 +4244,7 @@ mod tests {
         project_model::create_workspace_files(&ws).unwrap();
         fs::write(
             project_model::files::solutions_path(&ws),
-            format!(
-                r#"[{{"type": "simple", "path": "{}"}}]"#,
-                project_dir.display()
-            ),
+            serde_json::json!([{"type": "simple", "path": project_dir}]).to_string(),
         )
         .unwrap();
 
@@ -4339,7 +4349,7 @@ mod tests {
         project_model::create_workspace_files(&ws).unwrap();
         fs::write(
             project_model::files::solutions_path(&ws),
-            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, foo.display()),
+            serde_json::json!([{"type": "simple", "path": foo}]).to_string(),
         )
         .unwrap();
         app_entity.update(cx, |app, cx| app.begin_open(ws.clone(), cx));
@@ -4361,11 +4371,11 @@ mod tests {
         let dead = ws.join("nope-never");
         fs::write(
             project_model::files::solutions_path(&ws),
-            format!(
-                r#"[{{"type": "simple", "path": "{}"}}, {{"type": "simple", "path": "{}"}}]"#,
-                foo.display(),
-                dead.display()
-            ),
+            serde_json::json!([
+                {"type": "simple", "path": foo},
+                {"type": "simple", "path": dead}
+            ])
+            .to_string(),
         )
         .unwrap();
         app_entity.update(cx, |app, cx| app.begin_open(ws.clone(), cx));
@@ -4457,7 +4467,7 @@ mod tests {
         project_model::create_workspace_files(&ws1).unwrap();
         fs::write(
             project_model::files::solutions_path(&ws1),
-            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, one.display()),
+            serde_json::json!([{"type": "simple", "path": one}]).to_string(),
         )
         .unwrap();
         let ws2 = temp_dir("reg-switch-2");
@@ -4466,7 +4476,7 @@ mod tests {
         project_model::create_workspace_files(&ws2).unwrap();
         fs::write(
             project_model::files::solutions_path(&ws2),
-            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, two.display()),
+            serde_json::json!([{"type": "simple", "path": two}]).to_string(),
         )
         .unwrap();
 

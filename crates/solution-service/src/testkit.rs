@@ -90,24 +90,34 @@ impl Messaging for TestMessaging {
 impl TestMessaging {
     /// 驱动所有已捕获的后台任务至完成（测试用）。
     ///
-    /// 未来体内无 await 点（同步 git 子进程）→ 单次 poll 即 Ready；
-    /// 兼顾起见循环至 Ready, 上限防意外 Pending 死转。
+    /// 后台任务含 `spawn_blocking` await 点（门控 + git 执行离载，
+    /// change solution-git-offload）→ 必须走真 executor，noop waker
+    /// 单次 poll 会在第一个 await 处 Pending。
     pub fn drive_spawned(&self) {
         let mut futs = std::mem::take(&mut *self.spawned.lock().expect("test spawned poisoned"));
-        for mut fut in futs.drain(..) {
-            let waker = std::task::Waker::noop();
-            let mut cx = std::task::Context::from_waker(waker);
-            for _ in 0..16 {
-                match fut.as_mut().poll(&mut cx) {
-                    std::task::Poll::Ready(()) => break,
-                    std::task::Poll::Pending => continue,
-                }
-            }
+        for fut in futs.drain(..) {
+            block_on(fut);
         }
     }
 }
 
-/// 空 runtime 载体（SolutionService 不 spawn，无需真实句柄）。
+/// 测试用 executor：静态单 worker runtime（阻塞池独立），任何测试线程
+/// 可 `block_on` —— 异步 git 出口需要 runtime 上下文（`spawn_blocking`），
+/// 同步 `#[test]` 由此驱动它们（change solution-git-offload）。
+pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("sol-svc-test")
+            .build()
+            .expect("test runtime")
+    })
+    .block_on(fut)
+}
+
+/// 空 runtime 载体（服务侧 spawn 走 tokio ambient 上下文，不消费此句柄）。
 struct NullRuntime;
 
 impl RuntimeToken for NullRuntime {

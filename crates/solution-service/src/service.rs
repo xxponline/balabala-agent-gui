@@ -63,26 +63,28 @@ impl SolutionService {
     ///
     /// 节点上的 `actions` 由服务按 item 当前配置现算（design D3）—
     /// 描述符搭快照的车下传, 右键菜单因此零往返。
-    pub fn snapshot(&self) -> TreeSnapshot {
-        let hierarchy: Arc<[SolutionNode]> = self
-            .items
-            .iter()
-            .map(|item| SolutionNode {
+    pub async fn snapshot(&self) -> TreeSnapshot {
+        let mut nodes = Vec::with_capacity(self.items.len());
+        for item in &self.items {
+            // v1 `simple`: 1 item → 1 project (spec: Solution type
+            // registry resolves items to projects)
+            let projects = Arc::from(vec![ProjectNode {
+                desc: loader::expand_item(item),
+                // worktree 层 = git 元数据现算 (task 4.3 真源, design D4):
+                // `git worktree list --porcelain` 可见应用外注册的条目
+                // (异步出口 → 阻塞池, spec: Git work does not delay
+                // other services)
+                worktrees: Self::worktree_layer(item).await,
+                // project 节点恒声明 pull/push/create-worktree (design D5)
+                actions: project_actions(),
+            }]);
+            nodes.push(SolutionNode {
                 item: item.clone(),
-                // v1 `simple`: 1 item → 1 project (spec: Solution type
-                // registry resolves items to projects)
-                projects: Arc::from(vec![ProjectNode {
-                    desc: loader::expand_item(item),
-                    // worktree 层 = git 元数据现算 (task 4.3 真源, design D4):
-                    // `git worktree list --porcelain` 可见应用外注册的条目
-                    worktrees: Self::worktree_layer(item),
-                    // project 节点恒声明 pull/push/create-worktree (design D5)
-                    actions: project_actions(),
-                }]),
+                projects,
                 actions: solution_actions(item),
-            })
-            .collect::<Vec<_>>()
-            .into();
+            });
+        }
+        let hierarchy: Arc<[SolutionNode]> = nodes.into();
         TreeSnapshot {
             solutions: self.items.clone().into(),
             hierarchy,
@@ -92,13 +94,14 @@ impl SolutionService {
     /// 一个 project 的 worktree 层（hierarchy 第三层）：真源 = git
     /// `worktree list --porcelain`（spec: Worktree list comes from git
     /// metadata）。主仓自身条目（path == project root）滤掉；非 git
-    /// 项目或 git 调用失败 → 空层（不阻断快照）。
-    fn worktree_layer(item: &SolutionItem) -> Arc<[WorktreeNode]> {
+    /// 项目或 git 调用失败 → 空层（不阻断快照）。子进程走异步出口
+    /// （阻塞池）—— 列表不占单 worker（change solution-git-offload D1）。
+    async fn worktree_layer(item: &SolutionItem) -> Arc<[WorktreeNode]> {
         let desc = loader::expand_item(item);
         if !desc.is_git {
             return Arc::from([]);
         }
-        let Ok(entries) = crate::git::worktree::list(&desc.root) else {
+        let Ok(entries) = crate::git::worktree::list_async(&desc.root).await else {
             return Arc::from([]);
         };
         let canon = |p: &std::path::Path| {
@@ -118,12 +121,16 @@ impl SolutionService {
     }
 
     /// 信封分发（driver 顺序上下文；未知 kind 拒收落死信，对齐 AgentService）。
-    fn dispatch(&mut self, env: Envelope) {
+    /// 异步 —— git 子进程离载后 handler 可 await（spec: Git work does
+    /// not delay other services）。
+    async fn dispatch(&mut self, env: Envelope) {
         match env.kind {
-            KIND_LOAD => self.on_load(&env),
-            KIND_GET_TREE => self.on_get_tree(&env),
-            KIND_ACTION => self.on_action(&env),
-            KIND_WATCH => self.on_watch(&env),
+            KIND_LOAD => self.on_load(&env).await,
+            KIND_GET_TREE => self.on_get_tree(&env).await,
+            KIND_ACTION => self.on_action(&env).await,
+            KIND_WATCH => self.on_watch(&env).await,
+            // 后台 worktree 完成事件回投自己 (create/delete 落地)
+            KIND_GIT_OP_FINISHED => self.on_git_op_result(&env).await,
             _ => {
                 let _ = self.ctx.messaging.reject(&env);
             }
@@ -155,7 +162,7 @@ impl SolutionService {
 
     /// `load`：加载边界统一入口（启动 restore / 手动切换 / 显式 reload）。
     /// 失败只有结构化 reason，**不覆盖既有状态、不缓存部分树**（spec）。
-    fn on_load(&mut self, env: &Envelope) {
+    async fn on_load(&mut self, env: &Envelope) {
         let Ok(req) = env.downcast::<LoadReq>() else {
             let _ = self.ctx.messaging.reject(env);
             return;
@@ -168,7 +175,7 @@ impl SolutionService {
                 self.workspace_dir = Some(req.workspace_dir.clone());
                 let changed = items != self.items;
                 self.items = items;
-                let snap = self.snapshot();
+                let snap = self.snapshot().await;
                 self.reply_to(env, Ok(snap.clone()));
                 if changed {
                     self.emit(snap);
@@ -178,12 +185,12 @@ impl SolutionService {
     }
 
     /// `get_tree`：镜像补拉（无状态变更）。
-    fn on_get_tree(&self, env: &Envelope) {
+    async fn on_get_tree(&self, env: &Envelope) {
         let Ok(_) = env.downcast::<GetTreeReq>() else {
             let _ = self.ctx.messaging.reject(env);
             return;
         };
-        self.reply_to(env, Ok(self.snapshot()));
+        self.reply_to(env, Ok(self.snapshot().await));
     }
 
     /// `solution.action` — **写入口单点**（design D6）。
@@ -194,17 +201,17 @@ impl SolutionService {
     ///    （实施期定案 C — 不 reject, 见 design D6）
     /// 3. `node` 格式坏 → `reject`；前缀对但无此 solution → `NoSuch`
     ///    （那两条在 `on_create` / `on_configure` 内）
-    fn on_action(&mut self, env: &Envelope) {
+    async fn on_action(&mut self, env: &Envelope) {
         let Ok(req) = env.downcast::<ActionInvoke>() else {
             let _ = self.ctx.messaging.reject(env);
             return;
         };
         match req.action_id.as_str() {
-            ACTION_CREATE => self.on_create(env, &req),
-            ACTION_CONFIGURE_REGISTER | ACTION_CONFIGURE_GIT => self.on_configure(env, &req),
-            ACTION_PULL | ACTION_PUSH => self.on_git_pull_push(env, &req),
-            ACTION_CREATE_WORKTREE => self.on_create_worktree(env, &req),
-            ACTION_DELETE_WORKTREE => self.on_delete_worktree(env, &req),
+            ACTION_CREATE => self.on_create(env, &req).await,
+            ACTION_CONFIGURE_REGISTER | ACTION_CONFIGURE_GIT => self.on_configure(env, &req).await,
+            ACTION_PULL | ACTION_PUSH => self.on_git_pull_push(env, &req).await,
+            ACTION_CREATE_WORKTREE => self.on_create_worktree(env, &req).await,
+            ACTION_DELETE_WORKTREE => self.on_delete_worktree(env, &req).await,
             other => {
                 self.reply_to(env, Err(OpError::UnknownAction(other.to_string())));
             }
@@ -212,10 +219,12 @@ impl SolutionService {
     }
 
     /// pull/push 门控（change solution-git-worktree 3.1, design D2）：
-    /// 双门 —— is_git（解析产出, 同 snapshot 口径）+ tracked-clean
-    /// （untracked 不阻, spike 实证）；不过 → **立即** `OpError` 回执
-    /// （不 spawn, 仓库零改动）。通过 → 接受回执（异步 spawn 在 3.2 接）。
-    fn on_git_pull_push(&mut self, env: &Envelope, invoke: &ActionInvoke) {
+    /// 双门 —— is_git（解析产出, 同 snapshot 口径）留 handle 秒判
+    /// （`.git` 探测 = fs metadata）；tracked-clean（大仓 `git status`
+    /// 可达秒级）与执行一起挪进后台阻塞池（change solution-git-offload
+    /// D2）：秒回 accepted（纯传输应答, 5s 内销账）, **拒绝与执行结果
+    /// 走完成事件 notice** —— 执行好后再反馈, 仓库始终零改动。
+    async fn on_git_pull_push(&mut self, env: &Envelope, invoke: &ActionInvoke) {
         // 目标单源 = node (project://<root>); 格式坏 = 契约 bug → reject
         let Some(root) = parse_project_node(invoke.node.as_deref()) else {
             let _ = self.ctx.messaging.reject(env);
@@ -234,32 +243,22 @@ impl SolutionService {
             ))));
             return;
         }
-        // 门2: tracked-clean (脏 → 拒, 仓库不动)
-        match crate::git::is_tracked_clean(&root) {
-            Ok(true) => {}
-            Ok(false) => {
-                self.reply_to(env, Err(OpError::Git(format!(
-                    "{} 有未提交的 tracked 改动, 先提交再拉取/推送",
-                    root.display()
-                ))));
-                return;
-            }
-            Err(e) => {
-                self.reply_to(env, Err(OpError::Git(e.to_string())));
-                return;
-            }
-        }
-        // 双门通过 → 秒回 accepted (design D1: 5s 内销账, 无死信),
-        // 再 spawn 后台执行 —— 回执在 spawn 之前同步发出, 顺序有保证。
-        self.reply_to(env, Ok(self.snapshot()));
+        // 门2 + 执行全在后台 (design D4 门到执行背靠背); 回执在 spawn
+        // 之前同步发出, 顺序有保证 (design D1: 5s 内销账, 无死信)。
+        self.reply_to(env, Ok(self.snapshot().await));
         self.spawn_git_op(&root, invoke.action_id.as_str());
     }
 
-    /// 后台跑 pull/push, 完成发**无 corr** 的 `KIND_GIT_OP_FINISHED`
-    /// （design D1）：原 corr 已在 accepted 回执销账, 带 corr 迟到 =
-    /// 死信；事件发给 watch 订阅者（GUI pump, task 5.2 按 action_id
-    /// 出 notice）。**操作总是执行** —— 无订阅者只是事件无人收
-    /// （同 `emit` 立场），不得反向阻断 git 本身。
+    /// 后台跑「tracked-clean 门控 + pull/push」，完成发**无 corr** 的
+    /// `KIND_GIT_OP_FINISHED`（design D1）：原 corr 已在 accepted 回执
+    /// 销账, 带 corr 迟到 = 死信；事件直发 watch 订阅者（GUI pump 按
+    /// action_id 出 notice）。
+    ///
+    /// **git 子进程全在阻塞池**（change solution-git-offload D1/D2）：
+    /// 大仓 status 门控与网络 pull/push 都不得占单 worker —— 门控拒绝
+    /// 与执行失败走同一条完成事件链路（spec: outcome SHALL surface as
+    /// a notice）。**操作总是执行** —— 无订阅者只是事件无人收, 不得
+    /// 反向阻断 git 本身。
     fn spawn_git_op(&self, root: &std::path::Path, action_id: &str) {
         let messaging = Arc::clone(&self.ctx.messaging);
         let instance = self.ctx.instance;
@@ -268,11 +267,24 @@ impl SolutionService {
         let target = root.display().to_string();
         let root = root.to_path_buf();
         let fut: TaskFuture = Box::pin(async move {
-            // git 子进程同步跑在本后台任务内 —— 不占 driver 顺序上下文
-            let args: &[&str] = if action_id == ACTION_PULL { &["pull"] } else { &["push"] };
-            let (ok, detail) = match crate::git::run_ok(args, &root) {
-                Ok(_) => (true, String::new()),
-                Err(e) => (false, e.to_string()), // stderr 尾部摘要 (design D6)
+            // 门控 + 执行 = 同一后台任务背靠背 (design D4), 子进程各自
+            // 经异步出口落阻塞池 —— 大仓 status 与网络 pull/push 都不占
+            // 单 worker (D1/D2)
+            // 门2: tracked-clean (脏 → 拒, 仓库零改动)
+            let (ok, detail) = match crate::git::is_tracked_clean_async(&root).await {
+                Ok(false) => (
+                    false,
+                    format!("{target} 有未提交的 tracked 改动, 先提交再拉取/推送"),
+                ),
+                Err(e) => (false, e.to_string()),
+                Ok(true) => {
+                    let args: &[&str] =
+                        if action_id == ACTION_PULL { &["pull"] } else { &["push"] };
+                    match crate::git::run_ok_async(args, &root).await {
+                        Ok(_) => (true, String::new()),
+                        Err(e) => (false, e.to_string()), // stderr 尾部摘要 (design D6)
+                    }
+                }
             };
             let Some(watcher) = watcher else {
                 return; // 无订阅者: 操作已完, 事件无人收
@@ -294,10 +306,12 @@ impl SolutionService {
 
     /// `worktree.create`（4.1）：目标 = `project://<root>`，参数 =
     /// `CreateWorktreeReq{name}`；目录落**已绑定**工作区的
-    /// `.balabala.worktrees/`（design D5 绑定复用 + D4 点前缀）。成功
-    /// 回执 + `TreeChanged`（层级真变了）；非 git 项目 / git 失败 →
-    /// `OpError::Git` 回执，不发树变更。
-    fn on_create_worktree(&mut self, env: &Envelope, invoke: &ActionInvoke) {
+    /// `.balabala.worktrees/`（design D5 绑定复用 + D4 点前缀）。
+    /// **真异步**（change solution-git-offload D3）：廉价校验（node/
+    /// is_git/args/名字消毒/建目录）留 handle 秒拒；秒回 accepted
+    /// （操作前快照），`worktree add` 在阻塞池跑，成功 → 完成事件回投
+    /// 自己 → `TreeChanged`；失败 → 完成事件 notice（同 pull/push 链路）。
+    async fn on_create_worktree(&mut self, env: &Envelope, invoke: &ActionInvoke) {
         let Some(root) = parse_project_node(invoke.node.as_deref()) else {
             let _ = self.ctx.messaging.reject(env);
             return;
@@ -319,6 +333,15 @@ impl SolutionService {
             let _ = self.ctx.messaging.reject(env);
             return;
         };
+        // 名字消毒 = 纯 CPU → 留 handle 秒拒 (`..` 等非法名不等后台);
+        // bg 的 `add` 会再消毒一次 (幂等, 同一份实现)。
+        let sanitized = match crate::git::worktree::sanitize_name(&req.name) {
+            Ok(s) => s,
+            Err(e) => {
+                self.reply_to(env, Err(OpError::Git(e.to_string())));
+                return;
+            }
+        };
         // 目标目录单源 = 绑定工作区 (design D5, 同 create/configure)
         let Some(ws_dir) = self.workspace_dir.clone() else {
             self.reply_to(env, Err(OpError::Persist(NO_BOUND_WORKSPACE.into())));
@@ -332,63 +355,131 @@ impl SolutionService {
             ))));
             return;
         }
-        match crate::git::worktree::add(&root, &parent, &req.name) {
-            Ok(_) => {
-                let snap = self.snapshot();
-                self.reply_to(env, Ok(snap.clone()));
-                self.emit(snap); // 层级真变 → TreeChanged
-            }
-            Err(e) => self.reply_to(env, Err(OpError::Git(e.to_string()))),
-        }
+        // 秒回 accepted = 操作前快照 (层级真变由完成后的 TreeChanged 送达)
+        let snap = self.snapshot().await;
+        self.reply_to(env, Ok(snap));
+        let target = parent.join(&sanitized).display().to_string();
+        let name = req.name.clone();
+        let messaging = Arc::clone(&self.ctx.messaging);
+        let instance = self.ctx.instance;
+        let fut: TaskFuture = Box::pin(async move {
+            // `worktree add` 经异步出口落阻塞池 (D1), 完成回投自己
+            let outcome = crate::git::worktree::add_async(&root, &parent, &name).await;
+            let (ok, detail) = match outcome {
+                Ok(_) => (true, String::new()),
+                Err(e) => (false, e.to_string()),
+            };
+            let _ = messaging.tell(Envelope::new(
+                Route::Instance(instance),
+                Address::instance(instance),
+                KIND_GIT_OP_FINISHED,
+                Payload::new(GitOpFinished {
+                    action_id: ACTION_CREATE_WORKTREE.to_string(),
+                    target,
+                    ok,
+                    detail,
+                }),
+            ));
+        });
+        self.ctx.messaging.spawn_task(fut);
     }
 
     /// `worktree.delete`（4.2）：node = worktree 裸路径（solution-overview
     /// D2: worktree 行用裸路径）。**服务端只跑 git 自己的门** ——
     /// `worktree remove` 无 `--force`，git 内置 `check_clean_worktree`
     /// 当裁判（design D2：先查后删原子, 脏则零字节不动）。会话门在校验1
-    /// 归 view（design D3 路线 A）。成功 → 回执 + `TreeChanged`。
-    fn on_delete_worktree(&mut self, env: &Envelope, invoke: &ActionInvoke) {
+    /// 归 view（design D3 路线 A）。**真异步**（change
+    /// solution-git-offload D3）：秒回 accepted（操作前快照），属主查找
+    /// 与 remove 都在阻塞池；成功 → `TreeChanged`，失败/无此 worktree →
+    /// 完成事件 notice。
+    async fn on_delete_worktree(&mut self, env: &Envelope, invoke: &ActionInvoke) {
         // 裸路径节点 (无前缀): 缺失 = 契约 bug → reject
         let Some(path) = invoke.node.as_deref().map(std::path::PathBuf::from) else {
             let _ = self.ctx.messaging.reject(env);
             return;
         };
-        // 找属主 project: 遍历 git 项目的 worktree 层, 匹配路径
-        let Some(repo_root) = self.items.iter().find_map(|item| {
-            let desc = loader::expand_item(item);
-            if !desc.is_git {
-                return None;
+        // 秒回 accepted = 操作前快照 (删除成功由 TreeChanged 送达)
+        let snap = self.snapshot().await;
+        self.reply_to(env, Ok(snap));
+        // 属主查找 = `git worktree list` 子进程 → 经异步出口落阻塞池
+        // (D1); items 克隆随任务走 (单线程状态纪律: 快照仍在 handle
+        // 重建)。
+        let items = self.items.clone();
+        let messaging = Arc::clone(&self.ctx.messaging);
+        let instance = self.ctx.instance;
+        let fut: TaskFuture = Box::pin(async move {
+            let mut owner: Option<std::path::PathBuf> = None;
+            for item in &items {
+                let desc = loader::expand_item(item);
+                if !desc.is_git {
+                    continue;
+                }
+                let Ok(entries) = crate::git::worktree::list_async(&desc.root).await else {
+                    continue;
+                };
+                let canon = |p: &std::path::Path| {
+                    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+                };
+                if entries.iter().any(|e| canon(&e.path) == canon(&path)) {
+                    owner = Some(desc.root.clone());
+                    break;
+                }
             }
-            let entries = crate::git::worktree::list(&desc.root).ok()?;
-            let canon = |p: &std::path::Path| {
-                std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+            let outcome = match owner {
+                Some(repo_root) => crate::git::worktree::remove_async(&repo_root, &path).await,
+                None => Err(crate::git::GitError::Failed {
+                    code: -1,
+                    stderr: format!("no such worktree: {}", path.display()),
+                }),
             };
-            entries
-                .iter()
-                .any(|e| canon(&e.path) == canon(&path))
-                .then(|| desc.root.clone())
-        }) else {
-            self.reply_to(env, Err(OpError::Git(format!(
-                "no such worktree: {}",
-                path.display()
-            ))));
+            let (ok, detail) = match outcome {
+                Ok(()) => (true, String::new()),
+                Err(e) => (false, e.to_string()), // git 拒绝原话 (脏/locked) 直达 notice
+            };
+            let _ = messaging.tell(Envelope::new(
+                Route::Instance(instance),
+                Address::instance(instance),
+                KIND_GIT_OP_FINISHED,
+                Payload::new(GitOpFinished {
+                    action_id: ACTION_DELETE_WORKTREE.to_string(),
+                    target: path.display().to_string(),
+                    ok,
+                    detail,
+                }),
+            ));
+        });
+        self.ctx.messaging.spawn_task(fut);
+    }
+
+    /// 后台完成事件回投自己后的落地（create/delete 专用；pull/push 直发
+    /// 订阅者不经此路）：成功 → 重建快照发 `TreeChanged`（层级真变），
+    /// 然后把完成事件转发 watch 订阅者（notice 链路, 无 corr）。
+    async fn on_git_op_result(&mut self, env: &Envelope) {
+        let Ok(done) = env.downcast::<GitOpFinished>() else {
+            let _ = self.ctx.messaging.reject(env);
             return;
         };
-        match crate::git::worktree::remove(&repo_root, &path) {
-            Ok(()) => {
-                let snap = self.snapshot();
-                self.reply_to(env, Ok(snap.clone()));
-                self.emit(snap); // 层级真变 → TreeChanged
-            }
-            // git 拒绝原话 (脏/locked/主仓) 直达 notice
-            Err(e) => self.reply_to(env, Err(OpError::Git(e.to_string()))),
+        let stateful = done.ok
+            && (done.action_id == ACTION_CREATE_WORKTREE
+                || done.action_id == ACTION_DELETE_WORKTREE);
+        if stateful && self.watcher.is_some() {
+            let snap = self.snapshot().await;
+            self.emit(snap); // 层级真变 → TreeChanged
+        }
+        if let Some(watcher) = self.watcher {
+            let _ = self.ctx.messaging.tell(Envelope::new(
+                Route::Instance(watcher),
+                Address::instance(self.ctx.instance),
+                KIND_GIT_OP_FINISHED,
+                Payload::new(done.clone()),
+            ));
         }
     }
 
     /// `create`：append simple item + 落盘。幂等（spec: Create idempotent）：
     /// 同 path 已存在 → 原样回执、不重复。写失败 → `Persist` 红条回执 +
     /// **内存变更保留** + 树变更照发（workspace-management 契约）。
-    fn on_create(&mut self, env: &Envelope, invoke: &ActionInvoke) {
+    async fn on_create(&mut self, env: &Envelope, invoke: &ActionInvoke) {
         // 参数在 `args` 里 — 视图构造 typed args (design D6, 与 2.5 同形);
         // 缺失或类型不对 = 契约 bug → reject (`TypeMismatch` 同类)。
         let Some(create_req) = invoke
@@ -402,7 +493,7 @@ impl SolutionService {
         if valid_checker::create_is_noop(&self.items, &create_req.path) {
             // 幂等 no-op (spec: Re-adding an existing solution changes
             // nothing): 不写盘、不发树变更、原样回执
-            self.reply_to(env, Ok(self.snapshot()));
+            self.reply_to(env, Ok(self.snapshot().await));
             return;
         }
         // 未绑定工作区 (load 从未成功) → 无处落盘; **先查再改内存**,
@@ -416,7 +507,7 @@ impl SolutionService {
             register_to_asset_manager: true,
             git_enabled: true,
         });
-        let snap = self.snapshot();
+        let snap = self.snapshot().await;
         match loader::save_items(&ws_dir, &self.items) {
             Ok(()) => {
                 self.reply_to(env, Ok(snap.clone()));
@@ -432,7 +523,7 @@ impl SolutionService {
     /// `configure`：改配置项（None = 不改）。同值重放 = no-op（spec:
     /// Configure idempotent —— 无写盘、无树变更、不 re-trigger handoff）。
     /// 写失败语义同 create（内存保留 + 红条）。
-    fn on_configure(&mut self, env: &Envelope, invoke: &ActionInvoke) {
+    async fn on_configure(&mut self, env: &Envelope, invoke: &ActionInvoke) {
         // 目标单源 = `node` (design D4): 格式坏 = 契约 bug → reject;
         // 前缀对但无此 solution → 用户可见红条 `NoSuch`。
         let Some(target) = parse_solution_node(invoke.node.as_deref()) else {
@@ -459,7 +550,7 @@ impl SolutionService {
         };
         if valid_checker::configure_is_noop(&self.items, &target, register, git) {
             // 幂等 no-op: 状态/文件/交树均不变 (spec), 不发树变更
-            self.reply_to(env, Ok(self.snapshot()));
+            self.reply_to(env, Ok(self.snapshot().await));
             return;
         }
         // 未绑定 → 无处落盘; **先查再改内存** (同 on_create)。
@@ -478,7 +569,7 @@ impl SolutionService {
                 item.set_git_enabled(v);
             }
         }
-        let snap = self.snapshot();
+        let snap = self.snapshot().await;
         match loader::save_items(&ws_dir, &self.items) {
             Ok(()) => {
                 self.reply_to(env, Ok(snap.clone()));
@@ -493,7 +584,7 @@ impl SolutionService {
 
     /// `watch`：树变更订阅握手（订阅身份取信封 `from`）；首次订阅即推
     /// 全量快照（GUI 镜像冷启动零回程，对齐 `AgentService::on_watch`）。
-    fn on_watch(&mut self, env: &Envelope) {
+    async fn on_watch(&mut self, env: &Envelope) {
         let Ok(_) = env.downcast::<WatchReq>() else {
             let _ = self.ctx.messaging.reject(env);
             return;
@@ -501,7 +592,7 @@ impl SolutionService {
         match *env.from.route() {
             Route::Instance(id) => {
                 self.watcher = Some(id);
-                self.emit(self.snapshot());
+                self.emit(self.snapshot().await);
             }
             _ => {
                 let _ = self.ctx.messaging.reject(env);
@@ -516,8 +607,7 @@ impl Service for SolutionService {
     }
 
     fn handle(&mut self, env: Envelope) -> ServiceFuture<'_> {
-        self.dispatch(env);
-        Box::pin(std::future::ready(()))
+        Box::pin(self.dispatch(env))
     }
 }
 
@@ -549,10 +639,11 @@ mod tests {
         root
     }
 
-    /// 同步驱动一条信封 (`handle` 内部即同步 dispatch; 产出的 ready
-    /// future 有意丢弃 — 测试无需 await)。
+    /// 驱动一条信封至完成：`handle` 返回真实 future（snapshot 要 await
+    /// 阻塞池里的 worktree 列表），经 testkit 的 runtime 跑完（change
+    /// solution-git-offload D1）。
     fn drive(svc: &mut SolutionService, env: service_core::Envelope) {
-        std::mem::drop(svc.handle(env));
+        crate::testkit::block_on(svc.handle(env));
     }
 
     /// 取最后一条 KIND_OP_REPLY 回执（多轮 ask 后取最新轮）。
@@ -605,7 +696,7 @@ mod tests {
         let foo = make_project(&ws, "foo");
         std::fs::write(
             loader::solutions_path(&ws),
-            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, foo.display()),
+            serde_json::json!([{"type": "simple", "path": foo}]).to_string(),
         )
         .unwrap();
         let (ctx, msg) = test_ctx(1);
@@ -634,7 +725,7 @@ mod tests {
         // 缺 flag 默认 enabled (spec: legacy item without flags)
         std::fs::write(
             loader::solutions_path(&ws),
-            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, foo.display()),
+            serde_json::json!([{"type": "simple", "path": foo}]).to_string(),
         )
         .unwrap();
         let (ctx, msg) = test_ctx(2);
@@ -749,7 +840,7 @@ mod tests {
         let foo = make_project(&ws, "foo");
         std::fs::write(
             loader::solutions_path(&ws),
-            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, foo.display()),
+            serde_json::json!([{"type": "simple", "path": foo}]).to_string(),
         )
         .unwrap();
         let (ctx, msg) = test_ctx(6);
@@ -836,7 +927,7 @@ mod tests {
         let bar = make_project(&ws, "bar");
         std::fs::write(
             loader::solutions_path(&ws),
-            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, foo.display()),
+            serde_json::json!([{"type": "simple", "path": foo}]).to_string(),
         )
         .unwrap();
         let (ctx, msg) = test_ctx(3);
@@ -854,7 +945,7 @@ mod tests {
         let qux = make_project(&ws2, "qux");
         std::fs::write(
             loader::solutions_path(&ws2),
-            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, qux.display()),
+            serde_json::json!([{"type": "simple", "path": qux}]).to_string(),
         )
         .unwrap();
         drive(&mut svc, ask_env(KIND_LOAD, LoadReq { workspace_dir: ws2 }));
@@ -928,7 +1019,7 @@ mod tests {
         // 先写入合法 solutions 文件并重载 (load 需真实文件)
         std::fs::write(
             loader::solutions_path(&ws),
-            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, foo.display()),
+            serde_json::json!([{"type": "simple", "path": foo}]).to_string(),
         )
         .unwrap();
         drive(&mut svc, ask_env(
@@ -982,12 +1073,11 @@ mod tests {
         // foo 关注册, bar 开 — 缺省双 true 的反面对照
         std::fs::write(
             loader::solutions_path(&ws),
-            format!(
-                r#"[{{"type": "simple", "path": "{}", "register_to_asset_manager": false}},
-                  {{"type": "simple", "path": "{}"}}]"#,
-                foo.display(),
-                bar.display()
-            ),
+            serde_json::json!([
+                {"type": "simple", "path": foo, "register_to_asset_manager": false},
+                {"type": "simple", "path": bar}
+            ])
+            .to_string(),
         )
         .unwrap();
         let (ctx, msg) = test_ctx(6);
@@ -1013,11 +1103,17 @@ mod tests {
         assert_eq!(snap.handoff().projects.len(), 2, "enable 后下次交树出现 (不重启)");
     }
 
+    /// 测试 setup 同步驱动 git 出口：异步出口 + testkit executor（同步
+    /// git 已模块私有，change solution-git-offload D1 的编译期墙）。
+    fn git_ok(args: &[&str], cwd: &std::path::Path) -> Result<String, crate::git::GitError> {
+        crate::testkit::block_on(crate::git::run_ok_async(args, cwd))
+    }
+
     /// 造一个真实 git 仓项目（simple item path 必须存在且是 git 目录）。
     fn make_git_project(ws: &std::path::Path, name: &str) -> PathBuf {
         let root = make_project(ws, name);
         let g = |args: &[&str]| {
-            crate::git::run_ok(args, &root).unwrap_or_else(|e| panic!("git {args:?}: {e}"))
+            git_ok(args, &root).unwrap_or_else(|e| panic!("git {args:?}: {e}"))
         };
         g(&["init", "-q"]);
         g(&["config", "user.email", "t@t"]);
@@ -1040,30 +1136,35 @@ mod tests {
         )
     }
 
-    /// change solution-git-worktree 3.1 验证：门控三态 ——
-    /// 干净仓接受 / tracked 脏拒（且仓库零改动）/ 非 git 项目拒。
+    /// change solution-git-worktree 3.1 + solution-git-offload D2 验证：
+    /// 门控三态 —— 干净仓接受 / tracked 脏**接受后由后台门控拒**（完成
+    /// 事件 notice, 仓库零改动）/ 非 git 项目拒（同步, 秒判）。
     #[test]
     fn pull_push_gate_three_states() {
+        use crate::contract::{KIND_GIT_OP_FINISHED, WatchReq, KIND_WATCH};
+
         let ws = temp_ws("pull-gate"); // 不得与 registration_gate_scenarios 撞名 (同 pid 同目录, 并行互踩)
         let clean = make_git_project(&ws, "clean");
         let dirty = make_git_project(&ws, "dirty");
         let plain = make_project(&ws, "plain"); // 非 git
         std::fs::write(
             loader::solutions_path(&ws),
-            format!(
-                r#"[{{"type": "simple", "path": "{}"}}, {{"type": "simple", "path": "{}"}}, {{"type": "simple", "path": "{}"}}]"#,
-                clean.display(),
-                dirty.display(),
-                plain.display()
-            ),
+            serde_json::json!([
+                {"type": "simple", "path": clean},
+                {"type": "simple", "path": dirty},
+                {"type": "simple", "path": plain}
+            ])
+            .to_string(),
         )
         .unwrap();
         let (ctx, msg) = test_ctx(7);
         let mut svc = SolutionService::new(ctx);
+        // 订阅完成事件 (门控拒绝 = notice, 只发订阅者)
+        drive(&mut svc, ask_env(KIND_WATCH, WatchReq));
         drive(&mut svc, ask_env(KIND_LOAD, LoadReq { workspace_dir: ws.clone() }));
         assert!(last_reply(&msg).is_ok(), "load 应成功");
 
-        // 态1: 干净 git 仓 → 接受 (Ok 回执, 未 spawn —— 3.2 才接)
+        // 态1: 干净 git 仓 → 接受 (Ok 回执; 门控 + 执行在后台)
         drive(&mut svc, git_op_env(&clean, ACTION_PULL));
         assert!(
             last_reply(&msg).is_ok(),
@@ -1071,18 +1172,34 @@ mod tests {
             last_reply(&msg)
         );
 
-        // 态2: tracked 脏 → 拒, 且仓库零改动 (门控不碰仓)
+        // 态2: tracked 脏 → **秒回 accepted**, 后台门控拒 → 完成事件
+        // notice (执行好后再反馈), 且仓库零改动 (门控不碰仓)
         std::fs::write(dirty.join("f.txt"), "v2-uncommitted").unwrap();
-        let status_before = crate::git::run_ok(&["status", "--porcelain"], &dirty).unwrap();
+        let status_before = git_ok(&["status", "--porcelain"], &dirty).unwrap();
         drive(&mut svc, git_op_env(&dirty, ACTION_PUSH));
-        match last_reply(&msg) {
-            Err(OpError::Git(m)) => assert!(m.contains("未提交"), "红条点名 tracked 改动: {m}"),
-            other => panic!("tracked 脏应拒: {other:?}"),
-        }
-        let status_after = crate::git::run_ok(&["status", "--porcelain"], &dirty).unwrap();
+        assert!(
+            last_reply(&msg).is_ok(),
+            "门控后台化 → accepted 先回: {:?}",
+            last_reply(&msg)
+        );
+        msg.drive_spawned(); // 门控 + 执行跑完
+        let refusal = msg
+            .sent()
+            .into_iter()
+            .filter(|e| e.kind == KIND_GIT_OP_FINISHED)
+            .filter_map(|e| e.downcast::<crate::contract::GitOpFinished>().ok().cloned())
+            .find(|d| d.action_id == ACTION_PUSH && d.target == dirty.display().to_string())
+            .expect("脏仓应有完成事件");
+        assert!(!refusal.ok, "门控拒 → ok=false");
+        assert!(
+            refusal.detail.contains("未提交"),
+            "拒绝文案点名 tracked 改动: {}",
+            refusal.detail
+        );
+        let status_after = git_ok(&["status", "--porcelain"], &dirty).unwrap();
         assert_eq!(status_before, status_after, "拒时仓库必须零改动");
 
-        // 态3: 非 git 项目 → 拒
+        // 态3: 非 git 项目 → 拒 (同步秒判, 不 spawn)
         drive(&mut svc, git_op_env(&plain, ACTION_PULL));
         match last_reply(&msg) {
             Err(OpError::Git(m)) => assert!(m.contains("不是 git"), "红条点名非 git: {m}"),
@@ -1106,7 +1223,7 @@ mod tests {
             .count();
         assert_eq!(
             replies, 4,
-            "四次回执 (load + 接受 + 两拒), 第五发应 reject 无回执"
+            "四次回执 (load + 两接受 + 一拒), 第五发应 reject 无回执"
         );
     }
 
@@ -1120,7 +1237,7 @@ mod tests {
         let repo = make_git_project(&ws, "repo");
         std::fs::write(
             loader::solutions_path(&ws),
-            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, repo.display()),
+            serde_json::json!([{"type": "simple", "path": repo}]).to_string(),
         )
         .unwrap();
         let (ctx, msg) = test_ctx(8);
@@ -1178,10 +1295,10 @@ mod tests {
         let ws2 = temp_ws("async-ok");
         let remote = ws2.join("remote.git");
         std::fs::create_dir_all(&remote).unwrap();
-        crate::git::run_ok(&["init", "-q", "--bare"], &remote).unwrap();
+        git_ok(&["init", "-q", "--bare"], &remote).unwrap();
         let src = ws2.join("src");
         std::fs::create_dir_all(&src).unwrap();
-        let g = |args: &[&str]| crate::git::run_ok(args, &src).unwrap();
+        let g = |args: &[&str]| git_ok(args, &src).unwrap();
         g(&["init", "-q"]);
         g(&["config", "user.email", "t@t"]);
         g(&["config", "user.name", "t"]);
@@ -1192,7 +1309,7 @@ mod tests {
         g(&["push", "-q", "-u", "origin", "HEAD"]);
         std::fs::write(
             loader::solutions_path(&ws2),
-            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, src.display()),
+            serde_json::json!([{"type": "simple", "path": src}]).to_string(),
         )
         .unwrap();
         let (ctx2, msg2) = test_ctx(80);
@@ -1223,14 +1340,14 @@ mod tests {
         let ws = temp_ws("file-remote");
         let remote = ws.join("remote.git");
         std::fs::create_dir_all(&remote).unwrap();
-        crate::git::run_ok(&["init", "-q", "--bare"], &remote).unwrap();
+        git_ok(&["init", "-q", "--bare"], &remote).unwrap();
         let remote_url = format!("file://{}", remote.display());
 
         // 主仓: c1 + push -u origin HEAD
         let repo = ws.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let g = |args: &[&str]| {
-            crate::git::run_ok(args, &repo).unwrap_or_else(|e| panic!("git {args:?}: {e}"))
+            git_ok(args, &repo).unwrap_or_else(|e| panic!("git {args:?}: {e}"))
         };
         g(&["init", "-q"]);
         g(&["config", "user.email", "t@t"]);
@@ -1245,10 +1362,10 @@ mod tests {
 
         // peer 仓: 推 c2 → 主仓落后 (behind)
         let peer = ws.join("peer");
-        crate::git::run_ok(&["clone", "-q", remote_url.as_str(), &peer.to_string_lossy()], &ws)
+        git_ok(&["clone", "-q", remote_url.as_str(), &peer.to_string_lossy()], &ws)
             .expect("clone 应成功");
         let pg = |args: &[&str]| {
-            crate::git::run_ok(args, &peer).unwrap_or_else(|e| panic!("peer git {args:?}: {e}"))
+            git_ok(args, &peer).unwrap_or_else(|e| panic!("peer git {args:?}: {e}"))
         };
         pg(&["config", "user.email", "t@t"]);
         pg(&["config", "user.name", "t"]);
@@ -1261,7 +1378,7 @@ mod tests {
 
         std::fs::write(
             loader::solutions_path(&ws),
-            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, repo.display()),
+            serde_json::json!([{"type": "simple", "path": repo}]).to_string(),
         )
         .unwrap();
         let (ctx, msg) = test_ctx(9);
@@ -1301,7 +1418,7 @@ mod tests {
         msg.drive_spawned();
         let b = last_fin(&msg);
         assert!(b.ok, "push 应成功: {}", b.detail);
-        let remote_tip = crate::git::run_ok(
+        let remote_tip = git_ok(
             &["-C", &remote.to_string_lossy(), "rev-parse", &format!("refs/heads/{branch}")],
             &ws,
         )
@@ -1361,6 +1478,53 @@ mod tests {
             .unwrap_or_else(|| panic!("快照里应有 project {}", root.display()))
     }
 
+    /// 跑后台任务, 并把**回投自己**的完成事件驱动回 handle
+    /// (create/delete 的落地在 handle: TreeChanged + 转发订阅者 ——
+    /// 模拟 driver 收信)。只驱动本次新增的信封 (mark 起点), 避免重复
+    /// 落地旧事件。
+    fn drive_bg(svc: &mut SolutionService, msg: &TestMessaging, self_id: u64) {
+        use crate::contract::KIND_GIT_OP_FINISHED;
+        let mark = msg.sent().len();
+        msg.drive_spawned();
+        for env in msg.sent().into_iter().skip(mark) {
+            let to_self = matches!(
+                env.to,
+                service_core::Route::Instance(id) if id.0 == self_id
+            );
+            if env.kind == KIND_GIT_OP_FINISHED && to_self {
+                drive(svc, env);
+            }
+        }
+    }
+
+    /// 最后一条 TreeChanged 的快照 (层级真变的落地载体)。
+    fn last_tree_changed(msg: &TestMessaging) -> TreeSnapshot {
+        msg.sent()
+            .into_iter()
+            .rev()
+            .find(|e| e.kind == crate::contract::KIND_TREE_CHANGED)
+            .expect("应有 TreeChanged")
+            .downcast::<crate::contract::TreeChanged>()
+            .expect("TreeChanged 载荷")
+            .0
+            .clone()
+    }
+
+    /// 按 action_id + target 取完成事件 (载荷克隆; watcher 转发与回投
+    /// 自己的原件同载荷, 任取其一)。
+    fn find_fin(msg: &TestMessaging, action_id: &str, target: &str) -> crate::contract::GitOpFinished {
+        // 取**最后**一条匹配: 同 target 先拒后成时, 成功在后
+        msg.sent()
+            .into_iter()
+            .filter(|e| e.kind == crate::contract::KIND_GIT_OP_FINISHED)
+            .filter_map(|e| e.downcast::<crate::contract::GitOpFinished>().ok().cloned())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .find(|d| d.action_id == action_id && d.target == target)
+            .unwrap_or_else(|| panic!("应有完成事件 {action_id} / {target}"))
+    }
+
     /// change solution-git-worktree 4.1 验证：create 后快照见第三层、
     /// 目录落在 `.balabala.worktrees` 下、非 git 项目拒。
     #[test]
@@ -1372,11 +1536,11 @@ mod tests {
         let plain = make_project(&ws, "plain");
         std::fs::write(
             loader::solutions_path(&ws),
-            format!(
-                r#"[{{"type": "simple", "path": "{}"}}, {{"type": "simple", "path": "{}"}}]"#,
-                git_p.display(),
-                plain.display()
-            ),
+            serde_json::json!([
+                {"type": "simple", "path": git_p},
+                {"type": "simple", "path": plain}
+            ])
+            .to_string(),
         )
         .unwrap();
         let (ctx, msg) = test_ctx(10);
@@ -1391,11 +1555,19 @@ mod tests {
             .filter(|e| e.kind == KIND_TREE_CHANGED)
             .count();
 
-        // 建
+        // 建 (真异步): 秒回 accepted = 操作前快照, 层级未变
         drive(&mut svc, create_wt_env(&git_p, "feature-x"));
-        let snap = last_reply(&msg).expect("create 应成功");
+        let snap = last_reply(&msg).expect("create 应 accepted");
+        assert!(
+            wt_layer(&snap, &git_p).is_empty(),
+            "accepted 是操作前快照 (层级真变由后续 TreeChanged 送达)"
+        );
+
+        // 后台 add 跑完 + 回投落地 → TreeChanged 带新层级
+        drive_bg(&mut svc, &msg, 10);
+        let snap = last_tree_changed(&msg);
         let layer = wt_layer(&snap, &git_p);
-        assert_eq!(layer.len(), 1, "快照应见第三层");
+        assert_eq!(layer.len(), 1, "TreeChanged 快照应见第三层");
         assert_eq!(layer[0].branch.as_deref(), Some("feature-x"));
         assert_eq!(layer[0].actions[0].id, crate::contract::ACTION_DELETE_WORKTREE);
         // 目录落 workspace/.balabala.worktrees 下 (design D4 点前缀)
@@ -1410,7 +1582,7 @@ mod tests {
             .count();
         assert!(tells_after > tells_before, "create 成功应发 TreeChanged");
 
-        // 非 git 项目拒, 零副作用
+        // 非 git 项目拒 (廉价校验留 handle 秒拒), 零副作用
         drive(&mut svc, create_wt_env(&plain, "nope"));
         match last_reply(&msg) {
             Err(OpError::Git(m)) => assert!(m.contains("不是 git"), "{m}"),
@@ -1423,12 +1595,14 @@ mod tests {
 
         // 目录名消毒穿透: `feature/y` → `feature-y` (design D4)
         drive(&mut svc, create_wt_env(&git_p, "feature/y"));
-        assert!(last_reply(&msg).is_ok(), "斜杠名应消毒后成功");
+        assert!(last_reply(&msg).is_ok(), "斜杠名应 accepted");
+        drive_bg(&mut svc, &msg, 10);
         assert!(
             ws.join(crate::contract::WORKTREES_DIR).join("feature-y").is_dir(),
             "斜杠折叠落盘"
         );
-        // 消毒后不可穿越: `..` 名直接拒, 不逃出 worktrees 目录
+        // 消毒后不可穿越: `..` 名直接拒 (纯 CPU 消毒留 handle 秒拒),
+        // 不逃出 worktrees 目录
         drive(&mut svc, create_wt_env(&git_p, ".."));
         assert!(matches!(last_reply(&msg), Err(OpError::Git(_))), "`..` 应拒");
     }
@@ -1443,7 +1617,7 @@ mod tests {
         let repo = make_git_project(&ws, "repo");
         std::fs::write(
             loader::solutions_path(&ws),
-            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, repo.display()),
+            serde_json::json!([{"type": "simple", "path": repo}]).to_string(),
         )
         .unwrap();
         let (ctx, msg) = test_ctx(11);
@@ -1451,11 +1625,13 @@ mod tests {
         drive(&mut svc, ask_env(KIND_WATCH, WatchReq));
         drive(&mut svc, ask_env(KIND_LOAD, LoadReq { workspace_dir: ws.clone() }));
         drive(&mut svc, create_wt_env(&repo, "doomed"));
-        let snap = last_reply(&msg).expect("create 应成功");
+        drive_bg(&mut svc, &msg, 11); // create 落地 → TreeChanged 带新层级
+        let snap = last_tree_changed(&msg);
         let wt_path = wt_layer(&snap, &repo)[0].path.clone();
         assert!(wt_path.is_dir());
 
-        // 脏树 → git 拒 (原话直达 OpError::Git), 目录原封, 不发 TreeChanged
+        // 脏树 → git 拒: 秒回 accepted, 后台 git 原话走完成事件 notice,
+        // 目录原封, 不发 TreeChanged
         let tells_before = msg
             .sent()
             .iter()
@@ -1463,13 +1639,19 @@ mod tests {
             .count();
         std::fs::write(wt_path.join("dirty.txt"), "x").unwrap();
         drive(&mut svc, delete_wt_env(&wt_path));
-        match last_reply(&msg) {
-            Err(OpError::Git(m)) => assert!(
-                m.contains("modified or untracked"),
-                "git 判例原话应直达: {m}"
-            ),
-            other => panic!("脏树应被 git 拒: {other:?}"),
-        }
+        assert!(last_reply(&msg).is_ok(), "门控后台化 → accepted 先回");
+        drive_bg(&mut svc, &msg, 11);
+        let refusal = find_fin(
+            &msg,
+            crate::contract::ACTION_DELETE_WORKTREE,
+            &wt_path.display().to_string(),
+        );
+        assert!(!refusal.ok, "脏树应被 git 拒");
+        assert!(
+            refusal.detail.contains("modified or untracked"),
+            "git 判例原话应直达: {}",
+            refusal.detail
+        );
         assert!(wt_path.is_dir(), "被拒后目录必须原封");
         let tells_mid = msg
             .sent()
@@ -1478,10 +1660,18 @@ mod tests {
             .count();
         assert_eq!(tells_mid, tells_before, "拒时不发 TreeChanged");
 
-        // 干净 → 删净 + 快照不再列出 + TreeChanged
+        // 干净 → 删净 + TreeChanged 快照不再列出
         std::fs::remove_file(wt_path.join("dirty.txt")).unwrap();
         drive(&mut svc, delete_wt_env(&wt_path));
-        let snap = last_reply(&msg).expect("干净树应删净");
+        assert!(last_reply(&msg).is_ok(), "干净树应 accepted");
+        drive_bg(&mut svc, &msg, 11);
+        let done = find_fin(
+            &msg,
+            crate::contract::ACTION_DELETE_WORKTREE,
+            &wt_path.display().to_string(),
+        );
+        assert!(done.ok, "干净树应删净: {}", done.detail);
+        let snap = last_tree_changed(&msg);
         assert!(wt_layer(&snap, &repo).is_empty(), "快照不再列出");
         assert!(!wt_path.exists(), "目录删净");
         let tells_after = msg
@@ -1491,11 +1681,76 @@ mod tests {
             .count();
         assert!(tells_after > tells_mid, "删除成功应发 TreeChanged");
 
-        // 不存在的 worktree → structured 拒
-        drive(&mut svc, delete_wt_env(&ws.join("ghost")));
+        // 不存在的 worktree → accepted 后台拒, 结构化原因走完成事件
+        let ghost = ws.join("ghost");
+        drive(&mut svc, delete_wt_env(&ghost));
+        assert!(last_reply(&msg).is_ok(), "幽灵路径也先 accepted");
+        drive_bg(&mut svc, &msg, 11);
+        let gone = find_fin(
+            &msg,
+            crate::contract::ACTION_DELETE_WORKTREE,
+            &ghost.display().to_string(),
+        );
+        assert!(!gone.ok);
         assert!(
-            matches!(last_reply(&msg), Err(OpError::Git(m)) if m.contains("no such worktree")),
-            "幽灵路径应结构化拒"
+            gone.detail.contains("no such worktree"),
+            "结构化原因: {}",
+            gone.detail
+        );
+    }
+
+    /// change solution-git-offload 4.1 验证：git 子进程**不在**驱动
+    /// `handle` 的线程上执行 —— 门闩卡住 `git worktree list` 入口, 分别
+    /// 记录 ① 驱动线程 ② 实际执行 git 的线程, 两者必须不同（asset-
+    /// service `offload_tests` 同款判据; 看门狗 3s 自动放行防挂死）。
+    #[test]
+    fn offload_git_subprocess_runs_off_the_driver_thread() {
+        use std::time::Duration;
+
+        let ws = temp_ws("offload");
+        let repo = make_git_project(&ws, "repo");
+        std::fs::write(
+            loader::solutions_path(&ws),
+            serde_json::json!([{"type": "simple", "path": repo}]).to_string(),
+        )
+        .unwrap();
+        let (ctx, msg) = test_ctx(13);
+        let mut svc = SolutionService::new(ctx);
+        drive(&mut svc, ask_env(KIND_LOAD, LoadReq { workspace_dir: ws.clone() }));
+        assert!(last_reply(&msg).is_ok(), "load 应成功");
+        let replies_before = msg
+            .sent()
+            .iter()
+            .filter(|e| e.kind == KIND_OP_REPLY)
+            .count();
+
+        // 上闩 → 在独立线程上驱动 get_tree（该线程扮演 driver 角色）
+        crate::git::probe::arm(&repo);
+        let driver = std::thread::spawn(move || {
+            let tid = std::thread::current().id();
+            drive(&mut svc, ask_env(KIND_GET_TREE, GetTreeReq));
+            tid
+        });
+
+        // 命中线程 = 实际跑 git 的线程（正确实现 = 阻塞池线程）
+        let git_thread = crate::git::probe::wait_hit(Duration::from_secs(3))
+            .expect("git 子进程应在门闩处命中");
+        crate::git::probe::release();
+        let driver_thread = driver.join().expect("drive 应完成");
+        assert_ne!(
+            git_thread, driver_thread,
+            "git 子进程不得在驱动 handle 的线程上执行"
+        );
+        // 离载不改语义: get_tree 回执照常到达
+        let replies_after = msg
+            .sent()
+            .iter()
+            .filter(|e| e.kind == KIND_OP_REPLY)
+            .count();
+        assert_eq!(
+            replies_after,
+            replies_before + 1,
+            "get_tree 回执应到达"
         );
     }
 
@@ -1503,20 +1758,22 @@ mod tests {
     /// 应用**外**注册的 worktree 也出现在其 project 下。
     #[test]
     fn snapshot_lists_worktrees_registered_outside_the_app() {
-        use crate::contract::{WatchReq, KIND_WATCH};
-
         let ws = temp_ws("wt-external");
         let repo = make_git_project(&ws, "repo");
         std::fs::write(
             loader::solutions_path(&ws),
-            format!(r#"[{{"type": "simple", "path": "{}"}}]"#, repo.display()),
+            serde_json::json!([{"type": "simple", "path": repo}]).to_string(),
         )
         .unwrap();
         // 应用外: 直接用 git 命令注册 (绕过服务)
         let ext_parent = ws.join(crate::contract::WORKTREES_DIR);
         std::fs::create_dir_all(&ext_parent).unwrap();
-        crate::git::worktree::add(&repo, &ext_parent, "external-one")
-            .expect("应用外注册应成功");
+        crate::testkit::block_on(crate::git::worktree::add_async(
+            &repo,
+            &ext_parent,
+            "external-one",
+        ))
+        .expect("应用外注册应成功");
 
         let (ctx, msg) = test_ctx(12);
         let mut svc = SolutionService::new(ctx);

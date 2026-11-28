@@ -86,7 +86,7 @@ pub fn sanitize_name(raw: &str) -> Result<String, GitError> {
 ///
 /// 不带分支参数 —— git 按目录 basename 自建/检出同名分支（create 表单
 /// 的 ref 参数属 design OQ2, 落地时再开）。
-pub fn add(repo_root: &Path, parent: &Path, raw_name: &str) -> Result<PathBuf, GitError> {
+fn add(repo_root: &Path, parent: &Path, raw_name: &str) -> Result<PathBuf, GitError> {
     let name = sanitize_name(raw_name)?;
     let dest = parent.join(&name);
     run_ok(&["worktree", "add", &dest.to_string_lossy()], repo_root)?;
@@ -96,7 +96,7 @@ pub fn add(repo_root: &Path, parent: &Path, raw_name: &str) -> Result<PathBuf, G
 }
 
 /// `git worktree list --porcelain` 解析（含应用外注册的条目）。
-pub fn list(repo_root: &Path) -> Result<Vec<WorktreeEntry>, GitError> {
+fn list(repo_root: &Path) -> Result<Vec<WorktreeEntry>, GitError> {
     let out = run(&["worktree", "list", "--porcelain"], repo_root)?;
     if out.code != 0 {
         return Err(GitError::Failed {
@@ -110,12 +110,40 @@ pub fn list(repo_root: &Path) -> Result<Vec<WorktreeEntry>, GitError> {
 /// `git worktree remove <path>`（**无 `--force`**）：git 内置
 /// `check_clean_worktree` 当门 —— 脏树/locked/校验失败 → [`GitError::Failed`]
 /// 携带 git 原话，且先查后删原子（脏则一个字节不动）。
-pub fn remove(repo_root: &Path, worktree_path: &Path) -> Result<(), GitError> {
+fn remove(repo_root: &Path, worktree_path: &Path) -> Result<(), GitError> {
     run_ok(
         &["worktree", "remove", &worktree_path.to_string_lossy()],
         repo_root,
     )?;
     Ok(())
+}
+
+/// 异步出口：`git worktree add` 在**阻塞池**执行（不占单 worker，
+/// change solution-git-offload design D1 —— 模块外只拿得到本函数）。
+pub async fn add_async(repo_root: &Path, parent: &Path, raw_name: &str) -> Result<PathBuf, GitError> {
+    let repo_root = repo_root.to_path_buf();
+    let parent = parent.to_path_buf();
+    let raw_name = raw_name.to_string();
+    tokio::task::spawn_blocking(move || add(&repo_root, &parent, &raw_name))
+        .await
+        .map_err(|e| GitError::Spawn(format!("git task: {e}")))?
+}
+
+/// 异步出口：`git worktree list` 的阻塞池版（见 [`add_async`]）。
+pub async fn list_async(repo_root: &Path) -> Result<Vec<WorktreeEntry>, GitError> {
+    let repo_root = repo_root.to_path_buf();
+    tokio::task::spawn_blocking(move || list(&repo_root))
+        .await
+        .map_err(|e| GitError::Spawn(format!("git task: {e}")))?
+}
+
+/// 异步出口：`git worktree remove` 的阻塞池版（见 [`add_async`]）。
+pub async fn remove_async(repo_root: &Path, worktree_path: &Path) -> Result<(), GitError> {
+    let repo_root = repo_root.to_path_buf();
+    let worktree_path = worktree_path.to_path_buf();
+    tokio::task::spawn_blocking(move || remove(&repo_root, &worktree_path))
+        .await
+        .map_err(|e| GitError::Spawn(format!("git task: {e}")))?
 }
 
 /// porcelain 文本 → 条目（空行分块；未知字段容忍跳过, 保向前兼容）。
@@ -242,6 +270,30 @@ mod tests {
         remove(&main, &dest).expect("干净删应成功 (dest 同样带前缀)");
         assert!(!dest.exists(), "目录应删净");
         std::fs::remove_dir_all(&parent).ok();
+    }
+
+    /// 任务 1.2 验证: 异步出口在 runtime 上下文跑通（add → list → remove）。
+    #[test]
+    fn async_entries_run_through_blocking_pool() {
+        crate::testkit::block_on(async {
+            let main = repo("async-entry");
+            let parent = main.join(".balabala.worktrees");
+            std::fs::create_dir_all(&parent).unwrap();
+
+            let dest = add_async(&main, &parent, "async-x")
+                .await
+                .expect("add_async 应成功");
+            assert!(dest.is_dir(), "worktree 目录应存在");
+
+            let entries = list_async(&main).await.expect("list_async 应成功");
+            let same = |e: &WorktreeEntry| {
+                std::fs::canonicalize(&e.path).unwrap_or_else(|_| e.path.clone()) == dest
+            };
+            assert!(entries.iter().any(same), "list 应见新条目");
+
+            remove_async(&main, &dest).await.expect("remove_async 应成功");
+            assert!(!dest.exists(), "目录应删净");
+        });
     }
 
     /// 消毒: 斜杠折叠 / Windows 非法字符 / 拒 .. 与绝对路径。

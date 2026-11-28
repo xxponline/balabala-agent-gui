@@ -15,3 +15,9 @@ contracts = { path = "../contracts" }
 # wire 载荷走 Payload::Typed 零拷贝, 仅文件 DTO 用 serde)。
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# git 子进程必须走阻塞池 (change solution-git-offload, design D1) —
+# runtime 是 worker_threads(1)，同步 `Command::output()` 扛不住大仓 status。
+# **features 与 agent-service / asset-service / service-manager /
+# service-plugin / example-plugin 完全一致**（同一编译单元；否则 TypeId
+# 分叉 —— 那几处 Cargo.toml 注释已反复强调）。
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }

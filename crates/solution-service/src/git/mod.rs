@@ -4,6 +4,15 @@
 //! 防挂三件套 —— `stdin = null`（绝不读输入）、`GIT_TERMINAL_PROMPT=0`
 //! + `GIT_ASKPASS=:`（凭证请求即失败而非挂死后台任务）、stderr 截断
 //! **保留尾部**（git 的错误信息在尾部）。
+//!
+//! # 无 git 在 worker 上（change solution-git-offload, design D1）
+//!
+//! layer runtime 是 `worker_threads(1)`，同步 `Command::output()` 会占住
+//! 唯一 worker —— 大仓一次 `git status` 冻结整层（spec: Git work does
+//! not delay other services）。因此同步实现（[`run`] / [`run_ok`] /
+//! [`is_tracked_clean`]）**模块外不可见**：模块外只拿得到异步出口
+//! （[`run_async`] / [`run_ok_async`] / [`is_tracked_clean_async`]），
+//! 子进程落在 `spawn_blocking` 阻塞池，编译期钉死这条规则。
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -54,13 +63,13 @@ pub mod worktree;
 
 /// 跑 `git <args>` 于 `cwd`：spawn 失败 → [`GitError::Spawn`]；否则
 /// 返回产出（**不**把非零退出当错误 —— 门控类调用要读 code/stderr 自行裁决）。
-pub fn run(args: &[&str], cwd: &Path) -> Result<GitOutput, GitError> {
+fn run(args: &[&str], cwd: &Path) -> Result<GitOutput, GitError> {
     run_program("git", args, cwd)
 }
 
 /// 跑 `git <args>` 并要求退出码 0：成功返回 stdout；非零 →
 /// [`GitError::Failed`]（携带尾部 stderr）。
-pub fn run_ok(args: &[&str], cwd: &Path) -> Result<String, GitError> {
+fn run_ok(args: &[&str], cwd: &Path) -> Result<String, GitError> {
     let out = run(args, cwd)?;
     if out.code == 0 {
         Ok(out.stdout)
@@ -78,7 +87,7 @@ pub fn run_ok(args: &[&str], cwd: &Path) -> Result<String, GitError> {
 /// **只看 tracked 改动** —— untracked（含应用自建的 `.balabala.worktrees/`，
 /// spike 实证它会出现在主仓 porcelain）不阻断 pull/push；非 git 目录或
 /// status 失败 → `Err`（按不干净处理, 门控侧走拒绝路径）。
-pub fn is_tracked_clean(root: &Path) -> Result<bool, GitError> {
+fn is_tracked_clean(root: &Path) -> Result<bool, GitError> {
     let out = run(&["status", "--porcelain", "--untracked-files=no"], root)?;
     if out.code != 0 {
         return Err(GitError::Failed {
@@ -89,11 +98,49 @@ pub fn is_tracked_clean(root: &Path) -> Result<bool, GitError> {
     Ok(out.stdout.trim().is_empty())
 }
 
+/// 异步出口：`git <args>` 于 `cwd`，子进程在**阻塞池**执行（不占单
+/// worker，spec: Git work does not delay other services）。
+pub async fn run_async(args: &[&str], cwd: &Path) -> Result<GitOutput, GitError> {
+    let args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+    let cwd = cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        run(&borrowed, &cwd)
+    })
+    .await
+    .map_err(|e| GitError::Spawn(format!("git task: {e}")))?
+}
+
+/// 异步出口：[`run_ok`] 的阻塞池版（见 [`run_async`] 的规则说明）。
+pub async fn run_ok_async(args: &[&str], cwd: &Path) -> Result<String, GitError> {
+    let args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+    let cwd = cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_ok(&borrowed, &cwd)
+    })
+    .await
+    .map_err(|e| GitError::Spawn(format!("git task: {e}")))?
+}
+
+/// 异步出口：[`is_tracked_clean`] 的阻塞池版（大仓 status 是五个占线点
+/// 里最慢的一个 —— 门控也必须离 worker，change solution-git-offload D2）。
+pub async fn is_tracked_clean_async(root: &Path) -> Result<bool, GitError> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || is_tracked_clean(&root))
+        .await
+        .map_err(|e| GitError::Spawn(format!("git task: {e}")))?
+}
+
 /// 实际执行（`program` 可注入, 供「二进制缺失」路径单测）。
 ///
 /// 防挂三件套全在这一处（design D6）：stdin null、`GIT_TERMINAL_PROMPT=0`、
 /// `GIT_ASKPASS=:`。
 fn run_program(program: &str, args: &[&str], cwd: &Path) -> Result<GitOutput, GitError> {
+    // 门闩探针 (cfg(test), change solution-git-offload 4.1): 卡住目标
+    // cwd 的子进程入口并记录执行线程 —— 离载断言用, 正常构建无此句。
+    #[cfg(test)]
+    probe::on_run(cwd);
     // `\\?\` 扩展长度前缀: Rust fs 认, git (MSYS) 不认 —— argv 里的
     // `\\?\D:\x` 会被转成 `//?/D:/x` → mkdir "Invalid argument" (真机
     // D:\Balabala 冒烟: worktree add 必炸于 "could not create leading
@@ -145,6 +192,96 @@ fn tail_lossy(bytes: &[u8]) -> String {
         &bytes[start..]
     };
     String::from_utf8_lossy(slice).into_owned()
+}
+
+/// 门闩探针（`cfg(test)`, change solution-git-offload 4.1）：卡住指定
+/// `cwd` 的 git 子进程入口, 记录**实际执行线程**供离载断言 —— 看门狗
+/// 3s 自动放行, 实现写错时测试是"失败"而不是"挂死"（asset-service
+/// `offload_tests` 同款纪律）。
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::path::Path;
+    use std::sync::{Condvar, LazyLock, Mutex};
+    use std::time::{Duration, Instant};
+
+    struct State {
+        /// 上闩的目标 cwd（只有匹配的调用被卡）。
+        armed: Option<std::path::PathBuf>,
+        /// 门闩命中时的执行线程。
+        hit: Option<std::thread::ThreadId>,
+        released: bool,
+        /// 自动放行期限（arm 起 3s）。
+        deadline: Instant,
+    }
+
+    static STATE: LazyLock<(Mutex<State>, Condvar)> = LazyLock::new(|| {
+        (
+            Mutex::new(State {
+                armed: None,
+                hit: None,
+                released: false,
+                deadline: Instant::now(),
+            }),
+            Condvar::new(),
+        )
+    });
+
+    fn lock() -> std::sync::MutexGuard<'static, State> {
+        STATE.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 上闩：此后 `cwd` 匹配的 git 调用会被卡住并记录线程。
+    pub(crate) fn arm(cwd: &Path) {
+        let mut st = lock();
+        st.armed = Some(cwd.to_path_buf());
+        st.hit = None;
+        st.released = false;
+        st.deadline = Instant::now() + Duration::from_secs(3);
+    }
+
+    /// 等门闩命中, 返回实际执行 git 的线程；超时 → `None`（测试据此失败）。
+    pub(crate) fn wait_hit(timeout: Duration) -> Option<std::thread::ThreadId> {
+        let deadline = Instant::now() + timeout;
+        let mut st = lock();
+        loop {
+            if let Some(t) = st.hit {
+                return Some(t);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let (guard, wait) = STATE
+                .1
+                .wait_timeout(st, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            st = guard;
+            if wait.timed_out() {
+                return st.hit;
+            }
+        }
+    }
+
+    /// 放行（看门狗到期也会自动放行）。
+    pub(crate) fn release() {
+        let mut st = lock();
+        st.released = true;
+        STATE.1.notify_all();
+    }
+
+    /// `run_program` 入口钩子：目标调用 → 记线程 → 等放行。
+    pub(crate) fn on_run(cwd: &Path) {
+        let mut st = lock();
+        if st.armed.as_deref() != Some(cwd) || st.released {
+            return;
+        }
+        st.hit = Some(std::thread::current().id());
+        STATE.1.notify_all();
+        while !st.released && Instant::now() < st.deadline {
+            st = STATE.1.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        // 到期自动放行: 实现写错时测试失败而不是挂死
+    }
 }
 
 #[cfg(test)]
